@@ -108,8 +108,9 @@ type hostStreamEmit struct {
 
 // groupAttempt is one target model tried (or skipped) for a group request.
 type groupAttempt struct {
-	Model  string `json:"model"`
-	Result string `json:"result"`
+	Model    string        `json:"model"`
+	Result   string        `json:"result"`
+	Duration time.Duration `json:"duration,omitempty"`
 }
 
 func groupModelRegistration(cfg pluginConfig) modelRegistrationResponse {
@@ -199,12 +200,13 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if errBody != nil {
 			return nil, errBody
 		}
+		attemptStart := time.Now()
 		rawResp, errCall := hostCall(methodHostModelExecute, hostModelRequest{
 			EntryProtocol: req.SourceFormat, ExitProtocol: req.Format, Model: model, Body: body,
 			Headers: sanitizedHeaders, Query: req.Query, Alt: req.Alt, HostCallbackID: req.HostCallbackID,
 		})
 		if errCall != nil {
-			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error()})
+			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error(), Duration: time.Since(attemptStart)})
 			lastErr = errCall
 			continue
 		}
@@ -214,12 +216,12 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		}
 		if cfg.Features.FallbackOnRefusal {
 			if errRefusal := checkNonStreamResponse(resp.Body); errRefusal != nil {
-				attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errRefusal.Error()})
+				attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errRefusal.Error(), Duration: time.Since(attemptStart)})
 				lastErr = errRefusal
 				continue
 			}
 		}
-		attempts = append(attempts, groupAttempt{Model: model, Result: "served"})
+		attempts = append(attempts, groupAttempt{Model: model, Result: "served", Duration: time.Since(attemptStart)})
 		recordGroupDecision(group, session, attempts, model)
 		bodyOut := resp.Body
 		if !aux {
@@ -272,12 +274,13 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if errBody != nil {
 			return nil, errBody
 		}
+		attemptStart := time.Now()
 		rawResp, errCall := hostCall(methodHostModelStream, hostModelRequest{
 			EntryProtocol: req.SourceFormat, ExitProtocol: req.Format, Model: model, Stream: true, Body: body,
 			Headers: sanitizedHeaders, Query: req.Query, Alt: req.Alt, HostCallbackID: req.HostCallbackID,
 		})
 		if errCall != nil {
-			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error()})
+			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error(), Duration: time.Since(attemptStart)})
 			lastErr = errCall
 			continue
 		}
@@ -287,11 +290,11 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		}
 		prefetched, done, errPrefetch := prefetchStream(resp.StreamID, req.HostCallbackID, cfg.Features.FallbackOnRefusal, cfg.StreamPrefetchBytes)
 		if errPrefetch != nil {
-			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errPrefetch.Error()})
+			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errPrefetch.Error(), Duration: time.Since(attemptStart)})
 			lastErr = errPrefetch
 			continue
 		}
-		attempts = append(attempts, groupAttempt{Model: model, Result: "served"})
+		attempts = append(attempts, groupAttempt{Model: model, Result: "served", Duration: time.Since(attemptStart)})
 		recordGroupDecision(group, session, attempts, model)
 		shiftIndices := false
 		if !aux {

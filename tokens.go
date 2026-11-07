@@ -79,8 +79,17 @@ func countPromptTokens(payload []byte) (int, error) {
 func collectText(value any, segments *[]string) {
 	switch typed := value.(type) {
 	case string:
-		if typed != "" && !hasNoticePrefix(typed, activeNoticePrefixes(currentConfig())) {
-			*segments = append(*segments, typed)
+		if typed != "" {
+			if hasNoticePrefix(typed, activeNoticePrefixes(currentConfig())) {
+				if idx := strings.Index(typed, "\n\n"); idx != -1 {
+					typed = typed[idx+2:]
+				} else {
+					typed = ""
+				}
+			}
+			if strings.TrimSpace(typed) != "" {
+				*segments = append(*segments, typed)
+			}
 		}
 	case []any:
 		for _, item := range typed {

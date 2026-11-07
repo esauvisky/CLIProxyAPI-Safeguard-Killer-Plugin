@@ -22,7 +22,7 @@ Every adaptation can be toggled individually in **Safeguard Killer > General Set
   - Gemini / Antigravity `SAFETY`, `PROHIBITED_CONTENT`, `BLOCKLIST`, `RECITATION`, `SPII`, and empty `end_turn` blocks
   - Plain-text refusals, OpenAI safe-completion pivots (`"I can help with ..., but not ..."`), and authorization/scope interrogations (`"I need a clear authorization context..."`)
   When any refusal is detected during prefetch, the stream is closed before a single chunk reaches the client and the request transparently switches to the next model in the group.
-- **Client fallback & model-switch notices (`client_fallback_notices` + `notice_prefix`):** Emits a customizable notice (default `⚡ [Safeguard Killer] `) in the client whenever a model in a group refuses/fails and Safeguard Killer recovers on another model, or when the active model for the session changes. On subsequent turns, the notice is stripped from `messages` before forwarding upstream so it never enters any model's context.
+- **Client fallback & model-switch notices (`client_fallback_notices` + `verbose_notices` + `notice_prefix`):** Emits a customizable notice (default `⚡ [Safeguard Killer] `) in the client whenever a model in a group refuses/fails and Safeguard Killer recovers on another model, or when the active model for the session changes. By default, notices highlight the model transition, elapsed call seconds, and concise reason (e.g. ``⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal: cyber) → `gemini-4-argon-high` (4s, refusal: regex) → `kimi-k3.1-pro` ``); enable `verbose_notices` to include the full raw upstream error/skip strings. On subsequent turns, the notice is stripped from `messages` before forwarding upstream so it never enters any model's context.
 - **Rewrite cyber & dual-use system prompt gate (`rewrite_cyber_system_prompt`):** Replaces Claude Code's built-in `"Dual-use security tools ... require clear authorization context"` gate and strips Fable/Mythos dual-use restriction blurbs in `body.system` so models answer directly without interrogating for authorization scope or ownership.
 - **Strip refusal-taint headers (`strip_refusal_taint_headers`):** Removes `x-is-refusal-fallback`, `x-cc-fallback-latched-by`, `x-cc-fallback-from-model`, `x-cc-fallback-category`, `x-cc-fallback-trigger`, `x-cc-original-request-id`, and `x-cc-atis` headers that Claude Code attaches after a flagged turn.
 - **Disable upstream server-side model swap (`disable_upstream_server_fallback`):** Deletes `body.fallbacks` and strips `server-side-fallback-*` / `fallback-credit-*` beta tokens from `Anthropic-Beta` so Anthropic's servers cannot silently swap your model mid-stream to a weaker fallback model.
@@ -115,6 +115,7 @@ plugins:
       features:
         fallback_on_refusal: true
         client_fallback_notices: true
+        verbose_notices: false
         notice_prefix: "⚡ [Safeguard Killer] "
         rewrite_cyber_system_prompt: true
         strip_refusal_taint_headers: true

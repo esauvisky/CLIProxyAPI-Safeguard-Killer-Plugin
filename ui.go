@@ -517,6 +517,13 @@ const uiHTML = `<!doctype html>
           </span>
         </label>
         <label class="feature-item">
+          <input type="checkbox" data-feature="verbose_notices">
+          <span>
+            <span class="feature-title">Verbose notices</span>
+            <span class="feature-desc">Include full raw upstream error payloads, filter messages, and per-credential quota details in fallback notices instead of concise reason labels (e.g. refusal: cyber, refusal: regex).</span>
+          </span>
+        </label>
+        <label class="feature-item">
           <input type="checkbox" data-feature="rewrite_cyber_system_prompt">
           <span>
             <span class="feature-title">Rewrite cyber &amp; dual-use system prompt gate</span>
@@ -799,6 +806,7 @@ const DEFAULT_NOTICE_PREFIX = '⚡ [Safeguard Killer] ';
 const FEATURE_KEYS = [
   'fallback_on_refusal',
   'client_fallback_notices',
+  'verbose_notices',
   'rewrite_cyber_system_prompt',
   'strip_refusal_taint_headers',
   'disable_upstream_server_fallback',
@@ -811,7 +819,7 @@ function featuresOf(cfg) {
   const raw = cfg.features || {};
   const out = {};
   for (const k of FEATURE_KEYS) {
-    out[k] = typeof raw[k] === 'boolean' ? raw[k] : true;
+    out[k] = typeof raw[k] === 'boolean' ? raw[k] : k !== 'verbose_notices';
   }
   out.notice_prefix = typeof raw.notice_prefix === 'string' && raw.notice_prefix !== '' ? raw.notice_prefix : DEFAULT_NOTICE_PREFIX;
   return out;

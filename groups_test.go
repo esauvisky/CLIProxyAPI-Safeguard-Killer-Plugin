@@ -132,7 +132,7 @@ func TestExecuteGroupStreamForwardsChunks(t *testing.T) {
 	}
 	var open executorStreamOpenResponse
 	decodeOK(t, raw, &open)
-	if got := <-emitted; !strings.Contains(got, "switched to deepseek-v4.1-flash-uncensored") {
+	if got := <-emitted; !strings.Contains(got, "`glm-5.3-uncensored` (0s, no auth) → `deepseek-v4.1-flash-uncensored`") {
 		t.Fatalf("notice event = %q", got)
 	}
 	if got := <-emitted; got != "emit:data: one\n\n" {
@@ -214,7 +214,7 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 	if !strings.Contains(streamOut, "Here is the answer.") {
 		t.Fatalf("emitted stream = %q, want answer from abliterated", streamOut)
 	}
-	if !strings.Contains(streamOut, "glm-5.3-uncensored (refusal (cyber))") || !strings.Contains(streamOut, "switched to abliterated") {
+	if !strings.Contains(streamOut, "`glm-5.3-uncensored` (0s, refusal: cyber) → `deepseek-v4.1-flash-uncensored` (0s, refusal: regex) → `abliterated`") {
 		t.Fatalf("emitted stream missing fallback notice: %q", streamOut)
 	}
 	if strings.Join(openedModels, ",") != "glm-5.3-uncensored,deepseek-v4.1-flash-uncensored,abliterated" {
@@ -362,6 +362,47 @@ func TestGroupRoutingStrategiesRandomAndQuotaSticky(t *testing.T) {
 	orderZero, skippedZero, prevZero := groupCandidateOrder(cfgZero, "sess-zero", groupOrder, now.Add(time.Second))
 	if orderZero[0] != "m1" || len(skippedZero) != 0 || prevZero != "m2" {
 		t.Fatalf("idle_minutes=0 order = %v skipped=%v prev=%q", orderZero, skippedZero, prevZero)
+	}
+}
+
+func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
+	cfg := defaultPluginConfig()
+	group := modelGroup{ID: "best", Name: "General Purpose", Models: []string{"claude-opus-5-5", "gemini-4-argon-high", "kimi-k3.1-pro"}}
+	attempts := []groupAttempt{
+		{Model: "claude-opus-5-5", Result: "failed: refusal (cyber)", Duration: 16 * time.Second},
+		{Model: "gemini-4-argon-high", Result: "failed: refusal (text)", Duration: 4 * time.Second},
+		{Model: "kimi-k3.1-pro", Result: "served", Duration: 2 * time.Second},
+	}
+
+	gotConcise := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5")
+	wantConcise := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal: cyber) → `gemini-4-argon-high` (4s, refusal: regex) → `kimi-k3.1-pro`"
+	if gotConcise != wantConcise {
+		t.Fatalf("concise notice = %q, want %q", gotConcise, wantConcise)
+	}
+
+	gotSwitchConcise := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high")
+	wantSwitchConcise := "⚡ [Safeguard Killer] `gemini-4-argon-high` → `claude-opus-5-5`"
+	if gotSwitchConcise != wantSwitchConcise {
+		t.Fatalf("concise switch notice = %q, want %q", gotSwitchConcise, wantSwitchConcise)
+	}
+
+	gotExhaustedConcise := buildGroupExhaustedNotice(cfg, group, attempts[:2])
+	wantExhaustedConcise := "⚡ [Safeguard Killer] every model in General Purpose (`best`) failed: `claude-opus-5-5` (16s, refusal: cyber) → `gemini-4-argon-high` (4s, refusal: regex)"
+	if gotExhaustedConcise != wantExhaustedConcise {
+		t.Fatalf("concise exhausted notice = %q, want %q", gotExhaustedConcise, wantExhaustedConcise)
+	}
+
+	cfg.Features.VerboseNotices = true
+	gotVerbose := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5")
+	wantVerbose := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal (cyber)) → `gemini-4-argon-high` (4s, refusal (text)) → switched to `kimi-k3.1-pro`"
+	if gotVerbose != wantVerbose {
+		t.Fatalf("verbose notice = %q, want %q", gotVerbose, wantVerbose)
+	}
+
+	gotSwitchVerbose := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high")
+	wantSwitchVerbose := "⚡ [Safeguard Killer] switched from `gemini-4-argon-high` → `claude-opus-5-5`"
+	if gotSwitchVerbose != wantSwitchVerbose {
+		t.Fatalf("verbose switch notice = %q, want %q", gotSwitchVerbose, wantSwitchVerbose)
 	}
 }
 

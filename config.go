@@ -84,6 +84,7 @@ type pluginConfig struct {
 type featureConfig struct {
 	FallbackOnRefusal             bool   `yaml:"fallback_on_refusal" json:"fallback_on_refusal"`
 	ClientFallbackNotices         bool   `yaml:"client_fallback_notices" json:"client_fallback_notices"`
+	VerboseNotices                bool   `yaml:"verbose_notices" json:"verbose_notices"`
 	NoticePrefix                  string `yaml:"notice_prefix" json:"notice_prefix"`
 	RewriteCyberSystemPrompt      bool   `yaml:"rewrite_cyber_system_prompt" json:"rewrite_cyber_system_prompt"`
 	StripRefusalTaintHeaders      bool   `yaml:"strip_refusal_taint_headers" json:"strip_refusal_taint_headers"`

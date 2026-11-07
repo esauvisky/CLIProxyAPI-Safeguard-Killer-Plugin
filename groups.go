@@ -171,7 +171,26 @@ func resolveTargetGroup(cfg pluginConfig, requestedModel, session string) (model
 	return picked, true
 }
 
-// executeGroup tries the group's models in order and returns the first successful response.
+type parallelExecResult struct {
+	rank     int
+	model    string
+	resp     hostModelResponse
+	duration time.Duration
+	err      error
+}
+
+type parallelStreamResult struct {
+	rank       int
+	model      string
+	resp       hostModelStreamResponse
+	prefetched [][]byte
+	done       bool
+	duration   time.Duration
+	err        error
+}
+
+// executeGroup tries the group's models in order (or races parallel probe/race candidates) and
+// returns the first successful response.
 func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 	var req executorRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
@@ -185,9 +204,94 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 	now := time.Now()
 	aux := isAuxiliaryRequest(req.Payload)
 	sanitizedPayload, sanitizedHeaders, _, _ := sanitizeRequest(req.Payload, req.Headers, cfg)
-	order, attempts, prevLookupModel := groupCandidateOrder(cfg, session, group, now)
+	plan := planGroupExecution(cfg, session, group, req.Payload, now)
+	attempts := plan.Skipped
+	prevLookupModel := plan.PrevModel
 	var lastErr error
-	for _, model := range order {
+
+	var racers []string
+	for _, model := range plan.Parallel {
+		reason, errSkip := skipReason(cfg, model, now)
+		if errSkip != nil {
+			return nil, errSkip
+		}
+		if reason != "" {
+			attempts = append(attempts, groupAttempt{Model: model, Result: "skipped: " + reason})
+			continue
+		}
+		racers = append(racers, model)
+	}
+	if len(racers) == 1 {
+		plan.Sequential = append([]string{racers[0]}, plan.Sequential...)
+		racers = nil
+	}
+	if len(racers) > 1 {
+		results := make(chan parallelExecResult, len(racers))
+		for idx, model := range racers {
+			body, errBody := withModel(sanitizedPayload, model)
+			if errBody != nil {
+				return nil, errBody
+			}
+			go func(rank int, m string, b []byte) {
+				start := time.Now()
+				rawResp, errCall := hostCall(methodHostModelExecute, hostModelRequest{
+					EntryProtocol: req.SourceFormat, ExitProtocol: req.Format, Model: m, Body: b,
+					Headers: sanitizedHeaders, Query: req.Query, Alt: req.Alt, HostCallbackID: req.HostCallbackID,
+				})
+				if errCall != nil {
+					results <- parallelExecResult{rank: rank, model: m, duration: time.Since(start), err: errCall}
+					return
+				}
+				var resp hostModelResponse
+				if errDecode := json.Unmarshal(rawResp, &resp); errDecode != nil {
+					results <- parallelExecResult{rank: rank, model: m, duration: time.Since(start), err: fmt.Errorf("decode host.model.execute response: %w", errDecode)}
+					return
+				}
+				if cfg.Features.FallbackOnRefusal {
+					if errRefusal := checkNonStreamResponse(resp.Body); errRefusal != nil {
+						results <- parallelExecResult{rank: rank, model: m, duration: time.Since(start), err: errRefusal}
+						return
+					}
+				}
+				results <- parallelExecResult{rank: rank, model: m, resp: resp, duration: time.Since(start)}
+			}(idx, model, body)
+		}
+		for seen := 1; seen <= len(racers); seen++ {
+			res := <-results
+			if res.err != nil {
+				attempts = append(attempts, groupAttempt{Model: res.model, Result: "failed: " + res.err.Error(), Duration: res.duration})
+				recordSessionModelFailure(session, group.ID, res.model, res.err.Error(), len(req.Payload), time.Now())
+				lastErr = res.err
+				continue
+			}
+			attempts = append(attempts, groupAttempt{Model: res.model, Result: "served", Duration: res.duration})
+			recordGroupDecision(group, session, attempts, res.model)
+			bodyOut := res.resp.Body
+			if !aux {
+				prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, res.model, prevLookupModel, len(req.Payload), time.Now())
+				observeGroupSessionUsage(session, group.ID, res.resp.Body)
+				notice := buildGroupNotice(cfg, group, attempts, res.model, prevModel)
+				notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, res.model, len(req.Payload)))
+				bodyOut = injectNonStreamNotice(res.resp.Body, effectiveFormat(req.Format, req.SourceFormat), notice)
+			}
+			remaining := len(racers) - seen
+			if remaining > 0 {
+				go func(rem int, winnerRank int) {
+					for k := 0; k < rem; k++ {
+						late := <-results
+						if late.err != nil {
+							recordSessionModelFailure(session, group.ID, late.model, late.err.Error(), len(req.Payload), time.Now())
+						} else if !aux && late.rank < winnerRank && group.effectiveStrategy() == groupStrategyUpgrade {
+							promoteProbedModel(cfg, session, group.ID, late.model, time.Now())
+						}
+					}
+				}(remaining, res.rank)
+			}
+			return okEnvelope(executorResponse{Payload: bodyOut, Headers: cleanResponseHeaders(res.resp.Headers)})
+		}
+	}
+
+	for _, model := range plan.Sequential {
 		reason, errSkip := skipReason(cfg, model, now)
 		if errSkip != nil {
 			return nil, errSkip
@@ -207,6 +311,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		})
 		if errCall != nil {
 			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error(), Duration: time.Since(attemptStart)})
+			recordSessionModelFailure(session, group.ID, model, errCall.Error(), len(req.Payload), time.Now())
 			lastErr = errCall
 			continue
 		}
@@ -217,6 +322,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if cfg.Features.FallbackOnRefusal {
 			if errRefusal := checkNonStreamResponse(resp.Body); errRefusal != nil {
 				attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errRefusal.Error(), Duration: time.Since(attemptStart)})
+				recordSessionModelFailure(session, group.ID, model, errRefusal.Error(), len(req.Payload), time.Now())
 				lastErr = errRefusal
 				continue
 			}
@@ -225,8 +331,10 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		recordGroupDecision(group, session, attempts, model)
 		bodyOut := resp.Body
 		if !aux {
-			prevModel := bindGroupSession(cfg, session, group.ID, model, prevLookupModel, now)
+			prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, model, prevLookupModel, len(req.Payload), time.Now())
+			observeGroupSessionUsage(session, group.ID, resp.Body)
 			notice := buildGroupNotice(cfg, group, attempts, model, prevModel)
+			notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, model, len(req.Payload)))
 			bodyOut = injectNonStreamNotice(resp.Body, effectiveFormat(req.Format, req.SourceFormat), notice)
 		}
 		return okEnvelope(executorResponse{Payload: bodyOut, Headers: cleanResponseHeaders(resp.Headers)})
@@ -241,7 +349,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 }
 
 // executeGroupStream opens the first group model that produces visible output without refusing
-// and forwards its chunks.
+// (racing parallel probe/race candidates when present) and forwards its chunks.
 func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 	var req executorRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
@@ -259,9 +367,100 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 	aux := isAuxiliaryRequest(req.Payload)
 	sanitizedPayload, sanitizedHeaders, _, hadSafeguards := sanitizeRequest(req.Payload, req.Headers, cfg)
 	stampSafeguards := cfg.Features.BypassAutoModeClassifier && hadSafeguards
-	order, attempts, prevLookupModel := groupCandidateOrder(cfg, session, group, now)
+	plan := planGroupExecution(cfg, session, group, req.Payload, now)
+	attempts := plan.Skipped
+	prevLookupModel := plan.PrevModel
 	var lastErr error
-	for _, model := range order {
+
+	var racers []string
+	for _, model := range plan.Parallel {
+		reason, errSkip := skipReason(cfg, model, now)
+		if errSkip != nil {
+			return nil, errSkip
+		}
+		if reason != "" {
+			attempts = append(attempts, groupAttempt{Model: model, Result: "skipped: " + reason})
+			continue
+		}
+		racers = append(racers, model)
+	}
+	if len(racers) == 1 {
+		plan.Sequential = append([]string{racers[0]}, plan.Sequential...)
+		racers = nil
+	}
+	if len(racers) > 1 {
+		results := make(chan parallelStreamResult, len(racers))
+		for idx, model := range racers {
+			body, errBody := withModel(sanitizedPayload, model)
+			if errBody != nil {
+				return nil, errBody
+			}
+			go func(rank int, m string, b []byte) {
+				start := time.Now()
+				rawResp, errCall := hostCall(methodHostModelStream, hostModelRequest{
+					EntryProtocol: req.SourceFormat, ExitProtocol: req.Format, Model: m, Stream: true, Body: b,
+					Headers: sanitizedHeaders, Query: req.Query, Alt: req.Alt, HostCallbackID: req.HostCallbackID,
+				})
+				if errCall != nil {
+					results <- parallelStreamResult{rank: rank, model: m, duration: time.Since(start), err: errCall}
+					return
+				}
+				var resp hostModelStreamResponse
+				if errDecode := json.Unmarshal(rawResp, &resp); errDecode != nil {
+					results <- parallelStreamResult{rank: rank, model: m, duration: time.Since(start), err: fmt.Errorf("decode host.model.execute_stream response: %w", errDecode)}
+					return
+				}
+				prefetched, done, errPrefetch := prefetchStream(resp.StreamID, req.HostCallbackID, cfg.Features.FallbackOnRefusal, cfg.StreamPrefetchBytes)
+				if errPrefetch != nil {
+					results <- parallelStreamResult{rank: rank, model: m, duration: time.Since(start), err: errPrefetch}
+					return
+				}
+				results <- parallelStreamResult{rank: rank, model: m, resp: resp, prefetched: prefetched, done: done, duration: time.Since(start)}
+			}(idx, model, body)
+		}
+		for seen := 1; seen <= len(racers); seen++ {
+			res := <-results
+			if res.err != nil {
+				attempts = append(attempts, groupAttempt{Model: res.model, Result: "failed: " + res.err.Error(), Duration: res.duration})
+				recordSessionModelFailure(session, group.ID, res.model, res.err.Error(), len(req.Payload), time.Now())
+				lastErr = res.err
+				continue
+			}
+			attempts = append(attempts, groupAttempt{Model: res.model, Result: "served", Duration: res.duration})
+			recordGroupDecision(group, session, attempts, res.model)
+			shiftIndices := false
+			prefetched := res.prefetched
+			if !aux {
+				prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, res.model, prevLookupModel, len(req.Payload), time.Now())
+				for _, ch := range prefetched {
+					observeGroupSessionUsage(session, group.ID, ch)
+				}
+				notice := buildGroupNotice(cfg, group, attempts, res.model, prevModel)
+				notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, res.model, len(req.Payload)))
+				prefetched, shiftIndices = injectStreamNotice(prefetched, effectiveFormat(req.Format, req.SourceFormat), notice)
+			}
+			remaining := len(racers) - seen
+			if remaining > 0 {
+				go func(rem int, winnerRank int) {
+					for k := 0; k < rem; k++ {
+						late := <-results
+						if late.err == nil && late.resp.StreamID != "" {
+							_, _ = hostCall(methodHostModelStreamClose, hostStreamRef{StreamID: late.resp.StreamID, HostCallbackID: req.HostCallbackID})
+							if !aux && late.rank < winnerRank && group.effectiveStrategy() == groupStrategyUpgrade {
+								promoteProbedModel(cfg, session, group.ID, late.model, time.Now())
+							}
+						} else if late.err != nil {
+							recordSessionModelFailure(session, group.ID, late.model, late.err.Error(), len(req.Payload), time.Now())
+						}
+					}
+				}(remaining, res.rank)
+			}
+			go forwardStream(res.resp.StreamID, req.StreamID, req.HostCallbackID, prefetched, res.done, shiftIndices, stampSafeguards, cfg.Features.FallbackOnRefusal, session, group, res.model)
+			return okEnvelope(executorStreamOpenResponse{Headers: cleanResponseHeaders(res.resp.Headers)})
+		}
+	}
+
+	for _, model := range plan.Sequential {
 		reason, errSkip := skipReason(cfg, model, now)
 		if errSkip != nil {
 			return nil, errSkip
@@ -281,6 +480,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		})
 		if errCall != nil {
 			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error(), Duration: time.Since(attemptStart)})
+			recordSessionModelFailure(session, group.ID, model, errCall.Error(), len(req.Payload), time.Now())
 			lastErr = errCall
 			continue
 		}
@@ -291,6 +491,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		prefetched, done, errPrefetch := prefetchStream(resp.StreamID, req.HostCallbackID, cfg.Features.FallbackOnRefusal, cfg.StreamPrefetchBytes)
 		if errPrefetch != nil {
 			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errPrefetch.Error(), Duration: time.Since(attemptStart)})
+			recordSessionModelFailure(session, group.ID, model, errPrefetch.Error(), len(req.Payload), time.Now())
 			lastErr = errPrefetch
 			continue
 		}
@@ -298,8 +499,12 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		recordGroupDecision(group, session, attempts, model)
 		shiftIndices := false
 		if !aux {
-			prevModel := bindGroupSession(cfg, session, group.ID, model, prevLookupModel, now)
+			prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, model, prevLookupModel, len(req.Payload), time.Now())
+			for _, ch := range prefetched {
+				observeGroupSessionUsage(session, group.ID, ch)
+			}
 			notice := buildGroupNotice(cfg, group, attempts, model, prevModel)
+			notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, model, len(req.Payload)))
 			prefetched, shiftIndices = injectStreamNotice(prefetched, effectiveFormat(req.Format, req.SourceFormat), notice)
 		}
 		go forwardStream(resp.StreamID, req.StreamID, req.HostCallbackID, prefetched, done, shiftIndices, stampSafeguards, cfg.Features.FallbackOnRefusal, session, group, model)
@@ -342,6 +547,7 @@ func forwardStream(source, target, callbackID string, prefetched [][]byte, sourc
 			return
 		}
 		if len(chunk.Payload) > 0 {
+			observeGroupSessionUsage(session, group.ID, chunk.Payload)
 			if checkRefusal {
 				if refusal, _, _, _ := inspectStreamChunk(chunk.Payload); refusal != "" {
 					advanceGroupSessionOnRefusal(session, group, model, time.Now())

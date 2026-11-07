@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -13,9 +14,12 @@ const (
 	// groupProvider is the executor identifier model groups are registered and executed under.
 	groupProvider = "model-groups"
 
-	groupStrategyOrder  = "order"
-	groupStrategyRandom = "random"
-	groupStrategyQuota  = "quota"
+	groupStrategyUpgrade = "upgrade"
+	groupStrategyOrder   = "upgrade"
+	groupStrategyStick   = "stick"
+	groupStrategyQuota   = "quota"
+	groupStrategyRace    = "race"
+	groupStrategyRandom  = "random"
 )
 
 // executorFormats lists every client protocol; group requests pass through in the client's own format.
@@ -114,12 +118,16 @@ type modelGroup struct {
 
 func (g modelGroup) effectiveStrategy() string {
 	switch strings.ToLower(strings.TrimSpace(g.Strategy)) {
-	case "", groupStrategyOrder, "fallback", "priority":
-		return groupStrategyOrder
-	case groupStrategyRandom:
-		return groupStrategyRandom
+	case "", groupStrategyUpgrade, "order", "fallback", "priority":
+		return groupStrategyUpgrade
+	case groupStrategyStick, "sticky":
+		return groupStrategyStick
 	case groupStrategyQuota:
 		return groupStrategyQuota
+	case groupStrategyRace, "fastest":
+		return groupStrategyRace
+	case groupStrategyRandom, "round-robin":
+		return groupStrategyRandom
 	default:
 		return strings.ToLower(strings.TrimSpace(g.Strategy))
 	}
@@ -129,6 +137,7 @@ var activeConfig atomic.Value
 
 func init() {
 	activeConfig.Store(defaultPluginConfig())
+	loadPersistedSessions(time.Now())
 }
 
 func defaultPluginConfig() pluginConfig {
@@ -203,9 +212,9 @@ func validateConfig(cfg pluginConfig) error {
 			return fmt.Errorf("group %s needs at least one model", group.ID)
 		}
 		switch group.effectiveStrategy() {
-		case groupStrategyOrder, groupStrategyRandom, groupStrategyQuota:
+		case groupStrategyUpgrade, groupStrategyStick, groupStrategyQuota, groupStrategyRace, groupStrategyRandom:
 		default:
-			return fmt.Errorf("group %s has unknown strategy %q (want order, random, or quota)", group.ID, group.Strategy)
+			return fmt.Errorf("group %s has unknown strategy %q (want upgrade, stick, quota, race, or random)", group.ID, group.Strategy)
 		}
 	}
 	for _, group := range cfg.Groups {

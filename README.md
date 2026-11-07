@@ -39,20 +39,26 @@ Every adaptation can be toggled individually in **Safeguard Killer > General Set
 
 A **Smart Group** exposes a virtual model ID (e.g. `best`, `heavy`, `fast`, `uncensored-best`) backed by a list of target models across providers. While Smart Groups can also be used simply for convenience or spreading usage across providers, they are designed first and foremost to **survive safeguard refusals without interrupting your session**:
 
-### 5-Minute Prompt-Cache Stickiness
+### Programmatic Cache Stickiness, Parallel Probing & Compaction Reset
 When a message triggers a refusal (or error) on an earlier model in the group and a later model accepts and answers:
-- **Within 5 minutes:** Subsequent turns in the same session start **directly on the model that worked**, keeping the server-side prompt cache warm and avoiding repeated refusals from the models that already rejected the topic.
-- **After 5+ minutes of inactivity:** Once 5 minutes have elapsed since the last request, the upstream prompt cache has expired anyway, so the session binding resets and the next prompt tries from the start of the group again (allowing a higher-ranked model to take over if the topic has moved on).
+- **Sticky across idle gaps:** Sessions stay pinned to the working fallback model across idle pauses (preserving long-lived provider prefix caches on Kimi, DeepSeek, GLM, and OpenAI without wasting uncached tokens re-sending unchanged history).
+- **Context-Dilution Parallel Probe (`10 turns` + `128 KB`, with `2×` exponential backoff):** Once the conversation has grown by at least **10 turns and +128 KB** since a higher model refused (doubling to `20 turns / +256 KB`, `40 turns / +512 KB` on consecutive refusals), Safeguard Killer races the eligible higher models **and** the known-good working model **in parallel** and picks the first one that completes prefetch without refusing.
+- **Compaction Reset & Smart Tips:** Whenever conversation history is compacted (`/compact`, auto-compaction, or `/clear`, shrinking payload bytes by >30%), all per-model refusal/context-length records reset immediately to Model #1. On large fallback sessions (`>= 128 KB`), Safeguard Killer periodically appends a tip reminding you that running `/compact` lets you retry the session on the primary model.
+- **Session-Scoped Capability Memory:** Models that fail with `no tools`, `not found`, `no vision` (while images are in payload), or `context too long` (until compaction shrinks the payload) are skipped automatically without re-trying.
 
 ### Per-Group Routing Strategies (`strategy`)
-Each Smart Group can choose how it selects its starting model when a session is new or its 5-minute cache window has expired:
+Each Smart Group can choose how it selects models and handles upgrades:
 
-1. **`order` — In Order (Fallback Only, 5m Sticky, default):**
-   Tries models strictly top-to-bottom (`#1 → #2 → #3...`) and only moves to the next model when a model refuses, errors, or all of its credentials are below `min_remaining`.
-2. **`quota` — Quota Spread (Weighted Random, 5m Sticky):**
-   Scores each model in the group by its best eligible credential's quota burn rate (`remaining / hours_until_reset`) and selects the starting model via Efraimidis–Spirakis weighted random sampling (`u^(1/rate)`). Providers with more unused quota per hour are chosen with proportionally higher probability to spread token spend across providers, then pinned for 5 minutes while the prompt cache is warm (falling through to the remaining weighted models if a refusal occurs).
-3. **`random` — Random (Uniform Random, 5m Sticky):**
-   Shuffles the group's models uniformly at random for new or cache-expired sessions, falls through on refusal, and pins to the answering model for 5 minutes.
+1. **`upgrade` — Priority + Auto-Upgrade (Parallel Probe, default):**
+   Tries models in priority order (`#1 → #2 → #3...`), pins to the answering model, and races eligible higher models alongside the known-good model in parallel once the session dilutes (`10 turns + 128 KB` with `2×` backoff) or compacts.
+2. **`stick` — Priority + Sticky Until Compact (Max Cache Saver):**
+   Tries models in priority order (`#1 → #2 → #3...`). Once a model refuses on safeguards, stays locked on the working fallback model for the entire session without re-probing higher models mid-session — only resetting to `#1` when history is compacted (`/compact`) or cleared.
+3. **`quota` — Quota Balanced (Cache-Sticky):**
+   Scores each model in the group by its best eligible credential's quota burn rate (`remaining / hours_until_reset`) and selects the starting model via Efraimidis–Spirakis weighted random sampling (`u^(1/rate)`), staying pinned while the session's prefix cache is warm.
+4. **`race` — Fastest Non-Refusing (Parallel Race):**
+   Races candidate models in parallel for new or cold sessions and streams the first one that passes prefetch without refusing or failing, then stays pinned while its server cache is warm.
+5. **`random` — Round-Robin / Random Pool (Cache-Sticky):**
+   Distributes new or cold sessions uniformly across the group's models, stays pinned while the cache is warm, and fails over on refusal or error.
 
 ---
 

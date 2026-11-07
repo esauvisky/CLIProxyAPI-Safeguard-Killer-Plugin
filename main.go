@@ -63,7 +63,7 @@ const (
 	schemaVersion uint32 = 9
 
 	pluginName    = "Safeguard Killer"
-	pluginVersion = "0.5.11"
+	pluginVersion = "1.0.0"
 	pluginAuthor  = "esauvisky"
 	pluginRepo    = "https://github.com/esauvisky/CLIProxyAPI-Safeguard-Killer-Plugin"
 	pluginLogo    = "https://raw.githubusercontent.com/esauvisky/CLIProxyAPI-Safeguard-Killer-Plugin/main/assets/logo.png"
@@ -164,7 +164,9 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() {
+	savePersistedSessions()
+}
 
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
@@ -174,6 +176,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		}
 		return okEnvelope(pluginRegistration())
 	case methodPluginQuiesce, methodPluginShutdown:
+		savePersistedSessions()
 		return okEnvelope(struct{}{})
 	case methodSchedulerPick:
 		var req schedulerPickRequest

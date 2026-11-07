@@ -71,7 +71,17 @@ type decision struct {
 	Attempts []groupAttempt `json:"attempts,omitempty"`
 }
 
-// sessionBinding pins a client session to a credential until it goes idle.
+// modelSessionState tracks how a model in a Smart Group failed within a specific session.
+type modelSessionState struct {
+	FailureKind   string    `json:"failure_kind"`
+	Reason        string    `json:"reason,omitempty"`
+	RefusalCount  int       `json:"refusal_count,omitempty"`
+	FailedAtTurn  int       `json:"failed_at_turn,omitempty"`
+	FailedAtBytes int       `json:"failed_at_bytes,omitempty"`
+	FailedAt      time.Time `json:"failed_at"`
+}
+
+// sessionBinding pins a client session to a credential or Smart Group model.
 type sessionBinding struct {
 	Session  string    `json:"session"`
 	AuthID   string    `json:"auth_id"`
@@ -80,7 +90,15 @@ type sessionBinding struct {
 	BoundAt  time.Time `json:"bound_at"`
 	LastSeen time.Time `json:"last_seen"`
 	// IdleExpiresAt is LastSeen + idle_minutes; after it the next prompt re-picks.
-	IdleExpiresAt time.Time `json:"idle_expires_at"`
+	IdleExpiresAt         time.Time                     `json:"idle_expires_at"`
+	Turns                 int                           `json:"turns,omitempty"`
+	LastPayloadBytes      int                           `json:"last_payload_bytes,omitempty"`
+	LastInputTokens       int                           `json:"last_input_tokens,omitempty"`
+	LastCacheReadTokens   int                           `json:"last_cache_read_tokens,omitempty"`
+	LastCacheCreateTokens int                           `json:"last_cache_create_tokens,omitempty"`
+	CacheWarm             bool                          `json:"cache_warm,omitempty"`
+	LastTipTurn           int                           `json:"last_tip_turn,omitempty"`
+	ModelStates           map[string]*modelSessionState `json:"model_states,omitempty"`
 }
 
 // uiState is the JSON served to the management page.

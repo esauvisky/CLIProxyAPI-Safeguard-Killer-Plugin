@@ -54,6 +54,7 @@ func fakeHost(t *testing.T, models []string, other func(method string, payload a
 
 func resetHostState(t *testing.T) {
 	t.Helper()
+	sessionStatePath = ""
 	hostMu.Lock()
 	hostCache = hostSnapshot{}
 	hostMu.Unlock()

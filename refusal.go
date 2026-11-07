@@ -7,6 +7,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -15,9 +17,22 @@ import (
 )
 
 const (
-	// groupCacheTTL is how long a group session stays pinned to the model that last succeeded
-	// (matching the 5-minute server prompt-cache window) before retrying from the first model.
+	// groupCacheTTL is the default idle horizon before a non-refusal session binding may re-rank.
 	groupCacheTTL = 5 * time.Minute
+
+	// dilutionBaseTurns and dilutionBaseBytes are the minimum new turns and payload growth required
+	// before a model that refused on safeguards is probed again in the same session. Each consecutive
+	// refusal doubles both thresholds (1x -> 2x -> 4x...).
+	dilutionBaseTurns = 10
+	dilutionBaseBytes = 128 * 1024
+
+	// compactionMinPrevBytes and compactionShrinkRatio detect conversation compaction (/compact or
+	// rewind): when a payload >= 32 KB shrinks below 70% of its previous byte size, per-model
+	// refusal and context-length states are cleared and the session resets to the primary model.
+	compactionMinPrevBytes    = 32 * 1024
+	compactionShrinkRatio     = 0.70
+	transientErrorCooldown    = 2 * time.Minute
+	compactionTipTurnInterval = 15
 
 	defaultNoticePrefix = "⚡ [Safeguard Killer] "
 	legacyNoticePrefix  = "⚡ [Quota Smart Router] "
@@ -46,66 +61,342 @@ var refusalTaintHeaders = []string{
 	"x-cc-atis",
 }
 
-// groupSessions pins a (session, groupID) pair to the model that last succeeded for groupCacheTTL
-// (5 minutes), so subsequent requests reuse the warm prompt cache and skip models that already
-// refused or failed, then reset to the top model once 5 minutes pass.
-var groupSessions = make(map[string]*sessionBinding)
+// groupSessions pins a (session, groupID) pair to its working model and tracks per-model failure
+// state, turn count, payload size, and cache telemetry across turns.
+var (
+	groupSessions    = make(map[string]*sessionBinding)
+	sessionStatePath = filepath.Join(os.TempDir(), "safeguard-killer-sessions.json")
+)
 
-// groupCandidateOrder returns the model order to try for a group request, any initial sticky-skip
-// attempt records, and the model that served the previous turn in this session (if any).
-func groupCandidateOrder(cfg pluginConfig, session string, group modelGroup, now time.Time) (order []string, skipped []groupAttempt, prevModel string) {
-	if len(group.Models) == 0 {
-		return nil, nil, ""
+type persistedSessionState struct {
+	Sessions      map[string]*sessionBinding `json:"sessions"`
+	GroupSessions map[string]*sessionBinding `json:"group_sessions"`
+}
+
+func loadPersistedSessions(now time.Time) {
+	if sessionStatePath == "" {
+		return
 	}
-	warm := false
+	raw, errRead := os.ReadFile(sessionStatePath)
+	if errRead != nil || len(raw) == 0 {
+		return
+	}
+	var snap persistedSessionState
+	if json.Unmarshal(raw, &snap) != nil {
+		return
+	}
+	stateMu.Lock()
+	for k, v := range snap.Sessions {
+		if v != nil && now.Sub(v.LastSeen) <= sessionRetention {
+			sessions[k] = v
+		}
+	}
+	for k, v := range snap.GroupSessions {
+		if v != nil && now.Sub(v.LastSeen) <= sessionRetention {
+			groupSessions[k] = v
+		}
+	}
+	stateMu.Unlock()
+}
+
+func savePersistedSessionsLocked() {
+	if sessionStatePath == "" {
+		return
+	}
+	raw, errMarshal := json.Marshal(persistedSessionState{
+		Sessions:      sessions,
+		GroupSessions: groupSessions,
+	})
+	if errMarshal != nil {
+		return
+	}
+	tmp := sessionStatePath + ".tmp"
+	if os.WriteFile(tmp, raw, 0o600) == nil {
+		_ = os.Rename(tmp, sessionStatePath)
+	}
+}
+
+func savePersistedSessions() {
+	stateMu.Lock()
+	savePersistedSessionsLocked()
+	stateMu.Unlock()
+}
+
+// groupRoutingPlan describes which models to race in parallel and which to try sequentially.
+type groupRoutingPlan struct {
+	Parallel   []string
+	Sequential []string
+	Skipped    []groupAttempt
+	PrevModel  string
+	Compacted  bool
+}
+
+func payloadHasImage(payload []byte) bool {
+	return bytes.Contains(payload, []byte(`"type":"image"`)) ||
+		bytes.Contains(payload, []byte(`"type": "image"`)) ||
+		bytes.Contains(payload, []byte(`"image_url"`))
+}
+
+func classifyAttemptFailure(rawDetail string) string {
+	summary := summarizeAttemptReason(rawDetail)
+	switch summary {
+	case "no tools":
+		return "no_tools"
+	case "not found":
+		return "not_found"
+	case "no vision":
+		return "no_vision"
+	case "context too long":
+		return "context_too_long"
+	case "empty response", "refusal":
+		return "refusal"
+	}
+	if strings.HasPrefix(summary, "refusal:") {
+		return "refusal"
+	}
+	return "transient"
+}
+
+func modelSkipReasonLocked(binding *sessionBinding, model string, payload []byte, strategy string, now time.Time) string {
+	if binding == nil || len(binding.ModelStates) == 0 {
+		return ""
+	}
+	ms, ok := binding.ModelStates[model]
+	if !ok || ms == nil {
+		return ""
+	}
+	switch ms.FailureKind {
+	case "no_tools", "not_found":
+		return ms.Reason
+	case "no_vision":
+		if payloadHasImage(payload) {
+			return ms.Reason
+		}
+		delete(binding.ModelStates, model)
+		return ""
+	case "context_too_long":
+		if ms.FailedAtBytes > 0 && len(payload) >= ms.FailedAtBytes {
+			return ms.Reason
+		}
+		delete(binding.ModelStates, model)
+		return ""
+	case "refusal":
+		if strategy == groupStrategyStick {
+			return "sticky to " + binding.AuthID + " (cache warm)"
+		}
+		shift := ms.RefusalCount - 1
+		if shift < 0 {
+			shift = 0
+		}
+		if shift > 6 {
+			shift = 6
+		}
+		mult := 1 << shift
+		needTurns := dilutionBaseTurns * mult
+		needBytes := dilutionBaseBytes * mult
+		turnsAdded := binding.Turns - ms.FailedAtTurn
+		bytesAdded := len(payload) - ms.FailedAtBytes
+		if turnsAdded < needTurns || bytesAdded < needBytes {
+			if binding.AuthID != "" {
+				return "sticky to " + binding.AuthID + " (cache warm)"
+			}
+			return ms.Reason
+		}
+		return ""
+	case "transient":
+		if binding.AuthID != "" && binding.AuthID != model && now.Sub(ms.FailedAt) < transientErrorCooldown {
+			return "sticky to " + binding.AuthID + " (cache warm)"
+		}
+		return ""
+	}
+	return ""
+}
+
+// planGroupExecution computes the parallel probe list and sequential fallback order for a group turn.
+func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payload []byte, now time.Time) groupRoutingPlan {
+	var plan groupRoutingPlan
+	if len(group.Models) == 0 {
+		return plan
+	}
+	strategy := group.effectiveStrategy()
+	stickyEnabled := cfg.IdleMinutes > 0
+	var activeModel string
+	cacheStickActive := false
+
 	if session != "" {
 		key := session + "\x00" + group.ID
 		stateMu.Lock()
-		if binding, ok := groupSessions[key]; ok {
-			prevModel = binding.AuthID
-			if now.Before(binding.IdleExpiresAt) {
-				warm = true
-			} else {
-				delete(groupSessions, key)
+		if binding, ok := groupSessions[key]; ok && binding != nil {
+			plan.PrevModel = binding.AuthID
+			if binding.LastPayloadBytes >= compactionMinPrevBytes && len(payload) > 0 &&
+				float64(len(payload)) < float64(binding.LastPayloadBytes)*compactionShrinkRatio {
+				plan.Compacted = true
+				binding.ModelStates = nil
+				binding.AuthID = ""
+				binding.LastPayloadBytes = len(payload)
+				binding.CacheWarm = false
+				savePersistedSessionsLocked()
+			}
+			if stickyEnabled && binding.AuthID != "" {
+				activeModel = binding.AuthID
+				cacheStickActive = binding.CacheWarm || now.Before(binding.IdleExpiresAt)
 			}
 		}
 		stateMu.Unlock()
 	}
 
-	strategy := group.effectiveStrategy()
-	if warm {
-		startIdx := -1
+	stateMu.Lock()
+	var binding *sessionBinding
+	if session != "" {
+		binding = groupSessions[session+"\x00"+group.ID]
+	}
+
+	if strategy == groupStrategyRace {
+		if activeModel != "" && cacheStickActive && modelSkipReasonLocked(binding, activeModel, payload, strategy, now) == "" {
+			plan.Sequential = append(plan.Sequential, activeModel)
+			for _, m := range group.Models {
+				if m == activeModel {
+					continue
+				}
+				if reason := modelSkipReasonLocked(binding, m, payload, strategy, now); reason != "" {
+					plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
+					continue
+				}
+				plan.Sequential = append(plan.Sequential, m)
+			}
+			stateMu.Unlock()
+			return plan
+		}
+		for _, m := range group.Models {
+			if reason := modelSkipReasonLocked(binding, m, payload, strategy, now); reason != "" {
+				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
+				continue
+			}
+			plan.Parallel = append(plan.Parallel, m)
+		}
+		if len(plan.Parallel) == 0 {
+			plan.Sequential = append(plan.Sequential, group.Models...)
+			plan.Skipped = nil
+		}
+		stateMu.Unlock()
+		return plan
+	}
+
+	activeIdx := -1
+	if activeModel != "" {
 		for i, m := range group.Models {
-			if m == prevModel {
-				startIdx = i
+			if m == activeModel {
+				activeIdx = i
 				break
 			}
 		}
-		if startIdx >= 0 {
-			if strategy == groupStrategyOrder {
-				for _, m := range group.Models[:startIdx] {
-					skipped = append(skipped, groupAttempt{Model: m, Result: "skipped: sticky to " + prevModel + " (cache warm)"})
-				}
-				order = make([]string, 0, len(group.Models))
-				order = append(order, group.Models[startIdx:]...)
-				order = append(order, group.Models[:startIdx]...)
-				return order, skipped, prevModel
-			}
-			rest := make([]string, 0, len(group.Models)-1)
-			for i, m := range group.Models {
-				if i != startIdx {
-					rest = append(rest, m)
-				}
-			}
-			orderedRest := orderByStrategy(cfg, rest, strategy, now)
-			order = make([]string, 0, len(group.Models))
-			order = append(order, prevModel)
-			order = append(order, orderedRest...)
-			return order, nil, prevModel
-		}
 	}
 
-	return orderByStrategy(cfg, group.Models, strategy, now), nil, prevModel
+	if activeIdx > 0 && (strategy == groupStrategyUpgrade || strategy == groupStrategyStick) {
+		var probeModels []string
+		for _, m := range group.Models[:activeIdx] {
+			if strategy == groupStrategyStick {
+				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: sticky to " + activeModel + " (cache warm)"})
+				continue
+			}
+			reason := modelSkipReasonLocked(binding, m, payload, strategy, now)
+			if reason != "" {
+				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
+				continue
+			}
+			// If m has no recorded failure in ModelStates, only probe it once the active binding's
+			// idle window expires so normal consecutive turns stay pinned without racing.
+			if (binding == nil || binding.ModelStates[m] == nil) && cacheStickActive {
+				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: sticky to " + activeModel + " (cache warm)"})
+				continue
+			}
+			probeModels = append(probeModels, m)
+		}
+		if len(probeModels) > 0 {
+			for _, pm := range probeModels {
+				if binding != nil {
+					if binding.ModelStates == nil {
+						binding.ModelStates = make(map[string]*modelSessionState)
+					}
+					if ms, ok := binding.ModelStates[pm]; ok && ms != nil {
+						ms.FailedAtTurn = binding.Turns
+						ms.FailedAtBytes = len(payload)
+					}
+				}
+			}
+			plan.Parallel = append(plan.Parallel, probeModels...)
+			plan.Parallel = append(plan.Parallel, activeModel)
+			for _, m := range group.Models[activeIdx+1:] {
+				if reason := modelSkipReasonLocked(binding, m, payload, strategy, now); reason != "" {
+					plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
+					continue
+				}
+				plan.Sequential = append(plan.Sequential, m)
+			}
+			stateMu.Unlock()
+			return plan
+		}
+		for _, m := range group.Models[activeIdx:] {
+			if reason := modelSkipReasonLocked(binding, m, payload, strategy, now); reason != "" {
+				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
+				continue
+			}
+			plan.Sequential = append(plan.Sequential, m)
+		}
+		// Keep earlier models at the tail only if every model from activeIdx onward fails.
+		for _, m := range group.Models[:activeIdx] {
+			ms := (*modelSessionState)(nil)
+			if binding != nil {
+				ms = binding.ModelStates[m]
+			}
+			if ms == nil || (ms.FailureKind != "no_tools" && ms.FailureKind != "not_found" && ms.FailureKind != "no_vision" && ms.FailureKind != "context_too_long") {
+				plan.Sequential = append(plan.Sequential, m)
+			}
+		}
+		stateMu.Unlock()
+		return plan
+	}
+
+	var eligible []string
+	for _, m := range group.Models {
+		if reason := modelSkipReasonLocked(binding, m, payload, strategy, now); reason != "" {
+			plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
+			continue
+		}
+		eligible = append(eligible, m)
+	}
+	stateMu.Unlock()
+
+	if len(eligible) == 0 {
+		eligible = append(eligible, group.Models...)
+		plan.Skipped = nil
+	}
+
+	if activeIdx >= 0 && cacheStickActive && (strategy == groupStrategyQuota || strategy == groupStrategyRandom) {
+		var rest []string
+		for _, m := range eligible {
+			if m != activeModel {
+				rest = append(rest, m)
+			}
+		}
+		orderedRest := orderByStrategy(cfg, rest, strategy, now)
+		plan.Sequential = append(plan.Sequential, activeModel)
+		plan.Sequential = append(plan.Sequential, orderedRest...)
+		return plan
+	}
+
+	plan.Sequential = orderByStrategy(cfg, eligible, strategy, now)
+	return plan
+}
+
+// groupCandidateOrder returns the model order to try for a group request, any initial sticky-skip
+// attempt records, and the model that served the previous turn in this session (if any).
+func groupCandidateOrder(cfg pluginConfig, session string, group modelGroup, now time.Time) (order []string, skipped []groupAttempt, prevModel string) {
+	plan := planGroupExecution(cfg, session, group, nil, now)
+	order = make([]string, 0, len(plan.Parallel)+len(plan.Sequential))
+	order = append(order, plan.Parallel...)
+	order = append(order, plan.Sequential...)
+	return order, plan.Skipped, plan.PrevModel
 }
 
 func orderByStrategy(cfg pluginConfig, models []string, strategy string, now time.Time) []string {
@@ -194,31 +485,99 @@ func orderByQuotaWeightedRandom(cfg pluginConfig, models []string, now time.Time
 	return out
 }
 
+func ensureGroupBindingLocked(session, groupID string, now time.Time) *sessionBinding {
+	key := session + "\x00" + groupID
+	binding, ok := groupSessions[key]
+	if !ok || binding == nil {
+		binding = &sessionBinding{
+			Session:     session,
+			Provider:    groupProvider,
+			Model:       groupID,
+			BoundAt:     now,
+			LastSeen:    now,
+			ModelStates: make(map[string]*modelSessionState),
+		}
+		groupSessions[key] = binding
+	} else if binding.ModelStates == nil {
+		binding.ModelStates = make(map[string]*modelSessionState)
+	}
+	return binding
+}
+
+// recordSessionModelFailure records how a model in a Smart Group failed within a session so
+// subsequent turns apply the appropriate dilution gate, capability skip, or transient cooldown.
+func recordSessionModelFailure(session, groupID, model, rawDetail string, payloadBytes int, now time.Time) {
+	if session == "" || groupID == "" || model == "" {
+		return
+	}
+	kind := classifyAttemptFailure(rawDetail)
+	reason := summarizeAttemptReason(rawDetail)
+	stateMu.Lock()
+	binding := ensureGroupBindingLocked(session, groupID, now)
+	ms, ok := binding.ModelStates[model]
+	if !ok || ms == nil {
+		ms = &modelSessionState{}
+		binding.ModelStates[model] = ms
+	}
+	ms.FailureKind = kind
+	ms.Reason = reason
+	if kind == "refusal" {
+		ms.RefusalCount++
+	}
+	ms.FailedAtTurn = binding.Turns
+	ms.FailedAtBytes = payloadBytes
+	ms.FailedAt = now
+	savePersistedSessionsLocked()
+	stateMu.Unlock()
+}
+
+// promoteProbedModel promotes a probed higher-priority model that finished prefetch without
+// refusing after a faster fallback model already won the parallel race on the current turn, so
+// the next turn uses the higher model directly.
+func promoteProbedModel(cfg pluginConfig, session, groupID, model string, now time.Time) {
+	if session == "" || groupID == "" || model == "" {
+		return
+	}
+	stateMu.Lock()
+	binding := ensureGroupBindingLocked(session, groupID, now)
+	delete(binding.ModelStates, model)
+	binding.AuthID = model
+	binding.LastSeen = now
+	binding.IdleExpiresAt = now.Add(time.Duration(cfg.IdleMinutes) * time.Minute)
+	savePersistedSessionsLocked()
+	stateMu.Unlock()
+}
+
 // bindGroupSession records the model that served a group request and returns the model that had
 // served the previous turn in this session (empty if none).
 func bindGroupSession(cfg pluginConfig, session, groupID, served, prevFromLookup string, now time.Time) string {
+	return bindGroupSessionWithPayload(cfg, session, groupID, served, prevFromLookup, 0, now)
+}
+
+func bindGroupSessionWithPayload(cfg pluginConfig, session, groupID, served, prevFromLookup string, payloadBytes int, now time.Time) string {
 	if session == "" {
 		return prevFromLookup
 	}
-	key := session + "\x00" + groupID
 	stateMu.Lock()
+	binding := ensureGroupBindingLocked(session, groupID, now)
 	prev := prevFromLookup
-	if existing, ok := groupSessions[key]; ok && prev == "" {
-		prev = existing.AuthID
+	if prev == "" {
+		prev = binding.AuthID
 	}
-	boundAt := now
-	if existing, ok := groupSessions[key]; ok && existing.AuthID == served && !existing.BoundAt.IsZero() {
-		boundAt = existing.BoundAt
+	if binding.AuthID != served || binding.BoundAt.IsZero() {
+		binding.BoundAt = now
 	}
-	groupSessions[key] = &sessionBinding{
-		Session:       session,
-		AuthID:        served,
-		Provider:      groupProvider,
-		Model:         groupID,
-		BoundAt:       boundAt,
-		LastSeen:      now,
-		IdleExpiresAt: now.Add(time.Duration(cfg.IdleMinutes) * time.Minute),
+	binding.AuthID = served
+	binding.Provider = groupProvider
+	binding.Model = groupID
+	binding.LastSeen = now
+	binding.IdleExpiresAt = now.Add(time.Duration(cfg.IdleMinutes) * time.Minute)
+	binding.Turns++
+	if payloadBytes > 0 {
+		binding.LastPayloadBytes = payloadBytes
 	}
+	delete(binding.ModelStates, served)
+	savePersistedSessionsLocked()
 	stateMu.Unlock()
 	return prev
 }
@@ -240,18 +599,196 @@ func advanceGroupSessionOnRefusal(session string, group modelGroup, failedModel 
 	if nextIdx == -1 {
 		return
 	}
-	key := session + "\x00" + group.ID
 	stateMu.Lock()
-	groupSessions[key] = &sessionBinding{
-		Session:       session,
-		AuthID:        group.Models[nextIdx],
-		Provider:      groupProvider,
-		Model:         group.ID,
-		BoundAt:       now,
-		LastSeen:      now,
-		IdleExpiresAt: now.Add(groupCacheTTL),
+	binding := ensureGroupBindingLocked(session, group.ID, now)
+	ms, ok := binding.ModelStates[failedModel]
+	if !ok || ms == nil {
+		ms = &modelSessionState{}
+		binding.ModelStates[failedModel] = ms
+	}
+	ms.FailureKind = "refusal"
+	ms.Reason = "refusal: stream"
+	ms.RefusalCount++
+	ms.FailedAtTurn = binding.Turns
+	ms.FailedAtBytes = binding.LastPayloadBytes
+	ms.FailedAt = now
+	binding.AuthID = group.Models[nextIdx]
+	binding.BoundAt = now
+	binding.LastSeen = now
+	binding.IdleExpiresAt = now.Add(groupCacheTTL)
+	savePersistedSessionsLocked()
+	stateMu.Unlock()
+}
+
+func extractUsageFromJSON(raw []byte) (inputTok, cacheReadTok, cacheCreateTok int, found bool) {
+	var env struct {
+		Usage *struct {
+			InputTokens              int `json:"input_tokens"`
+			PromptTokens             int `json:"prompt_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			PromptTokensDetails      *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			InputTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"input_tokens_details"`
+		} `json:"usage"`
+		Message *struct {
+			Usage *struct {
+				InputTokens              int `json:"input_tokens"`
+				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			} `json:"usage"`
+		} `json:"message"`
+		Response *struct {
+			Usage *struct {
+				InputTokens        int `json:"input_tokens"`
+				InputTokensDetails *struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"input_tokens_details"`
+			} `json:"usage"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(raw, &env) != nil {
+		return 0, 0, 0, false
+	}
+	if u := env.Usage; u != nil {
+		in := u.InputTokens
+		if in == 0 {
+			in = u.PromptTokens
+		}
+		cr := u.CacheReadInputTokens
+		if cr == 0 && u.PromptTokensDetails != nil {
+			cr = u.PromptTokensDetails.CachedTokens
+		}
+		if cr == 0 && u.InputTokensDetails != nil {
+			cr = u.InputTokensDetails.CachedTokens
+		}
+		if in > 0 || cr > 0 || u.CacheCreationInputTokens > 0 {
+			return in, cr, u.CacheCreationInputTokens, true
+		}
+	}
+	if env.Message != nil && env.Message.Usage != nil {
+		u := env.Message.Usage
+		if u.InputTokens > 0 || u.CacheReadInputTokens > 0 || u.CacheCreationInputTokens > 0 {
+			return u.InputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens, true
+		}
+	}
+	if env.Response != nil && env.Response.Usage != nil {
+		u := env.Response.Usage
+		cr := 0
+		if u.InputTokensDetails != nil {
+			cr = u.InputTokensDetails.CachedTokens
+		}
+		if u.InputTokens > 0 || cr > 0 {
+			return u.InputTokens, cr, 0, true
+		}
+	}
+	return 0, 0, 0, false
+}
+
+func observeGroupSessionUsage(session, groupID string, chunk []byte) {
+	if session == "" || groupID == "" || len(chunk) == 0 {
+		return
+	}
+	if !bytes.Contains(chunk, []byte(`"usage"`)) {
+		return
+	}
+	trimmed := bytes.TrimSpace(chunk)
+	var inTok, crTok, ccTok int
+	found := false
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		inTok, crTok, ccTok, found = extractUsageFromJSON(trimmed)
+	} else {
+		for _, line := range bytes.Split(chunk, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+			if len(data) == 0 || data[0] != '{' || !bytes.Contains(data, []byte(`"usage"`)) {
+				continue
+			}
+			if in, cr, cc, ok := extractUsageFromJSON(data); ok {
+				if in > 0 {
+					inTok = in
+				}
+				if cr > 0 {
+					crTok = cr
+				}
+				if cc > 0 {
+					ccTok = cc
+				}
+				found = true
+			}
+		}
+	}
+	if !found {
+		return
+	}
+	stateMu.Lock()
+	if binding, ok := groupSessions[session+"\x00"+groupID]; ok && binding != nil {
+		if inTok > 0 || crTok > 0 {
+			binding.LastInputTokens = inTok
+		}
+		if crTok > 0 {
+			binding.LastCacheReadTokens = crTok
+		} else if inTok > 0 && ccTok == 0 {
+			binding.LastCacheReadTokens = 0
+		}
+		if ccTok > 0 {
+			binding.LastCacheCreateTokens = ccTok
+		}
+		binding.CacheWarm = crTok > 0 || ccTok > 0
 	}
 	stateMu.Unlock()
+}
+
+// compactionTipForSession returns a compaction tip when a large session (>= 128 KB) is running on a
+// fallback model because the group's primary model refused earlier (or just refused a probe),
+// rate-limited to at most once every compactionTipTurnInterval turns unless a probe just failed.
+func compactionTipForSession(cfg pluginConfig, session string, group modelGroup, attempts []groupAttempt, served string, payloadBytes int) string {
+	if !cfg.Features.ClientFallbackNotices || len(group.Models) == 0 || served == group.Models[0] || payloadBytes < dilutionBaseBytes {
+		return ""
+	}
+	strategy := group.effectiveStrategy()
+	if strategy != groupStrategyUpgrade && strategy != groupStrategyStick {
+		return ""
+	}
+	primary := group.Models[0]
+	primaryFailedThisTurn := false
+	for _, a := range attempts {
+		if a.Model == primary && strings.HasPrefix(a.Result, "failed: ") && classifyAttemptFailure(strings.TrimPrefix(a.Result, "failed: ")) == "refusal" {
+			primaryFailedThisTurn = true
+			break
+		}
+	}
+	if session == "" {
+		if primaryFailedThisTurn {
+			return fmt.Sprintf("💡 Tip: compact history (`/compact`) if you want to retry this session with `%s`", primary)
+		}
+		return ""
+	}
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	binding, ok := groupSessions[session+"\x00"+group.ID]
+	if !ok || binding == nil {
+		return ""
+	}
+	primaryRefusedInSession := primaryFailedThisTurn
+	if ms, ok := binding.ModelStates[primary]; ok && ms != nil && ms.FailureKind == "refusal" {
+		primaryRefusedInSession = true
+	}
+	if !primaryRefusedInSession {
+		return ""
+	}
+	dueByInterval := binding.LastTipTurn == 0 || (binding.Turns-binding.LastTipTurn >= compactionTipTurnInterval)
+	if !primaryFailedThisTurn && !dueByInterval {
+		return ""
+	}
+	binding.LastTipTurn = binding.Turns
+	return fmt.Sprintf("💡 Tip: compact history (`/compact`) if you want to retry this session with `%s`", primary)
 }
 
 // groupSessionKey extracts the session identity for a group executor request from host metadata,
@@ -929,8 +1466,9 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 			failedChain = append(failedChain, fmt.Sprintf("`%s` (%s)", attempt.Model, reason))
 		}
 	}
+	strat := group.effectiveStrategy()
 	modelChanged := (prevModel != "" && prevModel != served) ||
-		(prevModel == "" && group.effectiveStrategy() == groupStrategyOrder && len(group.Models) > 0 && served != group.Models[0])
+		(prevModel == "" && (strat == groupStrategyUpgrade || strat == groupStrategyStick) && len(group.Models) > 0 && served != group.Models[0])
 	if !hadActiveFailure && !modelChanged {
 		return ""
 	}
@@ -944,6 +1482,16 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 		return fmt.Sprintf("%sswitched from `%s` → `%s`", prefix, prevModel, served)
 	}
 	return fmt.Sprintf("%s`%s` → `%s`", prefix, prevModel, served)
+}
+
+func appendNoticeTip(cfg pluginConfig, notice, tip string) string {
+	if tip == "" {
+		return notice
+	}
+	if notice == "" {
+		return cfg.Features.effectiveNoticePrefix() + tip
+	}
+	return notice + "\n" + cfg.Features.effectiveNoticePrefix() + tip
 }
 
 func hasRefusalAttempt(attempts []groupAttempt) bool {

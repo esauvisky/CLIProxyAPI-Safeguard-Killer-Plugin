@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -155,6 +156,7 @@ func TestWithModelKeepsBodiesWithoutModelField(t *testing.T) {
 
 func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *testing.T) {
 	emitted := make(chan string, 16)
+	var testMu sync.Mutex
 	var closedStreams []string
 	var openedModels []string
 	var lastNudgeBody string
@@ -162,8 +164,10 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 		switch method {
 		case methodHostModelStream:
 			req := payload.(hostModelRequest)
+			testMu.Lock()
 			openedModels = append(openedModels, req.Model)
 			lastNudgeBody = string(req.Body)
+			testMu.Unlock()
 			return json.Marshal(hostModelStreamResponse{StatusCode: 200, StreamID: "src-" + req.Model})
 		case methodHostModelStreamRead:
 			ref := payload.(hostStreamRef)
@@ -183,7 +187,9 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 				return json.Marshal(hostStreamReadResponse{Payload: []byte(chunk), Done: true})
 			}
 		case methodHostModelStreamClose:
+			testMu.Lock()
 			closedStreams = append(closedStreams, payload.(hostStreamRef).StreamID)
+			testMu.Unlock()
 			return json.RawMessage(`{}`), nil
 		case methodHostStreamEmit:
 			emitted <- string(payload.(hostStreamEmit).Payload)
@@ -248,25 +254,114 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 		t.Fatalf("second turn openedModels = %v, want [abliterated]", openedModels)
 	}
 
-	// Simulate 5+ minutes passing (server prompt cache expired): the next request starts from
-	// the top model (glm-5.3-uncensored) again instead of staying pinned to abliterated.
+	// Simulate 20+ minutes passing without context dilution or compaction: the session stays
+	// pinned to abliterated instead of wasting tokens re-probing models that refused the unchanged context.
 	stateMu.Lock()
 	for _, b := range groupSessions {
-		b.LastSeen = time.Now().Add(-6 * time.Minute)
+		b.LastSeen = time.Now().Add(-20 * time.Minute)
 		b.IdleExpiresAt = b.LastSeen.Add(groupCacheTTL)
 	}
 	stateMu.Unlock()
 	openedModels = nil
 	if _, errExec := executeGroupStream([]byte(reqJSON), groupConfig()); errExec != nil {
-		t.Fatalf("third executeGroupStream() after 5m expiry error = %v", errExec)
+		t.Fatalf("third executeGroupStream() after 20m idle error = %v", errExec)
 	}
 	for {
 		if <-emitted == "close" {
 			break
 		}
 	}
-	if strings.Join(openedModels, ",") != "glm-5.3-uncensored,deepseek-v4.1-flash-uncensored,abliterated" {
-		t.Fatalf("after 5m cache expiry openedModels = %v, want full chain from top", openedModels)
+	if strings.Join(openedModels, ",") != "abliterated" {
+		t.Fatalf("after 20m idle without dilution openedModels = %v, want [abliterated]", openedModels)
+	}
+
+	// Simulate context dilution (10+ turns and +128 KB of new context): now a parallel probe races
+	// the refused higher models alongside the known-good model (abliterated).
+	stateMu.Lock()
+	for _, b := range groupSessions {
+		b.Turns += 12
+	}
+	stateMu.Unlock()
+	dilutedBody := `{"model":"uncensored-models","metadata":{"user_id":"user_abc_session_fd8e6192-7710-4bb9-8cf9-bc9a30d6549f"},"messages":[{"role":"user","content":"` + strings.Repeat("x", 140*1024) + `"}]}`
+	dilutedReqJSON := `{"Model":"uncensored-models","SourceFormat":"claude","Format":"claude","Stream":true,"Payload":"` + b64(dilutedBody) + `","stream_id":"dst"}`
+	testMu.Lock()
+	openedModels = nil
+	testMu.Unlock()
+	if _, errExec := executeGroupStream([]byte(dilutedReqJSON), groupConfig()); errExec != nil {
+		t.Fatalf("fourth executeGroupStream() after dilution error = %v", errExec)
+	}
+	allEmitted.Reset()
+	for {
+		ev := <-emitted
+		if ev == "close" {
+			break
+		}
+		allEmitted.WriteString(ev)
+	}
+	testMu.Lock()
+	gotOpenedCount := len(openedModels)
+	testMu.Unlock()
+	if gotOpenedCount != 3 {
+		t.Fatalf("after dilution parallel probe openedModels count = %d, want all 3 models raced", gotOpenedCount)
+	}
+	if !strings.Contains(allEmitted.String(), "Tip: compact history (`/compact`)") {
+		t.Fatalf("expected compaction tip on large diluted probe failure, got: %q", allEmitted.String())
+	}
+}
+
+func TestProgrammaticCompactionResetAndCapabilitySkips(t *testing.T) {
+	resetHostState(t)
+	cfg := defaultPluginConfig()
+	group := modelGroup{
+		ID:       "smart",
+		Name:     "Smart",
+		Strategy: groupStrategyUpgrade,
+		Models:   []string{"m1", "m2", "m3", "m4"},
+	}
+	cfg.Groups = []modelGroup{group}
+	now := time.Now()
+	sess := "claude:sess-prog"
+
+	// m1 fails with refusal (cyber), m2 fails with no_tools, m3 fails with no_vision, m4 serves.
+	bigPayload := []byte(`{"messages":[{"type":"image"},{"text":"` + strings.Repeat("a", 60*1024) + `"}]}`)
+	recordSessionModelFailure(sess, group.ID, "m1", "refusal (cyber)", len(bigPayload), now)
+	recordSessionModelFailure(sess, group.ID, "m2", `{"error":{"message":"The capability 'tools' is not supported by this gateway profile.","code":"unsupported_capability"}}`, len(bigPayload), now)
+	recordSessionModelFailure(sess, group.ID, "m3", `{"error":{"message":"Message 1 carries an image, and the selected model route accepts text only.","code":"unsupported_capability"}}`, len(bigPayload), now)
+	bindGroupSessionWithPayload(cfg, sess, group.ID, "m4", "", len(bigPayload), now)
+
+	// Next turn with image still present and <10 turns: m1 (refusal not diluted), m2 (no tools), m3 (no vision) all skipped; starts on m4.
+	plan1 := planGroupExecution(cfg, sess, group, bigPayload, now.Add(10*time.Minute))
+	if len(plan1.Parallel) != 0 || len(plan1.Sequential) == 0 || plan1.Sequential[0] != "m4" {
+		t.Fatalf("plan1 = %+v, want sequential starting with m4", plan1)
+	}
+
+	// After 10 turns and +128 KB growth, m1 is eligible for parallel probe alongside m4, while m2 (no tools) and m3 (no vision) remain skipped!
+	stateMu.Lock()
+	groupSessions[sess+"\x00"+group.ID].Turns += 10
+	stateMu.Unlock()
+	grownPayload := []byte(`{"messages":[{"type":"image"},{"text":"` + strings.Repeat("a", 200*1024) + `"}]}`)
+	plan2 := planGroupExecution(cfg, sess, group, grownPayload, now.Add(15*time.Minute))
+	if strings.Join(plan2.Parallel, ",") != "m1,m4" {
+		t.Fatalf("plan2.Parallel = %v, want [m1, m4]", plan2.Parallel)
+	}
+
+	// If m1 refuses again on the probe, its RefusalCount becomes 2, requiring 20 turns and +256 KB (exponential backoff).
+	recordSessionModelFailure(sess, group.ID, "m1", "refusal (cyber)", len(grownPayload), now.Add(15*time.Minute))
+	bindGroupSessionWithPayload(cfg, sess, group.ID, "m4", "m4", len(grownPayload), now.Add(15*time.Minute))
+	stateMu.Lock()
+	groupSessions[sess+"\x00"+group.ID].Turns += 12
+	stateMu.Unlock()
+	 slightlyGrown := []byte(`{"messages":[{"type":"image"},{"text":"` + strings.Repeat("a", 340*1024) + `"}]}`)
+	plan3 := planGroupExecution(cfg, sess, group, slightlyGrown, now.Add(20*time.Minute))
+	if len(plan3.Parallel) != 0 || plan3.Sequential[0] != "m4" {
+		t.Fatalf("plan3 after 2nd refusal should back off (need 20 turns + 256KB), got Parallel=%v Sequential=%v", plan3.Parallel, plan3.Sequential)
+	}
+
+	// Simulate Context Compaction (payload shrinks from 200 KB to 10 KB, no image): resets immediately to m1!
+	compactedPayload := []byte(`{"messages":[{"text":"compacted summary"}]}`)
+	plan4 := planGroupExecution(cfg, sess, group, compactedPayload, now.Add(25*time.Minute))
+	if !plan4.Compacted || len(plan4.Sequential) == 0 || plan4.Sequential[0] != "m1" {
+		t.Fatalf("plan4 after compaction = %+v, want Compacted=true and Sequential[0]=m1", plan4)
 	}
 }
 

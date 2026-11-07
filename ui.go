@@ -580,7 +580,7 @@ const uiHTML = `<!doctype html>
         <h2 class="card-title">Smart Groups</h2>
         <button class="btn sm" data-action="add-group" id="addGroupBtn">Add group</button>
       </div>
-      <p class="card-desc">A Smart Group exposes a single virtual model ID that automatically routes around safeguard refusals, content filters, scope-gate lectures, and quota exhaustion across multiple models. Once a model answers without refusing, the session stays pinned to it for 5 minutes while the server prompt cache is warm, then resets to try the group from the start once 5 minutes pass (can also be used purely for multi-provider convenience or quota spreading).</p>
+      <p class="card-desc">A Smart Group exposes a single virtual model ID that automatically routes around safeguard refusals, content filters, scope-gate lectures, capability mismatches, and quota exhaustion across multiple models. Pick a per-group strategy below to control how starting models are chosen and when fallback sessions probe back up to higher-ranked models.</p>
       <div class="groups" id="groupsEditor"></div>
       <datalist id="modelList"></datalist>
     </section>
@@ -591,7 +591,7 @@ const uiHTML = `<!doctype html>
       <div class="card-header"><h2 class="card-title">Sessions</h2></div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Session</th><th>Credential / Target</th><th>Provider</th><th>Model / Group</th><th>Bound</th><th>Last seen</th><th>Idle / Cache expires</th></tr></thead>
+          <thead><tr><th>Session</th><th>Credential / Target</th><th>Provider</th><th>Model / Group</th><th>Bound</th><th>Last seen</th><th>Cache / State</th></tr></thead>
           <tbody id="sessBody"></tbody>
         </table>
       </div>
@@ -826,7 +826,21 @@ function featuresOf(cfg) {
 }
 
 function normStrategy(s) {
-  return s === 'random' || s === 'quota' ? s : 'order';
+  switch ((s || '').toLowerCase().trim()) {
+    case 'stick':
+    case 'sticky':
+      return 'stick';
+    case 'quota':
+      return 'quota';
+    case 'race':
+    case 'fastest':
+      return 'race';
+    case 'random':
+    case 'round-robin':
+      return 'random';
+    default:
+      return 'upgrade';
+  }
 }
 
 function canonConfig(cfg) {
@@ -1047,9 +1061,11 @@ function groupFieldAttr(i, rest) {
 }
 
 const STRATEGY_HINTS = {
-  order: 'In order: tries models top to bottom and only advances when a model refuses, errors, or runs out of quota. Pins to the first model that answers for 5m (warm cache), then retries from #1 after 5m.',
-  quota: 'Quota spread: picks a starting model weighted-randomly by each provider\'s available quota rate (remaining / hours to reset) to spread token spend efficiently, falls through on refusal, and pins to the answering model for 5m.',
-  random: 'Random: picks a starting model uniformly at random for new or cache-expired (5m+) sessions, falls through on refusal, and pins to the answering model for 5m.',
+  upgrade: 'Priority + Auto-Upgrade (Parallel Probe): Tries models top to bottom (#1 → #2 → #3) and pins to the answering model to keep its server cache warm. Once the conversation grows by ≥10 turns and ≥128 KB (with 2× exponential backoff per refusal) or compacts (/compact), probes eligible higher models and the known-good model in parallel and picks the first one that does not refuse.',
+  stick: 'Priority + Sticky Until Compact (Max Cache Saver): Tries models top to bottom (#1 → #2 → #3). Once a model refuses on safeguards, stays locked on the working fallback model for the entire session without spending tokens re-probing higher models — only resetting to #1 when conversation history is compacted (/compact) or cleared.',
+  quota: 'Quota Balanced (Cache-Sticky): Picks the starting model for new/cold sessions weighted by each provider\'s available quota burn rate (remaining / hours to reset), stays pinned while the session\'s server cache is warm, and fails over around refusals or quota exhaustion.',
+  race: 'Fastest Non-Refusing (Parallel Race): Races candidate models in parallel for new or cold sessions and streams the first one that passes prefetch without refusing or failing, then stays pinned while its server cache is warm.',
+  random: 'Round-Robin / Random Pool (Cache-Sticky): Distributes new or cold sessions uniformly across the group\'s models (ideal for uncensored/open-weight pools without quota APIs), stays pinned while the cache is warm, and fails over on refusal or error.',
 };
 
 function renderGroups() {
@@ -1079,9 +1095,11 @@ function renderGroups() {
           '<input class="input" value="' + esc(g.name) + '" data-group="' + i + '" data-gfield="name"' + groupFieldAttr(i, 'name') + '></label>' +
         '<label class="field"><span class="cfg-key">Routing strategy</span>' +
           '<select class="input" data-group="' + i + '" data-gfield="strategy"' + groupFieldAttr(i, 'strategy') + '>' +
-            '<option value="order"' + (strat === 'order' ? ' selected' : '') + '>In Order (Fallback Only, 5m Sticky)</option>' +
-            '<option value="quota"' + (strat === 'quota' ? ' selected' : '') + '>Quota Spread (Weighted Random, 5m Sticky)</option>' +
-            '<option value="random"' + (strat === 'random' ? ' selected' : '') + '>Random (Uniform Random, 5m Sticky)</option>' +
+            '<option value="upgrade"' + (strat === 'upgrade' ? ' selected' : '') + '>Priority + Auto-Upgrade (Parallel Probe)</option>' +
+            '<option value="stick"' + (strat === 'stick' ? ' selected' : '') + '>Priority + Sticky Until Compact (Cache Saver)</option>' +
+            '<option value="quota"' + (strat === 'quota' ? ' selected' : '') + '>Quota Balanced (Cache-Sticky)</option>' +
+            '<option value="race"' + (strat === 'race' ? ' selected' : '') + '>Fastest Non-Refusing (Parallel Race)</option>' +
+            '<option value="random"' + (strat === 'random' ? ' selected' : '') + '>Round-Robin / Random Pool (Cache-Sticky)</option>' +
           '</select></label>' +
         '<button class="btn sm danger" data-action="group-remove" data-group="' + i + '">Delete group</button>' +
       '</div>' +
@@ -1115,7 +1133,7 @@ function onEditorClick(ev) {
   if (btn === null) return;
   const action = btn.dataset.action;
   if (action === 'add-group') {
-    draft.groups.push({ id: '', name: '', strategy: 'order', models: [], pending: '' });
+    draft.groups.push({ id: '', name: '', strategy: 'upgrade', models: [], pending: '' });
   } else {
     const gi = Number(btn.dataset.group);
     const g = draft.groups[gi];
@@ -1213,6 +1231,34 @@ function renderCredentials() {
   }).join('');
 }
 
+function renderSessionState(s) {
+  if (s.provider !== 'model-groups') {
+    return countdown(s.idle_expires_at);
+  }
+  const pills = [];
+  if (s.cache_warm) {
+    const tok = s.last_cache_read_tokens || s.last_cache_create_tokens || 0;
+    pills.push('<span class="badge ok">cache warm' + (tok > 0 ? ' (' + Math.round(tok / 1000) + 'k tok)' : '') + '</span>');
+  } else {
+    pills.push('<span class="badge">pinned</span>');
+  }
+  if (s.turns) {
+    pills.push('<span class="badge mono">' + esc(s.turns) + ' turns</span>');
+  }
+  if (s.last_payload_bytes) {
+    pills.push('<span class="badge mono">' + esc(Math.round(s.last_payload_bytes / 1024)) + ' KB</span>');
+  }
+  if (s.model_states) {
+    for (const [m, st] of Object.entries(s.model_states)) {
+      if (st && st.reason) {
+        const cnt = st.refusal_count > 1 ? ' ×' + st.refusal_count : '';
+        pills.push('<span class="badge bad mono" title="' + esc(m + ': ' + st.reason) + '">' + esc(m + ': ' + st.reason + cnt) + '</span>');
+      }
+    }
+  }
+  return pills.join(' ');
+}
+
 function renderSessions() {
   const body = document.getElementById('sessBody');
   if (state.sessions.length === 0) {
@@ -1227,7 +1273,7 @@ function renderSessions() {
       '<td class="mono">' + esc(s.model) + '</td>' +
       '<td class="nowrap">' + rel(s.bound_at) + '</td>' +
       '<td class="nowrap">' + rel(s.last_seen) + '</td>' +
-      '<td class="nowrap">' + countdown(s.idle_expires_at) + '</td>' +
+      '<td>' + renderSessionState(s) + '</td>' +
     '</tr>'
   ).join('');
 }

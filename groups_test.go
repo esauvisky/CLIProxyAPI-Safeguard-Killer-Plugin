@@ -90,6 +90,48 @@ func TestExecuteGroupFallsThroughFailuresAndLowQuota(t *testing.T) {
 	}
 }
 
+func TestInsufficientQuotaIsNotRequestedAgain(t *testing.T) {
+	var tried []string
+	fakeHost(t, []string{"glm-5.3-uncensored", "abliterated"}, func(method string, payload any) (json.RawMessage, error) {
+		if method != methodHostModelExecute {
+			t.Fatalf("unexpected host call %s", method)
+		}
+		req := payload.(hostModelRequest)
+		tried = append(tried, req.Model)
+		if req.Model == "glm-5.3-uncensored" {
+			return nil, &statusError{Code: "host_call_failed", Message: "insufficient_quota", HTTPStatus: 429}
+		}
+		return json.Marshal(hostModelResponse{StatusCode: 200, Body: []byte(`{"served":"abliterated"}`)})
+	}, "only-cred")
+	t.Cleanup(func() {
+		quotaMu.Lock()
+		delete(quotaDenials, "glm-5.3-uncensored")
+		quotaMu.Unlock()
+	})
+	body := []byte(`{"Model":"uncensored-models","SourceFormat":"openai","Format":"openai","Payload":"` + b64(`{"model":"uncensored-models","messages":[]}`) + `","host_callback_id":"cb"}`)
+	cfg := groupConfig()
+	cfg.Groups[0].Models = []string{"glm-5.3-uncensored", "abliterated"}
+	if _, errExec := executeGroup(body, cfg); errExec != nil {
+		t.Fatalf("first executeGroup() error = %v", errExec)
+	}
+	tried = nil
+	raw, errExec := executeGroup(body, cfg)
+	if errExec != nil {
+		t.Fatalf("second executeGroup() error = %v", errExec)
+	}
+	var resp executorResponse
+	decodeOK(t, raw, &resp)
+	if strings.Join(tried, ",") != "abliterated" {
+		t.Fatalf("second try called %v, want only abliterated", tried)
+	}
+	stateMu.Lock()
+	last := decisions[len(decisions)-1]
+	stateMu.Unlock()
+	if len(last.Attempts) == 0 || last.Attempts[0].Result != "skipped: insufficient quota" {
+		t.Fatalf("decision = %+v", last)
+	}
+}
+
 func TestExecuteGroupAllFailReturnsLastStatus(t *testing.T) {
 	fakeHost(t, nil, func(method string, payload any) (json.RawMessage, error) {
 		return nil, &statusError{Code: "host_call_failed", Message: "rate limited", HTTPStatus: 429}
@@ -473,6 +515,22 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 	wantConcise := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal: cyber) → `gemini-4-argon-high` (4s, refusal: regex) → `kimi-k3.1-pro`"
 	if gotConcise != wantConcise {
 		t.Fatalf("concise notice = %q, want %q", gotConcise, wantConcise)
+	}
+
+	gotSameModelQuota := buildGroupNotice(cfg, group, []groupAttempt{
+		{Model: "gpt-6.1-sol", Result: "failed: insufficient_quota", Duration: 0},
+		{Model: "grok-4.7", Result: "served", Duration: time.Second},
+	}, "grok-4.7", "grok-4.7")
+	if gotSameModelQuota != "" {
+		t.Fatalf("unchanged model with only a quota failure printed %q", gotSameModelQuota)
+	}
+	gotSameModelRefusal := buildGroupNotice(cfg, group, []groupAttempt{
+		{Model: "claude-opus-5-5", Result: "failed: refusal (cyber)", Duration: 6 * time.Second},
+		{Model: "gpt-6.1-sol", Result: "failed: insufficient_quota", Duration: 0},
+		{Model: "grok-4.7", Result: "served", Duration: time.Second},
+	}, "grok-4.7", "grok-4.7")
+	if gotSameModelRefusal == "" {
+		t.Fatal("unchanged model with a refusal was silenced")
 	}
 
 	gotSwitchConcise := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high")

@@ -32,6 +32,10 @@ const (
 	compactionMinPrevBytes    = 32 * 1024
 	compactionShrinkRatio     = 0.70
 	transientErrorCooldown    = 2 * time.Minute
+	// quotaDenialFallback is how long a model stays uncalled after upstream insufficient_quota when
+	// no quota window gives a reset time. The snapshot often still shows headroom (it tracks rate
+	// windows, not the credit balance that returns this error), so the rejection itself is the signal.
+	quotaDenialFallback = 6 * time.Hour
 	compactionTipTurnInterval = 15
 
 	defaultNoticePrefix = "⚡ [Safeguard Killer] "
@@ -507,6 +511,9 @@ func ensureGroupBindingLocked(session, groupID string, now time.Time) *sessionBi
 // recordSessionModelFailure records how a model in a Smart Group failed within a session so
 // subsequent turns apply the appropriate dilution gate, capability skip, or transient cooldown.
 func recordSessionModelFailure(session, groupID, model, rawDetail string, payloadBytes int, now time.Time) {
+	if summarizeAttemptReason(rawDetail) == "insufficient quota" {
+		noteQuotaDenied(model, now)
+	}
 	if session == "" || groupID == "" || model == "" {
 		return
 	}
@@ -1437,12 +1444,16 @@ func summarizeAttemptReason(detail string) string {
 
 // buildGroupNotice formats a user-visible line when a model in the group failed/refused and CPA
 // recovered on a fallback model, or when the active model for the session changed.
+// A session that stayed on its model is silent when every other attempt was only a transient
+// cooldown (quota, rate limit, upstream): those retries are not news. A refusal, an empty
+// response, or a capability rejection still prints.
 func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttempt, served, prevModel string) string {
 	if !cfg.Features.ClientFallbackNotices {
 		return ""
 	}
 	prefix := cfg.Features.effectiveNoticePrefix()
 	hadActiveFailure := false
+	onlyCooldown := true
 	var failedChain []string
 	for _, attempt := range attempts {
 		if attempt.Model == served && attempt.Result == "served" {
@@ -1452,6 +1463,9 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 			hadActiveFailure = true
 			secs := formatAttemptSecs(attempt.Duration)
 			rawDetail := strings.TrimPrefix(attempt.Result, "failed: ")
+			if classifyAttemptFailure(summarizeAttemptReason(rawDetail)) != "transient" {
+				onlyCooldown = false
+			}
 			reason := summarizeAttemptReason(rawDetail)
 			if cfg.Features.VerboseNotices {
 				reason = strings.Join(strings.Fields(rawDetail), " ")
@@ -1459,6 +1473,9 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 			failedChain = append(failedChain, fmt.Sprintf("`%s` (%s, %s)", attempt.Model, secs, reason))
 		} else if !strings.Contains(attempt.Result, "(cache warm)") {
 			rawDetail := strings.TrimPrefix(attempt.Result, "skipped: ")
+			if classifyAttemptFailure(summarizeAttemptReason(rawDetail)) != "transient" {
+				onlyCooldown = false
+			}
 			reason := summarizeAttemptReason(rawDetail)
 			if cfg.Features.VerboseNotices {
 				reason = strings.Join(strings.Fields(rawDetail), " ")
@@ -1470,6 +1487,9 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 	modelChanged := (prevModel != "" && prevModel != served) ||
 		(prevModel == "" && (strat == groupStrategyUpgrade || strat == groupStrategyStick) && len(group.Models) > 0 && served != group.Models[0])
 	if !hadActiveFailure && !modelChanged {
+		return ""
+	}
+	if prevModel != "" && prevModel == served && onlyCooldown {
 		return ""
 	}
 	if len(failedChain) > 0 {

@@ -576,10 +576,74 @@ func closeStream(target, callbackID, errText string) {
 	_, _ = hostCall(methodHostStreamClose, hostStreamEmit{StreamID: target, Error: errText, HostCallbackID: callbackID})
 }
 
-// skipReason reports why a target model should not be tried: every credential serving it is
-// below min_remaining. Credentials without quota data (API keys, unsupported providers) are
-// assumed usable, so a model is only skipped on positive evidence.
+// quotaDenials remembers models whose upstream just returned insufficient_quota, so the next
+// turns skip them instead of spending a request on an error that comes back in 0s.
+var quotaDenials = map[string]time.Time{}
+
+// noteQuotaDenied blocks model until the soonest applicable quota reset, or quotaDenialFallback
+// when no window reports one. A later denial only extends the block.
+func noteQuotaDenied(model string, now time.Time) {
+	if model == "" {
+		return
+	}
+	until := now.Add(quotaDenialFallback)
+	minRemaining := currentConfig().MinRemaining
+	if snapshot, errHost := hostState(now); errHost == nil {
+		var soonest time.Time
+		for _, auth := range snapshot.auths {
+			if auth.Disabled || !containsString(snapshot.models[auth.ID], model) {
+				continue
+			}
+			quota, ok := quotaFor(auth.ID)
+			if !ok || quota.Error != "" {
+				continue
+			}
+			for _, window := range quota.Windows {
+				if len(window.Models) > 0 && !containsString(window.Models, model) {
+					continue
+				}
+				remaining, resetAt := rolledWindow(window, now)
+				if remaining >= minRemaining || !resetAt.After(now) {
+					continue
+				}
+				if soonest.IsZero() || resetAt.Before(soonest) {
+					soonest = resetAt
+				}
+			}
+		}
+		if !soonest.IsZero() {
+			until = soonest
+		}
+	}
+	quotaMu.Lock()
+	if prev, ok := quotaDenials[model]; !ok || until.After(prev) {
+		quotaDenials[model] = until
+	}
+	quotaMu.Unlock()
+}
+
+func quotaDenied(model string, now time.Time) bool {
+	quotaMu.Lock()
+	defer quotaMu.Unlock()
+	until, ok := quotaDenials[model]
+	if !ok {
+		return false
+	}
+	if !now.Before(until) {
+		delete(quotaDenials, model)
+		return false
+	}
+	return true
+}
+
+// skipReason reports why a target model should not be tried: it recently returned
+// insufficient_quota, or every credential serving it is below min_remaining. Credentials without
+// quota data (API keys, unsupported providers) are assumed usable, so a model is only skipped on
+// positive evidence.
 func skipReason(cfg pluginConfig, model string, now time.Time) (string, error) {
+	if quotaDenied(model, now) {
+		return "insufficient quota", nil
+	}
 	if cfg.ManagementKey == "" {
 		return "", nil
 	}

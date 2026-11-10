@@ -20,23 +20,20 @@ const (
 	// groupCacheTTL is the default idle horizon before a non-refusal session binding may re-rank.
 	groupCacheTTL = 5 * time.Minute
 
-	// dilutionBaseTurns and dilutionBaseBytes are the minimum new turns and payload growth required
-	// before a model that refused on safeguards is probed again in the same session. Each consecutive
-	// refusal doubles both thresholds (1x -> 2x -> 4x...).
-	dilutionBaseTurns = 10
+	// dilutionBaseBytes is the payload size at which a session on a fallback model is large enough
+	// for one compaction tip.
 	dilutionBaseBytes = 128 * 1024
 
-	// compactionMinPrevBytes and compactionShrinkRatio detect conversation compaction (/compact or
-	// rewind): when a payload >= 32 KB shrinks below 70% of its previous byte size, per-model
-	// refusal and context-length states are cleared and the session resets to the primary model.
-	compactionMinPrevBytes    = 32 * 1024
-	compactionShrinkRatio     = 0.70
-	transientErrorCooldown    = 2 * time.Minute
+	// Compaction (/compact, auto-compaction, /clear) both shrinks the payload and collapses the
+	// message list. A byte shrink alone is Claude Code clearing old tool results, not compaction.
+	compactionMinPrevBytes = 32 * 1024
+	compactionMinMessages  = 8
+	compactionShrinkRatio  = 0.70
+	transientErrorCooldown = 2 * time.Minute
 	// quotaDenialFallback is how long a model stays uncalled after upstream insufficient_quota when
 	// no quota window gives a reset time. The snapshot often still shows headroom (it tracks rate
 	// windows, not the credit balance that returns this error), so the rejection itself is the signal.
 	quotaDenialFallback = 6 * time.Hour
-	compactionTipTurnInterval = 15
 
 	defaultNoticePrefix = "⚡ [Safeguard Killer] "
 	legacyNoticePrefix  = "⚡ [Quota Smart Router] "
@@ -161,7 +158,7 @@ func classifyAttemptFailure(rawDetail string) string {
 	return "transient"
 }
 
-func modelSkipReasonLocked(binding *sessionBinding, model string, payload []byte, strategy string, now time.Time) string {
+func modelSkipReasonLocked(binding *sessionBinding, model string, payload []byte, now time.Time) string {
 	if binding == nil || len(binding.ModelStates) == 0 {
 		return ""
 	}
@@ -185,28 +182,11 @@ func modelSkipReasonLocked(binding *sessionBinding, model string, payload []byte
 		delete(binding.ModelStates, model)
 		return ""
 	case "refusal":
-		if strategy == groupStrategyStick {
+		// The refused content stays in the history until compaction clears this record.
+		if binding.AuthID != "" {
 			return "sticky to " + binding.AuthID + " (cache warm)"
 		}
-		shift := ms.RefusalCount - 1
-		if shift < 0 {
-			shift = 0
-		}
-		if shift > 6 {
-			shift = 6
-		}
-		mult := 1 << shift
-		needTurns := dilutionBaseTurns * mult
-		needBytes := dilutionBaseBytes * mult
-		turnsAdded := binding.Turns - ms.FailedAtTurn
-		bytesAdded := len(payload) - ms.FailedAtBytes
-		if turnsAdded < needTurns || bytesAdded < needBytes {
-			if binding.AuthID != "" {
-				return "sticky to " + binding.AuthID + " (cache warm)"
-			}
-			return ms.Reason
-		}
-		return ""
+		return ms.Reason
 	case "transient":
 		if binding.AuthID != "" && binding.AuthID != model && now.Sub(ms.FailedAt) < transientErrorCooldown {
 			return "sticky to " + binding.AuthID + " (cache warm)"
@@ -232,12 +212,13 @@ func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payl
 		stateMu.Lock()
 		if binding, ok := groupSessions[key]; ok && binding != nil {
 			plan.PrevModel = binding.AuthID
-			if binding.LastPayloadBytes >= compactionMinPrevBytes && len(payload) > 0 &&
-				float64(len(payload)) < float64(binding.LastPayloadBytes)*compactionShrinkRatio {
+			if conversationCompacted(binding, payload) {
 				plan.Compacted = true
 				binding.ModelStates = nil
 				binding.AuthID = ""
 				binding.LastPayloadBytes = len(payload)
+				binding.LastMessageCount = payloadMessageCount(payload)
+				binding.LastTipTurn = 0
 				binding.CacheWarm = false
 				savePersistedSessionsLocked()
 			}
@@ -256,13 +237,13 @@ func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payl
 	}
 
 	if strategy == groupStrategyRace {
-		if activeModel != "" && cacheStickActive && modelSkipReasonLocked(binding, activeModel, payload, strategy, now) == "" {
+		if activeModel != "" && cacheStickActive && modelSkipReasonLocked(binding, activeModel, payload, now) == "" {
 			plan.Sequential = append(plan.Sequential, activeModel)
 			for _, m := range group.Models {
 				if m == activeModel {
 					continue
 				}
-				if reason := modelSkipReasonLocked(binding, m, payload, strategy, now); reason != "" {
+				if reason := modelSkipReasonLocked(binding, m, payload, now); reason != "" {
 					plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
 					continue
 				}
@@ -272,7 +253,7 @@ func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payl
 			return plan
 		}
 		for _, m := range group.Models {
-			if reason := modelSkipReasonLocked(binding, m, payload, strategy, now); reason != "" {
+			if reason := modelSkipReasonLocked(binding, m, payload, now); reason != "" {
 				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
 				continue
 			}
@@ -303,7 +284,7 @@ func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payl
 				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: sticky to " + activeModel + " (cache warm)"})
 				continue
 			}
-			reason := modelSkipReasonLocked(binding, m, payload, strategy, now)
+			reason := modelSkipReasonLocked(binding, m, payload, now)
 			if reason != "" {
 				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
 				continue
@@ -331,7 +312,7 @@ func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payl
 			plan.Parallel = append(plan.Parallel, probeModels...)
 			plan.Parallel = append(plan.Parallel, activeModel)
 			for _, m := range group.Models[activeIdx+1:] {
-				if reason := modelSkipReasonLocked(binding, m, payload, strategy, now); reason != "" {
+				if reason := modelSkipReasonLocked(binding, m, payload, now); reason != "" {
 					plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
 					continue
 				}
@@ -341,7 +322,7 @@ func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payl
 			return plan
 		}
 		for _, m := range group.Models[activeIdx:] {
-			if reason := modelSkipReasonLocked(binding, m, payload, strategy, now); reason != "" {
+			if reason := modelSkipReasonLocked(binding, m, payload, now); reason != "" {
 				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
 				continue
 			}
@@ -363,7 +344,7 @@ func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payl
 
 	var eligible []string
 	for _, m := range group.Models {
-		if reason := modelSkipReasonLocked(binding, m, payload, strategy, now); reason != "" {
+		if reason := modelSkipReasonLocked(binding, m, payload, now); reason != "" {
 			plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
 			continue
 		}
@@ -558,10 +539,10 @@ func promoteProbedModel(cfg pluginConfig, session, groupID, model string, now ti
 // bindGroupSession records the model that served a group request and returns the model that had
 // served the previous turn in this session (empty if none).
 func bindGroupSession(cfg pluginConfig, session, groupID, served, prevFromLookup string, now time.Time) string {
-	return bindGroupSessionWithPayload(cfg, session, groupID, served, prevFromLookup, 0, now)
+	return bindGroupSessionWithPayload(cfg, session, groupID, served, prevFromLookup, nil, now)
 }
 
-func bindGroupSessionWithPayload(cfg pluginConfig, session, groupID, served, prevFromLookup string, payloadBytes int, now time.Time) string {
+func bindGroupSessionWithPayload(cfg pluginConfig, session, groupID, served, prevFromLookup string, payload []byte, now time.Time) string {
 	if session == "" {
 		return prevFromLookup
 	}
@@ -580,8 +561,9 @@ func bindGroupSessionWithPayload(cfg pluginConfig, session, groupID, served, pre
 	binding.LastSeen = now
 	binding.IdleExpiresAt = now.Add(time.Duration(cfg.IdleMinutes) * time.Minute)
 	binding.Turns++
-	if payloadBytes > 0 {
-		binding.LastPayloadBytes = payloadBytes
+	if len(payload) > 0 {
+		binding.LastPayloadBytes = len(payload)
+		binding.LastMessageCount = payloadMessageCount(payload)
 	}
 	delete(binding.ModelStates, served)
 	savePersistedSessionsLocked()
@@ -752,11 +734,10 @@ func observeGroupSessionUsage(session, groupID string, chunk []byte) {
 	stateMu.Unlock()
 }
 
-// compactionTipForSession returns a compaction tip when a large session (>= 128 KB) is running on a
-// fallback model because the group's primary model refused earlier (or just refused a probe),
-// rate-limited to at most once every compactionTipTurnInterval turns unless a probe just failed.
+// compactionTipForSession returns one compaction tip when a large session (>= 128 KB) first lands
+// on a fallback because the primary refused. Later turns stay quiet until compaction.
 func compactionTipForSession(cfg pluginConfig, session string, group modelGroup, attempts []groupAttempt, served string, payloadBytes int) string {
-	if !cfg.Features.ClientFallbackNotices || len(group.Models) == 0 || served == group.Models[0] || payloadBytes < dilutionBaseBytes {
+	if !cfg.Features.ClientFallbackNotices || session == "" || len(group.Models) == 0 || served == group.Models[0] || payloadBytes < dilutionBaseBytes {
 		return ""
 	}
 	strategy := group.effectiveStrategy()
@@ -764,38 +745,56 @@ func compactionTipForSession(cfg pluginConfig, session string, group modelGroup,
 		return ""
 	}
 	primary := group.Models[0]
-	primaryFailedThisTurn := false
-	for _, a := range attempts {
-		if a.Model == primary && strings.HasPrefix(a.Result, "failed: ") && classifyAttemptFailure(strings.TrimPrefix(a.Result, "failed: ")) == "refusal" {
-			primaryFailedThisTurn = true
-			break
-		}
-	}
-	if session == "" {
-		if primaryFailedThisTurn {
-			return fmt.Sprintf("💡 Tip: compact history (`/compact`) if you want to retry this session with `%s`", primary)
-		}
-		return ""
-	}
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	binding, ok := groupSessions[session+"\x00"+group.ID]
-	if !ok || binding == nil {
+	if !ok || binding == nil || binding.LastTipTurn != 0 {
 		return ""
 	}
-	primaryRefusedInSession := primaryFailedThisTurn
+	refused := false
 	if ms, ok := binding.ModelStates[primary]; ok && ms != nil && ms.FailureKind == "refusal" {
-		primaryRefusedInSession = true
+		refused = true
 	}
-	if !primaryRefusedInSession {
-		return ""
+	if !refused {
+		for _, a := range attempts {
+			if a.Model == primary && strings.HasPrefix(a.Result, "failed: ") && classifyAttemptFailure(strings.TrimPrefix(a.Result, "failed: ")) == "refusal" {
+				refused = true
+				break
+			}
+		}
 	}
-	dueByInterval := binding.LastTipTurn == 0 || (binding.Turns-binding.LastTipTurn >= compactionTipTurnInterval)
-	if !primaryFailedThisTurn && !dueByInterval {
+	if !refused {
 		return ""
 	}
 	binding.LastTipTurn = binding.Turns
 	return fmt.Sprintf("💡 Tip: compact history (`/compact`) if you want to retry this session with `%s`", primary)
+}
+
+// conversationCompacted reports whether payload replaced a long transcript with a summary.
+func conversationCompacted(binding *sessionBinding, payload []byte) bool {
+	if binding.LastPayloadBytes < compactionMinPrevBytes || binding.LastMessageCount < compactionMinMessages || len(payload) == 0 {
+		return false
+	}
+	if float64(len(payload)) >= float64(binding.LastPayloadBytes)*compactionShrinkRatio {
+		return false
+	}
+	return payloadMessageCount(payload)*2 <= binding.LastMessageCount
+}
+
+func payloadMessageCount(payload []byte) int {
+	var body struct {
+		Messages []json.RawMessage `json:"messages"`
+		Request  struct {
+			Messages []json.RawMessage `json:"messages"`
+		} `json:"request"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &body) != nil {
+		return 0
+	}
+	if n := len(body.Messages); n > 0 {
+		return n
+	}
+	return len(body.Request.Messages)
 }
 
 // groupSessionKey extracts the session identity for a group executor request from host metadata,

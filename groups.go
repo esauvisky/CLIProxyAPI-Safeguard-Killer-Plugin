@@ -268,7 +268,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 			recordGroupDecision(group, session, attempts, res.model)
 			bodyOut := res.resp.Body
 			if !aux {
-				prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, res.model, prevLookupModel, len(req.Payload), time.Now())
+				prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, res.model, prevLookupModel, req.Payload, time.Now())
 				observeGroupSessionUsage(session, group.ID, res.resp.Body)
 				notice := buildGroupNotice(cfg, group, attempts, res.model, prevModel)
 				notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, res.model, len(req.Payload)))
@@ -331,7 +331,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		recordGroupDecision(group, session, attempts, model)
 		bodyOut := resp.Body
 		if !aux {
-			prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, model, prevLookupModel, len(req.Payload), time.Now())
+			prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, model, prevLookupModel, req.Payload, time.Now())
 			observeGroupSessionUsage(session, group.ID, resp.Body)
 			notice := buildGroupNotice(cfg, group, attempts, model, prevModel)
 			notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, model, len(req.Payload)))
@@ -431,7 +431,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 			shiftIndices := false
 			prefetched := res.prefetched
 			if !aux {
-				prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, res.model, prevLookupModel, len(req.Payload), time.Now())
+				prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, res.model, prevLookupModel, req.Payload, time.Now())
 				for _, ch := range prefetched {
 					observeGroupSessionUsage(session, group.ID, ch)
 				}
@@ -499,7 +499,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		recordGroupDecision(group, session, attempts, model)
 		shiftIndices := false
 		if !aux {
-			prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, model, prevLookupModel, len(req.Payload), time.Now())
+			prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, model, prevLookupModel, req.Payload, time.Now())
 			for _, ch := range prefetched {
 				observeGroupSessionUsage(session, group.ID, ch)
 			}

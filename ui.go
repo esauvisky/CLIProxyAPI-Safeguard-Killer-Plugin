@@ -1061,7 +1061,7 @@ function groupFieldAttr(i, rest) {
 }
 
 const STRATEGY_HINTS = {
-  upgrade: 'Priority + Auto-Upgrade (Parallel Probe): Tries models top to bottom (#1 → #2 → #3) and pins to the answering model to keep its server cache warm. Once the conversation grows by ≥10 turns and ≥128 KB (with 2× exponential backoff per refusal) or compacts (/compact), probes eligible higher models and the known-good model in parallel and picks the first one that does not refuse.',
+  upgrade: 'Priority + Auto-Upgrade: Tries models top to bottom (#1 → #2 → #3) and pins to the answering model. A refused model stays skipped until /compact collapses the transcript. Models that have not refused are raced with the pinned model after its cache window expires.',
   stick: 'Priority + Sticky Until Compact (Max Cache Saver): Tries models top to bottom (#1 → #2 → #3). Once a model refuses on safeguards, stays locked on the working fallback model for the entire session without spending tokens re-probing higher models — only resetting to #1 when conversation history is compacted (/compact) or cleared.',
   quota: 'Quota Balanced (Cache-Sticky): Picks the starting model for new/cold sessions weighted by each provider\'s available quota burn rate (remaining / hours to reset), stays pinned while the session\'s server cache is warm, and fails over around refusals or quota exhaustion.',
   race: 'Fastest Non-Refusing (Parallel Race): Races candidate models in parallel for new or cold sessions and streams the first one that passes prefetch without refusing or failing, then stays pinned while its server cache is warm.',

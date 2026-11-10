@@ -317,8 +317,7 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 		t.Fatalf("after 20m idle without dilution openedModels = %v, want [abliterated]", openedModels)
 	}
 
-	// Simulate context dilution (10+ turns and +128 KB of new context): now a parallel probe races
-	// the refused higher models alongside the known-good model (abliterated).
+	// Growth does not retry models that refused. The first large turn tells the user once.
 	stateMu.Lock()
 	for _, b := range groupSessions {
 		b.Turns += 12
@@ -330,7 +329,7 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 	openedModels = nil
 	testMu.Unlock()
 	if _, errExec := executeGroupStream([]byte(dilutedReqJSON), groupConfig()); errExec != nil {
-		t.Fatalf("fourth executeGroupStream() after dilution error = %v", errExec)
+		t.Fatalf("fourth executeGroupStream() after growth error = %v", errExec)
 	}
 	allEmitted.Reset()
 	for {
@@ -341,13 +340,30 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 		allEmitted.WriteString(ev)
 	}
 	testMu.Lock()
-	gotOpenedCount := len(openedModels)
+	gotOpened := strings.Join(openedModels, ",")
 	testMu.Unlock()
-	if gotOpenedCount != 3 {
-		t.Fatalf("after dilution parallel probe openedModels count = %d, want all 3 models raced", gotOpenedCount)
+	if gotOpened != "abliterated" {
+		t.Fatalf("after growth openedModels = %q, want [abliterated]", gotOpened)
 	}
 	if !strings.Contains(allEmitted.String(), "Tip: compact history (`/compact`)") {
-		t.Fatalf("expected compaction tip on large diluted probe failure, got: %q", allEmitted.String())
+		t.Fatalf("expected one compaction tip on the first large fallback turn, got: %q", allEmitted.String())
+	}
+	testMu.Lock()
+	openedModels = nil
+	testMu.Unlock()
+	if _, errExec := executeGroupStream([]byte(dilutedReqJSON), groupConfig()); errExec != nil {
+		t.Fatalf("fifth executeGroupStream() error = %v", errExec)
+	}
+	allEmitted.Reset()
+	for {
+		ev := <-emitted
+		if ev == "close" {
+			break
+		}
+		allEmitted.WriteString(ev)
+	}
+	if strings.Contains(allEmitted.String(), "Tip: compact history") {
+		t.Fatalf("compaction tip repeated: %q", allEmitted.String())
 	}
 }
 
@@ -364,42 +380,40 @@ func TestProgrammaticCompactionResetAndCapabilitySkips(t *testing.T) {
 	now := time.Now()
 	sess := "claude:sess-prog"
 
-	// m1 fails with refusal (cyber), m2 fails with no_tools, m3 fails with no_vision, m4 serves.
-	bigPayload := []byte(`{"messages":[{"type":"image"},{"text":"` + strings.Repeat("a", 60*1024) + `"}]}`)
+	history := func(n int, text string) []byte {
+		parts := []string{`{"type":"image","text":"img"}`}
+		for i := 1; i < n; i++ {
+			parts = append(parts, `{"role":"user","content":"`+text+`"}`)
+		}
+		return []byte(`{"messages":[` + strings.Join(parts, ",") + `]}`)
+	}
+	bigPayload := history(8, strings.Repeat("a", 8*1024))
 	recordSessionModelFailure(sess, group.ID, "m1", "refusal (cyber)", len(bigPayload), now)
 	recordSessionModelFailure(sess, group.ID, "m2", `{"error":{"message":"The capability 'tools' is not supported by this gateway profile.","code":"unsupported_capability"}}`, len(bigPayload), now)
 	recordSessionModelFailure(sess, group.ID, "m3", `{"error":{"message":"Message 1 carries an image, and the selected model route accepts text only.","code":"unsupported_capability"}}`, len(bigPayload), now)
-	bindGroupSessionWithPayload(cfg, sess, group.ID, "m4", "", len(bigPayload), now)
+	bindGroupSessionWithPayload(cfg, sess, group.ID, "m4", "", bigPayload, now)
 
-	// Next turn with image still present and <10 turns: m1 (refusal not diluted), m2 (no tools), m3 (no vision) all skipped; starts on m4.
 	plan1 := planGroupExecution(cfg, sess, group, bigPayload, now.Add(10*time.Minute))
 	if len(plan1.Parallel) != 0 || len(plan1.Sequential) == 0 || plan1.Sequential[0] != "m4" {
 		t.Fatalf("plan1 = %+v, want sequential starting with m4", plan1)
 	}
 
-	// After 10 turns and +128 KB growth, m1 is eligible for parallel probe alongside m4, while m2 (no tools) and m3 (no vision) remain skipped!
 	stateMu.Lock()
-	groupSessions[sess+"\x00"+group.ID].Turns += 10
+	groupSessions[sess+"\x00"+group.ID].Turns += 20
 	stateMu.Unlock()
-	grownPayload := []byte(`{"messages":[{"type":"image"},{"text":"` + strings.Repeat("a", 200*1024) + `"}]}`)
+	grownPayload := history(8, strings.Repeat("a", 20*1024))
 	plan2 := planGroupExecution(cfg, sess, group, grownPayload, now.Add(15*time.Minute))
-	if strings.Join(plan2.Parallel, ",") != "m1,m4" {
-		t.Fatalf("plan2.Parallel = %v, want [m1, m4]", plan2.Parallel)
+	if len(plan2.Parallel) != 0 || plan2.Sequential[0] != "m4" || plan2.Compacted {
+		t.Fatalf("plan2 after growth = %+v, want no probe and no compaction", plan2)
 	}
 
-	// If m1 refuses again on the probe, its RefusalCount becomes 2, requiring 20 turns and +256 KB (exponential backoff).
-	recordSessionModelFailure(sess, group.ID, "m1", "refusal (cyber)", len(grownPayload), now.Add(15*time.Minute))
-	bindGroupSessionWithPayload(cfg, sess, group.ID, "m4", "m4", len(grownPayload), now.Add(15*time.Minute))
-	stateMu.Lock()
-	groupSessions[sess+"\x00"+group.ID].Turns += 12
-	stateMu.Unlock()
-	 slightlyGrown := []byte(`{"messages":[{"type":"image"},{"text":"` + strings.Repeat("a", 340*1024) + `"}]}`)
-	plan3 := planGroupExecution(cfg, sess, group, slightlyGrown, now.Add(20*time.Minute))
-	if len(plan3.Parallel) != 0 || plan3.Sequential[0] != "m4" {
-		t.Fatalf("plan3 after 2nd refusal should back off (need 20 turns + 256KB), got Parallel=%v Sequential=%v", plan3.Parallel, plan3.Sequential)
+	bindGroupSessionWithPayload(cfg, sess, group.ID, "m4", "m4", grownPayload, now.Add(15*time.Minute))
+	editedPayload := history(8, "cleared tool result")
+	plan3 := planGroupExecution(cfg, sess, group, editedPayload, now.Add(20*time.Minute))
+	if plan3.Compacted || len(plan3.Parallel) != 0 || plan3.Sequential[0] != "m4" {
+		t.Fatalf("plan3 context edit = %+v, want still pinned to m4", plan3)
 	}
 
-	// Simulate Context Compaction (payload shrinks from 200 KB to 10 KB, no image): resets immediately to m1!
 	compactedPayload := []byte(`{"messages":[{"text":"compacted summary"}]}`)
 	plan4 := planGroupExecution(cfg, sess, group, compactedPayload, now.Add(25*time.Minute))
 	if !plan4.Compacted || len(plan4.Sequential) == 0 || plan4.Sequential[0] != "m1" {

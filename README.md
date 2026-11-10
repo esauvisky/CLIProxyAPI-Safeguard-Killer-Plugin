@@ -42,15 +42,15 @@ A **Smart Group** exposes a virtual model ID (e.g. `best`, `heavy`, `fast`, `unc
 ### Programmatic Cache Stickiness, Parallel Probing & Compaction Reset
 When a message triggers a refusal (or error) on an earlier model in the group and a later model accepts and answers:
 - **Sticky across idle gaps:** Sessions stay pinned to the working fallback model across idle pauses (preserving long-lived provider prefix caches on Kimi, DeepSeek, GLM, and OpenAI without wasting uncached tokens re-sending unchanged history).
-- **Context-Dilution Parallel Probe (`10 turns` + `128 KB`, with `2×` exponential backoff):** Once the conversation has grown by at least **10 turns and +128 KB** since a higher model refused (doubling to `20 turns / +256 KB`, `40 turns / +512 KB` on consecutive refusals), Safeguard Killer races the eligible higher models **and** the known-good working model **in parallel** and picks the first one that completes prefetch without refusing.
-- **Compaction Reset & Smart Tips:** Whenever conversation history is compacted (`/compact`, auto-compaction, or `/clear`, shrinking payload bytes by >30%), all per-model refusal/context-length records reset immediately to Model #1. On large fallback sessions (`>= 128 KB`), Safeguard Killer periodically appends a tip reminding you that running `/compact` lets you retry the session on the primary model.
+- **Refusal stickiness:** A safeguard refusal stays on the working fallback for the rest of the transcript. Growing the conversation does not call the refused model again, because the refused content is still in the history.
+- **Compaction Reset & One Tip:** Records reset to Model #1 only when the payload shrinks below 70% **and** the message list collapses to at most half (a real `/compact`, auto-compaction, or `/clear`). Claude Code clearing old tool results shrinks bytes without collapsing messages, and does not reset. On the first large fallback turn (`>= 128 KB`), one tip says that `/compact` retries the primary. It is not repeated.
 - **Session-Scoped Capability Memory:** Models that fail with `no tools`, `not found`, `no vision` (while images are in payload), or `context too long` (until compaction shrinks the payload) are skipped automatically without re-trying.
 
 ### Per-Group Routing Strategies (`strategy`)
 Each Smart Group can choose how it selects models and handles upgrades:
 
 1. **`upgrade` — Priority + Auto-Upgrade (Parallel Probe, default):**
-   Tries models in priority order (`#1 → #2 → #3...`), pins to the answering model, and races eligible higher models alongside the known-good model in parallel once the session dilutes (`10 turns + 128 KB` with `2×` backoff) or compacts.
+   Tries models in priority order (`#1 → #2 → #3...`) and pins to the answering model. A refused model is not called again until compaction resets the session. Models with no refusal record are still raced alongside the pinned model once its cache window expires.
 2. **`stick` — Priority + Sticky Until Compact (Max Cache Saver):**
    Tries models in priority order (`#1 → #2 → #3...`). Once a model refuses on safeguards, stays locked on the working fallback model for the entire session without re-probing higher models mid-session — only resetting to `#1` when history is compacted (`/compact`) or cleared.
 3. **`quota` — Quota Balanced (Cache-Sticky):**

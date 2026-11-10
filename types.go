@@ -93,6 +93,7 @@ type sessionBinding struct {
 	IdleExpiresAt         time.Time                     `json:"idle_expires_at"`
 	Turns                 int                           `json:"turns,omitempty"`
 	LastPayloadBytes      int                           `json:"last_payload_bytes,omitempty"`
+	LastMessageCount      int                           `json:"last_message_count,omitempty"`
 	LastInputTokens       int                           `json:"last_input_tokens,omitempty"`
 	LastCacheReadTokens   int                           `json:"last_cache_read_tokens,omitempty"`
 	LastCacheCreateTokens int                           `json:"last_cache_create_tokens,omitempty"`

@@ -259,10 +259,6 @@ func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payl
 			}
 			plan.Parallel = append(plan.Parallel, m)
 		}
-		if len(plan.Parallel) == 0 {
-			plan.Sequential = append(plan.Sequential, group.Models...)
-			plan.Skipped = nil
-		}
 		stateMu.Unlock()
 		return plan
 	}
@@ -328,13 +324,8 @@ func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payl
 			}
 			plan.Sequential = append(plan.Sequential, m)
 		}
-		// Keep earlier models at the tail only if every model from activeIdx onward fails.
 		for _, m := range group.Models[:activeIdx] {
-			ms := (*modelSessionState)(nil)
-			if binding != nil {
-				ms = binding.ModelStates[m]
-			}
-			if ms == nil || (ms.FailureKind != "no_tools" && ms.FailureKind != "not_found" && ms.FailureKind != "no_vision" && ms.FailureKind != "context_too_long") {
+			if modelSkipReasonLocked(binding, m, payload, now) == "" {
 				plan.Sequential = append(plan.Sequential, m)
 			}
 		}
@@ -352,12 +343,7 @@ func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payl
 	}
 	stateMu.Unlock()
 
-	if len(eligible) == 0 {
-		eligible = append(eligible, group.Models...)
-		plan.Skipped = nil
-	}
-
-	if activeIdx >= 0 && cacheStickActive && (strategy == groupStrategyQuota || strategy == groupStrategyRandom) {
+	if activeIdx >= 0 && cacheStickActive && containsString(eligible, activeModel) && (strategy == groupStrategyQuota || strategy == groupStrategyRandom) {
 		var rest []string
 		for _, m := range eligible {
 			if m != activeModel {
@@ -767,6 +753,7 @@ func compactionTipForSession(cfg pluginConfig, session string, group modelGroup,
 		return ""
 	}
 	binding.LastTipTurn = binding.Turns
+	savePersistedSessionsLocked()
 	return fmt.Sprintf("💡 Tip: compact history (`/compact`) if you want to retry this session with `%s`", primary)
 }
 
@@ -778,7 +765,8 @@ func conversationCompacted(binding *sessionBinding, payload []byte) bool {
 	if float64(len(payload)) >= float64(binding.LastPayloadBytes)*compactionShrinkRatio {
 		return false
 	}
-	return payloadMessageCount(payload)*2 <= binding.LastMessageCount
+	messageCount := payloadMessageCount(payload)
+	return messageCount > 0 && messageCount*2 <= binding.LastMessageCount
 }
 
 func payloadMessageCount(payload []byte) int {
@@ -788,8 +776,11 @@ func payloadMessageCount(payload []byte) int {
 			Messages []json.RawMessage `json:"messages"`
 		} `json:"request"`
 	}
-	if len(payload) == 0 || json.Unmarshal(payload, &body) != nil {
+	if len(payload) == 0 {
 		return 0
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		panic(fmt.Errorf("decode group history payload: %w", err))
 	}
 	if n := len(body.Messages); n > 0 {
 		return n
@@ -797,61 +788,91 @@ func payloadMessageCount(payload []byte) int {
 	return len(body.Request.Messages)
 }
 
-// groupSessionKey extracts the session identity for a group executor request from host metadata,
-// the request payload (Claude metadata.user_id or OpenAI/Codex session fields), or headers.
+// A parent identity describes ancestry, not the transcript whose routing state may be reset.
 func groupSessionKey(req executorRequest) string {
-	if s := sessionKey(req.Metadata); s != "" {
-		return s
-	}
+	key := sessionKey(req.Metadata)
 	var body struct {
 		SessionID      string `json:"session_id"`
 		ConversationID string `json:"conversation_id"`
 		PromptCacheKey string `json:"prompt_cache_key"`
 		Metadata       struct {
-			UserID string `json:"user_id"`
+			UserID     string `json:"user_id"`
+			AgentID    string `json:"agent_id"`
+			SubagentID string `json:"subagent_id"`
 		} `json:"metadata"`
 		Request struct {
 			Metadata struct {
-				UserID string `json:"user_id"`
+				UserID     string `json:"user_id"`
+				AgentID    string `json:"agent_id"`
+				SubagentID string `json:"subagent_id"`
 			} `json:"metadata"`
 		} `json:"request"`
 	}
-	if len(req.Payload) > 0 && json.Unmarshal(req.Payload, &body) == nil {
+	var agentID string
+	if len(req.Payload) > 0 {
+		if err := json.Unmarshal(req.Payload, &body); err != nil {
+			panic(fmt.Errorf("decode group session payload: %w", err))
+		}
 		userID := strings.TrimSpace(body.Metadata.UserID)
 		if userID == "" {
 			userID = strings.TrimSpace(body.Request.Metadata.UserID)
 		}
+		for _, candidate := range []string{body.Metadata.AgentID, body.Metadata.SubagentID, body.Request.Metadata.AgentID, body.Request.Metadata.SubagentID} {
+			if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+				agentID = trimmed
+				break
+			}
+		}
 		if strings.HasPrefix(userID, "{") {
 			var parsed struct {
-				SessionID       string `json:"session_id"`
-				ParentSessionID string `json:"parent_session_id"`
-				ParentAgentID   string `json:"parent_agent_id"`
-				ParentID        string `json:"parent_id"`
+				SessionID  string `json:"session_id"`
+				AgentID    string `json:"agent_id"`
+				SubagentID string `json:"subagent_id"`
 			}
-			if json.Unmarshal([]byte(userID), &parsed) == nil {
-				for _, candidate := range []string{parsed.ParentSessionID, parsed.ParentAgentID, parsed.ParentID, parsed.SessionID} {
-					if trimmed := strings.TrimSpace(candidate); trimmed != "" {
-						return "claude:" + trimmed
-					}
+			if err := json.Unmarshal([]byte(userID), &parsed); err != nil {
+				panic(fmt.Errorf("decode Claude session metadata: %w", err))
+			}
+			if sid := strings.TrimSpace(parsed.SessionID); sid != "" {
+				key = "claude:" + sid
+			}
+			for _, candidate := range []string{parsed.AgentID, parsed.SubagentID} {
+				if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+					agentID = trimmed
+					break
 				}
 			}
 		} else if idx := strings.LastIndex(userID, "_session_"); idx != -1 {
 			if sid := strings.TrimSpace(userID[idx+len("_session_"):]); sid != "" {
-				return "claude:" + sid
+				key = "claude:" + sid
 			}
 		}
-		for _, candidate := range []string{body.SessionID, body.ConversationID, body.PromptCacheKey} {
-			if trimmed := strings.TrimSpace(candidate); trimmed != "" {
-				return "session:" + trimmed
+		if key == "" {
+			for _, candidate := range []string{body.SessionID, body.ConversationID, body.PromptCacheKey} {
+				if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+					key = "session:" + trimmed
+					break
+				}
 			}
 		}
 	}
-	for _, header := range []string{"Session_id", "X-Session-Id", "Conversation_id", "X-Claude-Code-Session-Id"} {
-		if val := strings.TrimSpace(http.Header(req.Headers).Get(header)); val != "" {
-			return "header:" + val
+	if key == "" {
+		for _, header := range []string{"Session_id", "X-Session-Id", "Conversation_id", "X-Claude-Code-Session-Id"} {
+			if val := strings.TrimSpace(req.Headers.Get(header)); val != "" {
+				key = "header:" + val
+				break
+			}
 		}
 	}
-	return ""
+	if key == "" {
+		return ""
+	}
+	if agentID != "" {
+		key += "\x00agent:" + agentID
+	}
+	if isAuxiliaryRequest(req.Payload) {
+		key += "\x00auxiliary"
+	}
+	return key
 }
 
 // isAuxiliaryRequest reports whether the request is a background helper call (such as Claude Code's

@@ -367,6 +367,107 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 	}
 }
 
+func TestGroupSessionKeySeparatesConversations(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		want    string
+	}{
+		{"own session before host", `{"metadata":{"user_id":"{\"session_id\":\"child\",\"parent_session_id\":\"parent\"}"}}`, "claude:child"},
+		{"parent agent is not identity", `{"metadata":{"user_id":"{\"session_id\":\"child\",\"parent_agent_id\":\"parent\"}"}}`, "claude:child"},
+		{"agent within session", `{"metadata":{"user_id":"{\"session_id\":\"parent\",\"agent_id\":\"worker-a\"}"}}`, "claude:parent\x00agent:worker-a"},
+		{"sibling within session", `{"metadata":{"user_id":"{\"session_id\":\"parent\",\"subagent_id\":\"worker-b\"}"}}`, "claude:parent\x00agent:worker-b"},
+		{"legacy agent", `{"metadata":{"user_id":"user_abc_session_parent","agent_id":"worker-a"}}`, "claude:parent\x00agent:worker-a"},
+		{"wrapped metadata", `{"request":{"metadata":{"user_id":"{\"session_id\":\"child\",\"parent_id\":\"parent\"}"}}}`, "claude:child"},
+		{"host without client identity", `{"messages":[]}`, "shared-host"},
+		{"helper conversation", `{"metadata":{"user_id":"user_abc_session_parent"},"messages":[{"role":"user","content":"Your task is to create a detailed summary of the conversation"}]}`, "claude:parent\x00auxiliary"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := executorRequest{Payload: []byte(tc.payload), Metadata: map[string]any{metadataCanonicalSessionID: "shared-host"}}
+			if got := groupSessionKey(req); got != tc.want {
+				t.Fatalf("groupSessionKey() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestChildAndHelperRequestsPreserveParentRefusal(t *testing.T) {
+	resetHostState(t)
+	cfg := defaultPluginConfig()
+	group := modelGroup{ID: "smart", Strategy: groupStrategyUpgrade, Models: []string{"primary", "fallback"}}
+	now := time.Now()
+	messages := make([]map[string]string, 20)
+	for i := range messages {
+		messages[i] = map[string]string{"role": "user", "content": strings.Repeat("x", 8*1024)}
+	}
+	payload, err := json.Marshal(map[string]any{
+		"metadata": map[string]string{"user_id": `{"session_id":"parent"}`},
+		"messages": messages,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := executorRequest{Payload: payload, Metadata: map[string]any{metadataCanonicalSessionID: "shared-host"}}
+	parentKey := groupSessionKey(parent)
+	recordSessionModelFailure(parentKey, group.ID, "primary", "refusal (cyber)", len(payload), now)
+	bindGroupSessionWithPayload(cfg, parentKey, group.ID, "fallback", "", payload, now)
+	if tip := compactionTipForSession(cfg, parentKey, group, nil, "fallback", len(payload)); tip == "" {
+		t.Fatal("missing initial tip")
+	}
+	for _, childPayload := range []string{
+		`{"metadata":{"user_id":"{\"session_id\":\"child-a\",\"parent_session_id\":\"parent\"}"},"messages":[{"role":"user","content":"audit"}]}`,
+		`{"metadata":{"user_id":"{\"session_id\":\"parent\",\"agent_id\":\"child-b\"}"},"messages":[{"role":"user","content":"audit"}]}`,
+		`{"metadata":{"user_id":"{\"session_id\":\"parent\"}"},"messages":[{"role":"user","content":"Your task is to create a detailed summary of the conversation"}]}`,
+	} {
+		child := executorRequest{Payload: []byte(childPayload), Metadata: parent.Metadata}
+		childKey := groupSessionKey(child)
+		if childKey == parentKey {
+			t.Fatal("child/helper shares parent routing key")
+		}
+		planGroupExecution(cfg, childKey, group, child.Payload, now)
+		recordSessionModelFailure(childKey, group.ID, "primary", "refusal (cyber)", len(child.Payload), now)
+		bindGroupSessionWithPayload(cfg, childKey, group.ID, "fallback", "", child.Payload, now)
+		plan := planGroupExecution(cfg, parentKey, group, payload, now)
+		if plan.Compacted || len(plan.Parallel) != 0 || strings.Join(plan.Sequential, ",") != "fallback" {
+			t.Fatalf("child/helper changed parent plan: %+v", plan)
+		}
+		if tip := compactionTipForSession(cfg, parentKey, group, nil, "fallback", len(payload)); tip != "" {
+			t.Fatalf("child/helper reset parent's tip: %q", tip)
+		}
+	}
+}
+
+func TestGroupDoesNotRetrySkippedModelsWhenExhausted(t *testing.T) {
+	for _, strategy := range []string{groupStrategyUpgrade, groupStrategyStick, groupStrategyRace, groupStrategyQuota, groupStrategyRandom} {
+		t.Run(strategy, func(t *testing.T) {
+			resetHostState(t)
+			cfg := defaultPluginConfig()
+			group := modelGroup{ID: "smart", Strategy: strategy, Models: []string{"primary", "fallback"}}
+			now := time.Now()
+			payload := []byte(`{"messages":[{"role":"user","content":"work"}]}`)
+			recordSessionModelFailure("session", group.ID, "primary", "refusal (cyber)", len(payload), now)
+			bindGroupSessionWithPayload(cfg, "session", group.ID, "fallback", "", payload, now)
+			plan := planGroupExecution(cfg, "session", group, payload, now)
+			if strings.Join(plan.Sequential, ",") != "fallback" || len(plan.Parallel) != 0 {
+				t.Fatalf("refused model was scheduled: %+v", plan)
+			}
+			recordSessionModelFailure("session", group.ID, "fallback", "refusal (cyber)", len(payload), now)
+			plan = planGroupExecution(cfg, "session", group, payload, now)
+			if len(plan.Sequential) != 0 || len(plan.Parallel) != 0 || len(plan.Skipped) != 2 {
+				t.Fatalf("exhausted plan retried skipped models: %+v", plan)
+			}
+		})
+	}
+}
+
+func TestCompactionRequiresConversationMessages(t *testing.T) {
+	binding := &sessionBinding{LastPayloadBytes: 256 * 1024, LastMessageCount: 100}
+	if conversationCompacted(binding, []byte(`{"model":"smart"}`)) {
+		t.Fatal("request without messages treated as compaction")
+	}
+}
+
 func TestProgrammaticCompactionResetAndCapabilitySkips(t *testing.T) {
 	resetHostState(t)
 	cfg := defaultPluginConfig()

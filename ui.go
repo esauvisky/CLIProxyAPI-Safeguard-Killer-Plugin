@@ -446,6 +446,7 @@ const uiHTML = `<!doctype html>
   .model-row { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 6px; }
   .model-row .model-id { flex: 1; min-width: 160px; }
   .model-row .model-rating { width: 100px; }
+  .model-row .model-score { min-width: 200px; align-self: center; padding-bottom: 2px; }
   .add-row { display: flex; gap: 6px; align-items: center; }
   .attempts { margin: 6px 0 0; padding-left: 20px; font-size: 12px; }
   .attempts li { padding: 1px 4px; border-radius: 4px; }
@@ -1128,6 +1129,52 @@ const MODE_HINTS = {
   cost: 'Lower cost first: score = 0.2 × quality − 0.8 × cost.',
 };
 
+// Mirrors scoreModels and setSelectionProbabilities in routing.go for a new conversation in which
+// every model is eligible.
+const SCORE_TOLERANCE = 3;
+const SCORE_TEMPERATURE = 1;
+
+function draftModelScores(g) {
+  const out = g.models.map(m => {
+    const q = parseNum(String(m.quality));
+    const c = parseNum(String(m.cost));
+    const valid = Number.isFinite(q) && Number.isFinite(c) && q >= 0 && q <= 100 && c >= 0 && c <= 100;
+    if (!valid || (g.mode !== 'quality' && g.mode !== 'cost')) return { valid: false };
+    const score = g.mode === 'quality' ? 0.8 * q - 0.2 * c : 0.2 * q - 0.8 * c;
+    return { valid: true, score: score, probability: 0, gap: 0, inPool: false };
+  });
+  let best = -Infinity;
+  for (const e of out) if (e.valid && e.score > best) best = e.score;
+  let total = 0;
+  for (const e of out) {
+    if (!e.valid) continue;
+    e.gap = best - e.score;
+    e.inPool = e.gap <= SCORE_TOLERANCE;
+    if (e.inPool) {
+      e.probability = Math.exp((e.score - best) / SCORE_TEMPERATURE);
+      total += e.probability;
+    }
+  }
+  for (const e of out) if (e.inPool) e.probability /= total;
+  return out;
+}
+
+function renderScoreCell(e) {
+  if (!e.valid) return '<span class="subtle">score: needs valid ratings</span>';
+  const score = 'score <span class="mono">' + e.score.toFixed(1) + '</span>';
+  if (e.inPool) {
+    return '<span class="badge ok">in pool</span> ' + score + ' · <span class="mono">' + (e.probability * 100).toFixed(1) + '%</span>';
+  }
+  return '<span class="badge">not picked</span> ' + score + ' · <span class="mono">' + e.gap.toFixed(1) + '</span> below best';
+}
+
+function refreshGroupScores(gi) {
+  const scores = draftModelScores(draft.groups[gi]);
+  scores.forEach((e, j) => {
+    document.querySelector('[data-score-cell="' + gi + '.' + j + '"]').innerHTML = renderScoreCell(e);
+  });
+}
+
 function renderGroups() {
   const root = document.getElementById('groupsEditor');
   document.getElementById('groupCount').textContent = String(draft.groups.length);
@@ -1137,6 +1184,7 @@ function renderGroups() {
     return;
   }
   root.innerHTML = draft.groups.map((g, i) => {
+    const scores = draftModelScores(g);
     const models = g.models.map((m, j) =>
       '<li class="model-row">' +
         '<label class="field model-id"><span class="cfg-key">Model ID</span>' +
@@ -1145,6 +1193,7 @@ function renderGroups() {
           '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.quality) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="quality"' + groupFieldAttr(i, 'models.' + j + '.quality') + '></label>' +
         '<label class="field model-rating"><span class="cfg-key">Cost</span>' +
           '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.cost) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="cost"' + groupFieldAttr(i, 'models.' + j + '.cost') + '></label>' +
+        '<div class="model-score small" data-score-cell="' + i + '.' + j + '">' + renderScoreCell(scores[j]) + '</div>' +
         '<button class="btn sm danger" data-action="model-remove" data-group="' + i + '" data-model="' + j + '" title="Remove">&times;</button>' +
       '</li>'
     ).join('');
@@ -1161,7 +1210,7 @@ function renderGroups() {
           '</select></label>' +
         '<button class="btn sm danger" data-action="group-remove" data-group="' + i + '">Delete group</button>' +
       '</div>' +
-      '<div class="hint" style="margin-top:6px" data-group-hint="' + i + '">' + esc(MODE_HINTS[g.mode]) + ' Weighted selection includes only eligible models within 3 points of the best score, using softmax temperature = 1. Credential balancing is separate: account weight, quota bottleneck, and load.' + '</div>' +
+      '<div class="hint" style="margin-top:6px" data-group-hint="' + i + '">' + esc(MODE_HINTS[g.mode]) + ' Models in the pool are within 3 points of the best score and share new conversations by the percentages shown (softmax, temperature 1). Percentages assume every model is eligible; refused or unavailable models drop out and the pool is recalculated. Credential balancing is separate: account weight, quota bottleneck, and load.' + '</div>' +
       '<ul class="model-list">' + models + '</ul>' +
       '<div class="add-row">' +
         '<input class="input grow mono" list="modelList" placeholder="Add model (pick or type)" value="' + esc(g.pending) + '" data-group="' + i + '" data-gfield="pending"' + groupFieldAttr(i, 'add') + '>' +
@@ -1207,6 +1256,7 @@ function onEditorInput(ev) {
   const g = draft.groups[Number(el.dataset.group)];
   if (el.dataset.model !== undefined) {
     g.models[Number(el.dataset.model)][el.dataset.mfield] = el.value;
+    if (el.dataset.mfield !== 'id') refreshGroupScores(Number(el.dataset.group));
     setDirty(true);
   } else if (el.dataset.gfield === 'pending') {
     // Text in the add box is not part of the config until "Add model".

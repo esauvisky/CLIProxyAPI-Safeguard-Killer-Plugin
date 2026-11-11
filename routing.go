@@ -35,7 +35,6 @@ type conversationState struct {
 	Turns            int                             `json:"turns,omitempty"`
 	LastPayloadBytes int                             `json:"last_payload_bytes,omitempty"`
 	LastMessageCount int                             `json:"last_message_count,omitempty"`
-	TipShown         bool                            `json:"tip_shown,omitempty"`
 	CacheWarm        bool                            `json:"cache_warm,omitempty"`
 	LastSeen         time.Time                       `json:"last_seen"`
 	BoundAt          time.Time                       `json:"bound_at"`
@@ -186,19 +185,18 @@ func planConversation(cfg pluginConfig, session string, group modelGroup, payloa
 		state = groupStates[session+"\x00"+group.ID]
 	}
 	if state != nil {
-		plan.PrevModel = state.Current
 		if state.conversationCompactedLocked(payload) {
 			beforeBytes, beforeMessages := state.LastPayloadBytes, state.LastMessageCount
 			plan.Compacted = true
 			state.Current = ""
 			state.Failures = make(map[string]*conversationFailure)
-			state.TipShown = false
 			state.CacheWarm = false
 			state.LastPayloadBytes = len(payload)
 			state.LastMessageCount = payloadMessageCount(payload)
 			savePersistedSessionsLocked()
 			logRoutingLocked(group, session, "compaction", fmt.Sprintf("payload %d to %d bytes, messages %d to %d", beforeBytes, len(payload), beforeMessages, state.LastMessageCount))
 		}
+		plan.PrevModel = state.Current
 	}
 	active := ""
 	if state != nil {
@@ -450,48 +448,6 @@ func observeConversationUsage(session, groupID string, chunk []byte) {
 		}
 	}
 	stateMu.Unlock()
-}
-
-// The tip appears once after a preferred model refuses a large conversation.
-func compactionTipForSession(cfg pluginConfig, session string, group modelGroup, attempts []groupAttempt, served string, payloadBytes int) string {
-	if !cfg.Features.ClientFallbackNotices || session == "" || payloadBytes < dilutionBaseBytes {
-		return ""
-	}
-	bestScore := math.Inf(-1)
-	primary := ""
-	for _, candidate := range scoreModels(group) {
-		if candidate.Score > bestScore {
-			primary, bestScore = candidate.Model, candidate.Score
-		}
-	}
-	if primary == "" || primary == served {
-		return ""
-	}
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	state, ok := groupStates[session+"\x00"+group.ID]
-	if !ok || state == nil || state.TipShown {
-		return ""
-	}
-	refused := false
-	if f, ok := state.Failures[primary]; ok && f != nil && f.Kind == "refusal" {
-		refused = true
-	}
-	if !refused {
-		for _, a := range attempts {
-			if a.Model == primary && strings.HasPrefix(a.Result, "failed: ") && classifyAttemptFailure(strings.TrimPrefix(a.Result, "failed: ")) == "refusal" {
-				refused = true
-				break
-			}
-		}
-	}
-	if !refused {
-		return ""
-	}
-	state.TipShown = true
-	savePersistedSessionsLocked()
-	logRoutingLocked(group, session, "tip", "preferred "+primary+" refused; /compact reselects")
-	return fmt.Sprintf("💡 Tip: compact history (`/compact`) to make `%s` eligible again", primary)
 }
 
 // conversationKey extracts the conversation identity for a group executor
@@ -824,7 +780,6 @@ func computeRoutingMetrics() routingMetrics {
 				m.CompactionResets++
 			case "failure":
 				failed++
-			case "tip":
 			}
 		case "group":
 			if d.AuthID != "" {

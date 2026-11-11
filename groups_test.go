@@ -278,7 +278,7 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 	if !strings.Contains(streamOut, "Here is the answer.") {
 		t.Fatalf("emitted stream = %q, want answer from abliterated", streamOut)
 	}
-	if !strings.Contains(streamOut, "`glm-5.3-uncensored` (0s, refusal: cyber) → `deepseek-v4.1-flash-uncensored` (0s, refusal: regex) → `abliterated`") {
+	if !strings.Contains(streamOut, "`glm-5.3-uncensored` (0s, refusal: cyber) → `deepseek-v4.1-flash-uncensored` (0s, refusal: regex) → using `abliterated` from here onwards") {
 		t.Fatalf("emitted stream missing fallback notice: %q", streamOut)
 	}
 	if strings.Join(openedModels, ",") != "glm-5.3-uncensored,deepseek-v4.1-flash-uncensored,abliterated" {
@@ -332,7 +332,7 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 		t.Fatalf("after 20m idle without dilution openedModels = %v, want [abliterated]", openedModels)
 	}
 
-	// Growth does not retry models that refused. The first large turn tells the user once.
+	// Growth does not retry models that refused and prints nothing while the model is unchanged.
 	stateMu.Lock()
 	for _, b := range groupStates {
 		b.Turns += 12
@@ -360,25 +360,8 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 	if gotOpened != "abliterated" {
 		t.Fatalf("after growth openedModels = %q, want [abliterated]", gotOpened)
 	}
-	if !strings.Contains(allEmitted.String(), "Tip: compact history (`/compact`)") {
-		t.Fatalf("expected one compaction tip on the first large fallback turn, got: %q", allEmitted.String())
-	}
-	testMu.Lock()
-	openedModels = nil
-	testMu.Unlock()
-	if _, errExec := executeGroupStream([]byte(dilutedReqJSON), groupConfig()); errExec != nil {
-		t.Fatalf("fifth executeGroupStream() error = %v", errExec)
-	}
-	allEmitted.Reset()
-	for {
-		ev := <-emitted
-		if ev == "close" {
-			break
-		}
-		allEmitted.WriteString(ev)
-	}
-	if strings.Contains(allEmitted.String(), "Tip: compact history") {
-		t.Fatalf("compaction tip repeated: %q", allEmitted.String())
+	if strings.Contains(allEmitted.String(), defaultNoticePrefix) {
+		t.Fatalf("large turn on an unchanged model printed a notice: %q", allEmitted.String())
 	}
 }
 
@@ -427,9 +410,6 @@ func TestChildAndHelperRequestsPreserveParentRefusal(t *testing.T) {
 	parentKey := conversationKey(parent)
 	recordConversationFailure(parentKey, group.ID, "primary", "refusal (cyber)", payload, now)
 	recordServed(cfg, parentKey, group.ID, "fallback", "", payload, now)
-	if tip := compactionTipForSession(cfg, parentKey, group, nil, "fallback", len(payload)); tip == "" {
-		t.Fatal("missing initial tip")
-	}
 	for _, childPayload := range []string{
 		`{"metadata":{"user_id":"{\"session_id\":\"child-a\",\"parent_session_id\":\"parent\"}"},"messages":[{"role":"user","content":"audit"}]}`,
 		`{"metadata":{"user_id":"{\"session_id\":\"parent\",\"agent_id\":\"child-b\"}"},"messages":[{"role":"user","content":"audit"}]}`,
@@ -447,9 +427,6 @@ func TestChildAndHelperRequestsPreserveParentRefusal(t *testing.T) {
 		model, ok := plan.nextModel(0)
 		if plan.Err != nil || plan.Compacted || !ok || model != "fallback" {
 			t.Fatalf("child/helper changed parent plan: %+v", plan)
-		}
-		if tip := compactionTipForSession(cfg, parentKey, group, nil, "fallback", len(payload)); tip != "" {
-			t.Fatalf("child/helper reset parent's tip: %q", tip)
 		}
 	}
 }
@@ -547,7 +524,7 @@ func TestProgrammaticCompactionResetAndCapabilitySkips(t *testing.T) {
 
 	compactedPayload := []byte(`{"messages":[{"text":"compacted summary"}]}`)
 	plan4 := planConversation(cfg, sess, group, compactedPayload, now.Add(25*time.Minute))
-	if plan4.Err != nil || !plan4.Compacted || plan4.Sticky || plan4.Scores[0].Probability != 1 || len(plan4.Skipped) != 0 {
+	if plan4.Err != nil || !plan4.Compacted || plan4.Sticky || plan4.PrevModel != "" || plan4.Scores[0].Probability != 1 || len(plan4.Skipped) != 0 {
 		t.Fatalf("plan4 after compaction = %+v, want compaction and m1 selected", plan4)
 	}
 }
@@ -619,7 +596,7 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 		{Model: "kimi-k3.1-pro", Result: "served", Duration: 2 * time.Second},
 	}
 
-	gotConcise := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5", nil)
+	gotConcise := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5", false, nil)
 	wantConcise := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal: cyber) → `gemini-4-argon-high` (4s, refusal: regex) → `kimi-k3.1-pro`"
 	if gotConcise != wantConcise {
 		t.Fatalf("concise notice = %q, want %q", gotConcise, wantConcise)
@@ -628,7 +605,7 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 	gotSameModelQuota := buildGroupNotice(cfg, group, []groupAttempt{
 		{Model: "gpt-6.1-sol", Result: "failed: insufficient_quota", Duration: 0},
 		{Model: "grok-4.7", Result: "served", Duration: time.Second},
-	}, "grok-4.7", "grok-4.7", nil)
+	}, "grok-4.7", "grok-4.7", false, nil)
 	if gotSameModelQuota != "" {
 		t.Fatalf("unchanged model with only a quota failure printed %q", gotSameModelQuota)
 	}
@@ -636,15 +613,24 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 		{Model: "claude-opus-5-5", Result: "failed: refusal (cyber)", Duration: 6 * time.Second},
 		{Model: "gpt-6.1-sol", Result: "failed: insufficient_quota", Duration: 0},
 		{Model: "grok-4.7", Result: "served", Duration: time.Second},
-	}, "grok-4.7", "grok-4.7", nil)
+	}, "grok-4.7", "grok-4.7", false, nil)
 	if gotSameModelRefusal == "" {
 		t.Fatal("unchanged model with a refusal was silenced")
 	}
 
-	gotSwitchConcise := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high", nil)
+	gotSwitchConcise := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high", false, nil)
 	wantSwitchConcise := "⚡ [Safeguard Killer] `gemini-4-argon-high` → `claude-opus-5-5`"
 	if gotSwitchConcise != wantSwitchConcise {
 		t.Fatalf("concise switch notice = %q, want %q", gotSwitchConcise, wantSwitchConcise)
+	}
+
+	gotStarted := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "", true, nil)
+	if want := "⚡ [Safeguard Killer] using `claude-opus-5-5` from here onwards"; gotStarted != want {
+		t.Fatalf("started notice = %q, want %q", gotStarted, want)
+	}
+	gotStartedAfterRefusal := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "", true, nil)
+	if want := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal: cyber) → `gemini-4-argon-high` (4s, refusal: regex) → using `kimi-k3.1-pro` from here onwards"; gotStartedAfterRefusal != want {
+		t.Fatalf("started-after-refusal notice = %q, want %q", gotStartedAfterRefusal, want)
 	}
 
 	gotExhaustedConcise := buildGroupExhaustedNotice(cfg, group, attempts[:2])
@@ -654,13 +640,13 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 	}
 
 	cfg.Features.VerboseNotices = true
-	gotVerbose := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5", nil)
+	gotVerbose := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5", false, nil)
 	wantVerbose := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal (cyber)) → `gemini-4-argon-high` (4s, refusal (text)) → switched to `kimi-k3.1-pro`"
 	if gotVerbose != wantVerbose {
 		t.Fatalf("verbose notice = %q, want %q", gotVerbose, wantVerbose)
 	}
 
-	gotSwitchVerbose := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high", nil)
+	gotSwitchVerbose := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high", false, nil)
 	wantSwitchVerbose := "⚡ [Safeguard Killer] switched from `gemini-4-argon-high` → `claude-opus-5-5`"
 	if gotSwitchVerbose != wantSwitchVerbose {
 		t.Fatalf("verbose switch notice = %q, want %q", gotSwitchVerbose, wantSwitchVerbose)

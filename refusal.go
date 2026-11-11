@@ -15,10 +15,6 @@ import (
 )
 
 const (
-	// dilutionBaseBytes is the payload size at which a session on a fallback model is large enough
-	// for one compaction tip.
-	dilutionBaseBytes = 128 * 1024
-
 	// Compaction (/compact, auto-compaction, /clear) both shrinks the payload and collapses the
 	// message list. A byte shrink alone is Claude Code clearing old tool results, not compaction.
 	compactionMinPrevBytes = 32 * 1024
@@ -253,12 +249,13 @@ func summarizeAttemptReason(detail string) string {
 	return strings.Join(strings.Fields(detail), " ")
 }
 
-// buildGroupNotice formats a user-visible line when a model in the group failed/refused and CPA
-// recovered on a fallback model, or when the active model for the session changed.
+// buildGroupNotice formats a user-visible line when a conversation starts on a newly selected
+// model, when a model in the group failed/refused and CPA recovered on another model, or when the
+// active model for the session changed.
 // A session that stayed on its model is silent when every other attempt was only a transient
 // cooldown (quota, rate limit, upstream): those retries are not news. A refusal, an empty
 // response, or a capability rejection still prints.
-func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttempt, served, prevModel string, suppressedRefusalNotices map[string]bool) string {
+func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttempt, served, prevModel string, started bool, suppressedRefusalNotices map[string]bool) string {
 	if !cfg.Features.ClientFallbackNotices {
 		return ""
 	}
@@ -297,6 +294,12 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 			failedChain = append(failedChain, fmt.Sprintf("`%s` (%s)", attempt.Model, reason))
 		}
 	}
+	if started {
+		if len(failedChain) > 0 {
+			return fmt.Sprintf("%s%s → using `%s` from here onwards", prefix, strings.Join(failedChain, " → "), served)
+		}
+		return fmt.Sprintf("%susing `%s` from here onwards", prefix, served)
+	}
 	modelChanged := prevModel != "" && prevModel != served
 	if !hadActiveFailure && !modelChanged {
 		return ""
@@ -314,16 +317,6 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 		return fmt.Sprintf("%sswitched from `%s` → `%s`", prefix, prevModel, served)
 	}
 	return fmt.Sprintf("%s`%s` → `%s`", prefix, prevModel, served)
-}
-
-func appendNoticeTip(cfg pluginConfig, notice, tip string) string {
-	if tip == "" {
-		return notice
-	}
-	if notice == "" {
-		return cfg.Features.effectiveNoticePrefix() + tip
-	}
-	return notice + "\n" + cfg.Features.effectiveNoticePrefix() + tip
 }
 
 func hasRefusalAttempt(attempts []groupAttempt) bool {

@@ -228,8 +228,9 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		prevModel := recordServed(cfg, session, group.ID, model, prevLookupModel, req.Payload, time.Now())
 		observeConversationUsage(session, group.ID, resp.Body)
 		if !aux {
-			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, suppressedRefusals(session, group.ID, failedModels(attempts)))
-			notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, model, len(req.Payload)))
+			// Without a session identity every turn looks new, so only identified conversations announce a start.
+			started := session != "" && prevModel == ""
+			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)))
 			bodyOut = injectNonStreamNotice(resp.Body, effectiveFormat(req.Format, req.SourceFormat), notice)
 		}
 		return okEnvelope(executorResponse{Payload: bodyOut, Headers: cleanResponseHeaders(resp.Headers)})
@@ -304,8 +305,9 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 			observeConversationUsage(session, group.ID, ch)
 		}
 		if !aux {
-			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, suppressedRefusals(session, group.ID, failedModels(attempts)))
-			notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, model, len(req.Payload)))
+			// Without a session identity every turn looks new, so only identified conversations announce a start.
+			started := session != "" && prevModel == ""
+			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)))
 			prefetched, shiftIndices = injectStreamNotice(prefetched, effectiveFormat(req.Format, req.SourceFormat), notice)
 		}
 		go forwardStream(resp.StreamID, req.StreamID, req.HostCallbackID, prefetched, done, shiftIndices, stampSafeguards, cfg.Features.FallbackOnRefusal, session, group, model)

@@ -5,12 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -62,16 +60,14 @@ var refusalTaintHeaders = []string{
 	"x-cc-atis",
 }
 
-// groupSessions pins a (session, groupID) pair to its working model and tracks per-model failure
-// state, turn count, payload size, and cache telemetry across turns.
-var (
-	groupSessions    = make(map[string]*sessionBinding)
-	sessionStatePath = filepath.Join(os.TempDir(), "safeguard-killer-sessions.json")
-)
+// sessionStatePath is where session and conversation state is persisted across
+// restarts. groupStates lives in routing.go.
+var sessionStatePath = filepath.Join(os.TempDir(), "safeguard-killer-sessions.json")
 
 type persistedSessionState struct {
-	Sessions      map[string]*sessionBinding `json:"sessions"`
-	GroupSessions map[string]*sessionBinding `json:"group_sessions"`
+	Sessions      map[string]*sessionBinding    `json:"sessions"`
+	GroupSessions map[string]*sessionBinding    `json:"group_sessions"`
+	Conversations map[string]*conversationState `json:"conversations"`
 }
 
 func loadPersistedSessions(now time.Time) {
@@ -92,9 +88,9 @@ func loadPersistedSessions(now time.Time) {
 			sessions[k] = v
 		}
 	}
-	for k, v := range snap.GroupSessions {
+	for k, v := range snap.Conversations {
 		if v != nil && now.Sub(v.LastSeen) <= sessionRetention {
-			groupSessions[k] = v
+			groupStates[k] = v
 		}
 	}
 	stateMu.Unlock()
@@ -106,7 +102,7 @@ func savePersistedSessionsLocked() {
 	}
 	raw, errMarshal := json.Marshal(persistedSessionState{
 		Sessions:      sessions,
-		GroupSessions: groupSessions,
+		Conversations: groupStates,
 	})
 	if errMarshal != nil {
 		return
@@ -123,1207 +119,6 @@ func savePersistedSessions() {
 	stateMu.Unlock()
 }
 
-// groupRoutingPlan describes which models to race in parallel and which to try sequentially.
-type groupRoutingPlan struct {
-	Parallel   []string
-	Sequential []string
-	Skipped    []groupAttempt
-	PrevModel  string
-	Compacted  bool
-}
-
-func payloadHasImage(payload []byte) bool {
-	return bytes.Contains(payload, []byte(`"type":"image"`)) ||
-		bytes.Contains(payload, []byte(`"type": "image"`)) ||
-		bytes.Contains(payload, []byte(`"image_url"`))
-}
-
-func classifyAttemptFailure(rawDetail string) string {
-	summary := summarizeAttemptReason(rawDetail)
-	switch summary {
-	case "no tools":
-		return "no_tools"
-	case "not found":
-		return "not_found"
-	case "no vision":
-		return "no_vision"
-	case "context too long":
-		return "context_too_long"
-	case "empty response", "refusal":
-		return "refusal"
-	}
-	if strings.HasPrefix(summary, "refusal:") {
-		return "refusal"
-	}
-	return "transient"
-}
-
-func modelSkipReasonLocked(binding *sessionBinding, model string, payload []byte, now time.Time) string {
-	if binding == nil || len(binding.ModelStates) == 0 {
-		return ""
-	}
-	ms, ok := binding.ModelStates[model]
-	if !ok || ms == nil {
-		return ""
-	}
-	switch ms.FailureKind {
-	case "no_tools", "not_found":
-		return ms.Reason
-	case "no_vision":
-		if payloadHasImage(payload) {
-			return ms.Reason
-		}
-		delete(binding.ModelStates, model)
-		return ""
-	case "context_too_long":
-		if ms.FailedAtBytes > 0 && len(payload) >= ms.FailedAtBytes {
-			return ms.Reason
-		}
-		delete(binding.ModelStates, model)
-		return ""
-	case "refusal":
-		// The refused content stays in the history until compaction clears this record.
-		if binding.AuthID != "" {
-			return "sticky to " + binding.AuthID + " (cache warm)"
-		}
-		return ms.Reason
-	case "transient":
-		if binding.AuthID != "" && binding.AuthID != model && now.Sub(ms.FailedAt) < transientErrorCooldown {
-			return "sticky to " + binding.AuthID + " (cache warm)"
-		}
-		return ""
-	}
-	return ""
-}
-
-// planGroupExecution computes the parallel probe list and sequential fallback order for a group turn.
-func planGroupExecution(cfg pluginConfig, session string, group modelGroup, payload []byte, now time.Time) groupRoutingPlan {
-	var plan groupRoutingPlan
-	if len(group.Models) == 0 {
-		return plan
-	}
-	strategy := group.effectiveStrategy()
-	stickyEnabled := cfg.IdleMinutes > 0
-	var activeModel string
-	cacheStickActive := false
-
-	if session != "" {
-		key := session + "\x00" + group.ID
-		stateMu.Lock()
-		if binding, ok := groupSessions[key]; ok && binding != nil {
-			plan.PrevModel = binding.AuthID
-			if conversationCompacted(binding, payload) {
-				plan.Compacted = true
-				binding.ModelStates = nil
-				binding.AuthID = ""
-				binding.LastPayloadBytes = len(payload)
-				binding.LastMessageCount = payloadMessageCount(payload)
-				binding.LastTipTurn = 0
-				binding.CacheWarm = false
-				savePersistedSessionsLocked()
-			}
-			if stickyEnabled && binding.AuthID != "" {
-				activeModel = binding.AuthID
-				cacheStickActive = binding.CacheWarm || now.Before(binding.IdleExpiresAt)
-			}
-		}
-		stateMu.Unlock()
-	}
-
-	stateMu.Lock()
-	var binding *sessionBinding
-	if session != "" {
-		binding = groupSessions[session+"\x00"+group.ID]
-	}
-
-	if strategy == groupStrategyRace {
-		if activeModel != "" && cacheStickActive && modelSkipReasonLocked(binding, activeModel, payload, now) == "" {
-			plan.Sequential = append(plan.Sequential, activeModel)
-			for _, m := range group.Models {
-				if m == activeModel {
-					continue
-				}
-				if reason := modelSkipReasonLocked(binding, m, payload, now); reason != "" {
-					plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-					continue
-				}
-				plan.Sequential = append(plan.Sequential, m)
-			}
-			stateMu.Unlock()
-			return plan
-		}
-		for _, m := range group.Models {
-			if reason := modelSkipReasonLocked(binding, m, payload, now); reason != "" {
-				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-				continue
-			}
-			plan.Parallel = append(plan.Parallel, m)
-		}
-		stateMu.Unlock()
-		return plan
-	}
-
-	activeIdx := -1
-	if activeModel != "" {
-		for i, m := range group.Models {
-			if m == activeModel {
-				activeIdx = i
-				break
-			}
-		}
-	}
-
-	if activeIdx > 0 && (strategy == groupStrategyUpgrade || strategy == groupStrategyStick) {
-		var probeModels []string
-		for _, m := range group.Models[:activeIdx] {
-			if strategy == groupStrategyStick {
-				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: sticky to " + activeModel + " (cache warm)"})
-				continue
-			}
-			reason := modelSkipReasonLocked(binding, m, payload, now)
-			if reason != "" {
-				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-				continue
-			}
-			// If m has no recorded failure in ModelStates, only probe it once the active binding's
-			// idle window expires so normal consecutive turns stay pinned without racing.
-			if (binding == nil || binding.ModelStates[m] == nil) && cacheStickActive {
-				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: sticky to " + activeModel + " (cache warm)"})
-				continue
-			}
-			probeModels = append(probeModels, m)
-		}
-		if len(probeModels) > 0 {
-			for _, pm := range probeModels {
-				if binding != nil {
-					if binding.ModelStates == nil {
-						binding.ModelStates = make(map[string]*modelSessionState)
-					}
-					if ms, ok := binding.ModelStates[pm]; ok && ms != nil {
-						ms.FailedAtTurn = binding.Turns
-						ms.FailedAtBytes = len(payload)
-					}
-				}
-			}
-			plan.Parallel = append(plan.Parallel, probeModels...)
-			plan.Parallel = append(plan.Parallel, activeModel)
-			for _, m := range group.Models[activeIdx+1:] {
-				if reason := modelSkipReasonLocked(binding, m, payload, now); reason != "" {
-					plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-					continue
-				}
-				plan.Sequential = append(plan.Sequential, m)
-			}
-			stateMu.Unlock()
-			return plan
-		}
-		for _, m := range group.Models[activeIdx:] {
-			if reason := modelSkipReasonLocked(binding, m, payload, now); reason != "" {
-				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-				continue
-			}
-			plan.Sequential = append(plan.Sequential, m)
-		}
-		for _, m := range group.Models[:activeIdx] {
-			if modelSkipReasonLocked(binding, m, payload, now) == "" {
-				plan.Sequential = append(plan.Sequential, m)
-			}
-		}
-		stateMu.Unlock()
-		return plan
-	}
-
-	var eligible []string
-	for _, m := range group.Models {
-		if reason := modelSkipReasonLocked(binding, m, payload, now); reason != "" {
-			plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-			continue
-		}
-		eligible = append(eligible, m)
-	}
-	stateMu.Unlock()
-
-	if activeIdx >= 0 && cacheStickActive && containsString(eligible, activeModel) && (strategy == groupStrategyQuota || strategy == groupStrategyRandom) {
-		var rest []string
-		for _, m := range eligible {
-			if m != activeModel {
-				rest = append(rest, m)
-			}
-		}
-		orderedRest := orderByStrategy(cfg, rest, strategy, now)
-		plan.Sequential = append(plan.Sequential, activeModel)
-		plan.Sequential = append(plan.Sequential, orderedRest...)
-		return plan
-	}
-
-	plan.Sequential = orderByStrategy(cfg, eligible, strategy, now)
-	return plan
-}
-
-// groupCandidateOrder returns the model order to try for a group request, any initial sticky-skip
-// attempt records, and the model that served the previous turn in this session (if any).
-func groupCandidateOrder(cfg pluginConfig, session string, group modelGroup, now time.Time) (order []string, skipped []groupAttempt, prevModel string) {
-	plan := planGroupExecution(cfg, session, group, nil, now)
-	order = make([]string, 0, len(plan.Parallel)+len(plan.Sequential))
-	order = append(order, plan.Parallel...)
-	order = append(order, plan.Sequential...)
-	return order, plan.Skipped, plan.PrevModel
-}
-
-func orderByStrategy(cfg pluginConfig, models []string, strategy string, now time.Time) []string {
-	if len(models) <= 1 {
-		return append([]string(nil), models...)
-	}
-	switch strategy {
-	case groupStrategyRandom:
-		out := append([]string(nil), models...)
-		rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
-		return out
-	case groupStrategyQuota:
-		return orderByQuotaWeightedRandom(cfg, models, now)
-	default:
-		return append([]string(nil), models...)
-	}
-}
-
-// orderByQuotaWeightedRandom orders models using Efraimidis-Spirakis weighted random sampling
-// without replacement, weighted by each model's best eligible credential rate (remaining /
-// hours_to_reset), so usage spreads across providers proportional to available quota per hour.
-func orderByQuotaWeightedRandom(cfg pluginConfig, models []string, now time.Time) []string {
-	weights := make([]float64, len(models))
-	var positiveRates []float64
-	snapshot, errHost := hostState(now)
-	if errHost == nil && cfg.ManagementKey != "" {
-		ensureQuotaFresh(cfg.ManagementKey, snapshot.auths)
-		for i, model := range models {
-			bestRate := 0.0
-			sawCred := false
-			allExhausted := true
-			for _, auth := range snapshot.auths {
-				if auth.Disabled || !containsString(snapshot.models[auth.ID], model) {
-					continue
-				}
-				sawCred = true
-				entry := rankEntry{AuthID: auth.ID, Provider: auth.Provider}
-				rateCredential(&entry, model, cfg.MinRemaining, now)
-				if entry.Excluded == "" && entry.Rate > bestRate {
-					bestRate = entry.Rate
-					allExhausted = false
-				} else if !strings.Contains(entry.Excluded, "% left") {
-					allExhausted = false
-				}
-			}
-			if bestRate > 0 {
-				weights[i] = bestRate
-				positiveRates = append(positiveRates, bestRate)
-			} else if sawCred && allExhausted {
-				weights[i] = 1e-9
-			}
-		}
-	}
-	fallbackWeight := 1.0
-	if len(positiveRates) > 0 {
-		sum := 0.0
-		for _, r := range positiveRates {
-			sum += r
-		}
-		fallbackWeight = sum / float64(len(positiveRates))
-	}
-	type scoredModel struct {
-		model string
-		score float64
-	}
-	scored := make([]scoredModel, len(models))
-	for i, m := range models {
-		w := weights[i]
-		if w <= 0 {
-			w = fallbackWeight
-		}
-		u := rand.Float64()
-		if u <= 1e-12 {
-			u = 1e-12
-		}
-		// Efraimidis-Spirakis key u^(1/w); higher key (log(u)/w closer to 0) wins.
-		scored[i] = scoredModel{model: m, score: math.Log(u) / w}
-	}
-	sort.SliceStable(scored, func(i, j int) bool {
-		return scored[i].score > scored[j].score
-	})
-	out := make([]string, len(models))
-	for i, s := range scored {
-		out[i] = s.model
-	}
-	return out
-}
-
-func ensureGroupBindingLocked(session, groupID string, now time.Time) *sessionBinding {
-	key := session + "\x00" + groupID
-	binding, ok := groupSessions[key]
-	if !ok || binding == nil {
-		binding = &sessionBinding{
-			Session:     session,
-			Provider:    groupProvider,
-			Model:       groupID,
-			BoundAt:     now,
-			LastSeen:    now,
-			ModelStates: make(map[string]*modelSessionState),
-		}
-		groupSessions[key] = binding
-	} else if binding.ModelStates == nil {
-		binding.ModelStates = make(map[string]*modelSessionState)
-	}
-	return binding
-}
-
-// recordSessionModelFailure records how a model in a Smart Group failed within a session so
-// subsequent turns apply the appropriate dilution gate, capability skip, or transient cooldown.
-func recordSessionModelFailure(session, groupID, model, rawDetail string, payloadBytes int, now time.Time) {
-	if summarizeAttemptReason(rawDetail) == "insufficient quota" {
-		noteQuotaDenied(model, now)
-	}
-	if session == "" || groupID == "" || model == "" {
-		return
-	}
-	kind := classifyAttemptFailure(rawDetail)
-	reason := summarizeAttemptReason(rawDetail)
-	stateMu.Lock()
-	binding := ensureGroupBindingLocked(session, groupID, now)
-	ms, ok := binding.ModelStates[model]
-	if !ok || ms == nil {
-		ms = &modelSessionState{}
-		binding.ModelStates[model] = ms
-	}
-	ms.FailureKind = kind
-	ms.Reason = reason
-	if kind == "refusal" {
-		ms.RefusalCount++
-	}
-	ms.FailedAtTurn = binding.Turns
-	ms.FailedAtBytes = payloadBytes
-	ms.FailedAt = now
-	savePersistedSessionsLocked()
-	stateMu.Unlock()
-}
-
-// promoteProbedModel promotes a probed higher-priority model that finished prefetch without
-// refusing after a faster fallback model already won the parallel race on the current turn, so
-// the next turn uses the higher model directly.
-func promoteProbedModel(cfg pluginConfig, session, groupID, model string, now time.Time) {
-	if session == "" || groupID == "" || model == "" {
-		return
-	}
-	stateMu.Lock()
-	binding := ensureGroupBindingLocked(session, groupID, now)
-	delete(binding.ModelStates, model)
-	binding.AuthID = model
-	binding.LastSeen = now
-	binding.IdleExpiresAt = now.Add(time.Duration(cfg.IdleMinutes) * time.Minute)
-	savePersistedSessionsLocked()
-	stateMu.Unlock()
-}
-
-// bindGroupSession records the model that served a group request and returns the model that had
-// served the previous turn in this session (empty if none).
-func bindGroupSession(cfg pluginConfig, session, groupID, served, prevFromLookup string, now time.Time) string {
-	return bindGroupSessionWithPayload(cfg, session, groupID, served, prevFromLookup, nil, now)
-}
-
-func bindGroupSessionWithPayload(cfg pluginConfig, session, groupID, served, prevFromLookup string, payload []byte, now time.Time) string {
-	if session == "" {
-		return prevFromLookup
-	}
-	stateMu.Lock()
-	binding := ensureGroupBindingLocked(session, groupID, now)
-	prev := prevFromLookup
-	if prev == "" {
-		prev = binding.AuthID
-	}
-	if binding.AuthID != served || binding.BoundAt.IsZero() {
-		binding.BoundAt = now
-	}
-	binding.AuthID = served
-	binding.Provider = groupProvider
-	binding.Model = groupID
-	binding.LastSeen = now
-	binding.IdleExpiresAt = now.Add(time.Duration(cfg.IdleMinutes) * time.Minute)
-	binding.Turns++
-	if len(payload) > 0 {
-		binding.LastPayloadBytes = len(payload)
-		binding.LastMessageCount = payloadMessageCount(payload)
-	}
-	delete(binding.ModelStates, served)
-	savePersistedSessionsLocked()
-	stateMu.Unlock()
-	return prev
-}
-
-// advanceGroupSessionOnRefusal moves the session's sticky group model to the model after
-// failedModel when a refusal happens mid-stream (after the prefetch buffer was already flushed),
-// so the client's immediate continuation retry starts on the next model in the group.
-func advanceGroupSessionOnRefusal(session string, group modelGroup, failedModel string, now time.Time) {
-	if session == "" || len(group.Models) < 2 {
-		return
-	}
-	nextIdx := -1
-	for i, m := range group.Models {
-		if m == failedModel && i+1 < len(group.Models) {
-			nextIdx = i + 1
-			break
-		}
-	}
-	if nextIdx == -1 {
-		return
-	}
-	stateMu.Lock()
-	binding := ensureGroupBindingLocked(session, group.ID, now)
-	ms, ok := binding.ModelStates[failedModel]
-	if !ok || ms == nil {
-		ms = &modelSessionState{}
-		binding.ModelStates[failedModel] = ms
-	}
-	ms.FailureKind = "refusal"
-	ms.Reason = "refusal: stream"
-	ms.RefusalCount++
-	ms.FailedAtTurn = binding.Turns
-	ms.FailedAtBytes = binding.LastPayloadBytes
-	ms.FailedAt = now
-	binding.AuthID = group.Models[nextIdx]
-	binding.BoundAt = now
-	binding.LastSeen = now
-	binding.IdleExpiresAt = now.Add(groupCacheTTL)
-	savePersistedSessionsLocked()
-	stateMu.Unlock()
-}
-
-func extractUsageFromJSON(raw []byte) (inputTok, cacheReadTok, cacheCreateTok int, found bool) {
-	var env struct {
-		Usage *struct {
-			InputTokens              int `json:"input_tokens"`
-			PromptTokens             int `json:"prompt_tokens"`
-			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-			PromptTokensDetails      *struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-			InputTokensDetails *struct {
-				CachedTokens int `json:"cached_tokens"`
-			} `json:"input_tokens_details"`
-		} `json:"usage"`
-		Message *struct {
-			Usage *struct {
-				InputTokens              int `json:"input_tokens"`
-				CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-				CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-			} `json:"usage"`
-		} `json:"message"`
-		Response *struct {
-			Usage *struct {
-				InputTokens        int `json:"input_tokens"`
-				InputTokensDetails *struct {
-					CachedTokens int `json:"cached_tokens"`
-				} `json:"input_tokens_details"`
-			} `json:"usage"`
-		} `json:"response"`
-	}
-	if json.Unmarshal(raw, &env) != nil {
-		return 0, 0, 0, false
-	}
-	if u := env.Usage; u != nil {
-		in := u.InputTokens
-		if in == 0 {
-			in = u.PromptTokens
-		}
-		cr := u.CacheReadInputTokens
-		if cr == 0 && u.PromptTokensDetails != nil {
-			cr = u.PromptTokensDetails.CachedTokens
-		}
-		if cr == 0 && u.InputTokensDetails != nil {
-			cr = u.InputTokensDetails.CachedTokens
-		}
-		if in > 0 || cr > 0 || u.CacheCreationInputTokens > 0 {
-			return in, cr, u.CacheCreationInputTokens, true
-		}
-	}
-	if env.Message != nil && env.Message.Usage != nil {
-		u := env.Message.Usage
-		if u.InputTokens > 0 || u.CacheReadInputTokens > 0 || u.CacheCreationInputTokens > 0 {
-			return u.InputTokens, u.CacheReadInputTokens, u.CacheCreationInputTokens, true
-		}
-	}
-	if env.Response != nil && env.Response.Usage != nil {
-		u := env.Response.Usage
-		cr := 0
-		if u.InputTokensDetails != nil {
-			cr = u.InputTokensDetails.CachedTokens
-		}
-		if u.InputTokens > 0 || cr > 0 {
-			return u.InputTokens, cr, 0, true
-		}
-	}
-	return 0, 0, 0, false
-}
-
-func observeGroupSessionUsage(session, groupID string, chunk []byte) {
-	if session == "" || groupID == "" || len(chunk) == 0 {
-		return
-	}
-	if !bytes.Contains(chunk, []byte(`"usage"`)) {
-		return
-	}
-	trimmed := bytes.TrimSpace(chunk)
-	var inTok, crTok, ccTok int
-	found := false
-	if len(trimmed) > 0 && trimmed[0] == '{' {
-		inTok, crTok, ccTok, found = extractUsageFromJSON(trimmed)
-	} else {
-		for _, line := range bytes.Split(chunk, []byte("\n")) {
-			line = bytes.TrimSpace(line)
-			if !bytes.HasPrefix(line, []byte("data:")) {
-				continue
-			}
-			data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-			if len(data) == 0 || data[0] != '{' || !bytes.Contains(data, []byte(`"usage"`)) {
-				continue
-			}
-			if in, cr, cc, ok := extractUsageFromJSON(data); ok {
-				if in > 0 {
-					inTok = in
-				}
-				if cr > 0 {
-					crTok = cr
-				}
-				if cc > 0 {
-					ccTok = cc
-				}
-				found = true
-			}
-		}
-	}
-	if !found {
-		return
-	}
-	stateMu.Lock()
-	if binding, ok := groupSessions[session+"\x00"+groupID]; ok && binding != nil {
-		if inTok > 0 || crTok > 0 {
-			binding.LastInputTokens = inTok
-		}
-		if crTok > 0 {
-			binding.LastCacheReadTokens = crTok
-		} else if inTok > 0 && ccTok == 0 {
-			binding.LastCacheReadTokens = 0
-		}
-		if ccTok > 0 {
-			binding.LastCacheCreateTokens = ccTok
-		}
-		binding.CacheWarm = crTok > 0 || ccTok > 0
-	}
-	stateMu.Unlock()
-}
-
-// compactionTipForSession returns one compaction tip when a large session (>= 128 KB) first lands
-// on a fallback because the primary refused. Later turns stay quiet until compaction.
-func compactionTipForSession(cfg pluginConfig, session string, group modelGroup, attempts []groupAttempt, served string, payloadBytes int) string {
-	if !cfg.Features.ClientFallbackNotices || session == "" || len(group.Models) == 0 || served == group.Models[0] || payloadBytes < dilutionBaseBytes {
-		return ""
-	}
-	strategy := group.effectiveStrategy()
-	if strategy != groupStrategyUpgrade && strategy != groupStrategyStick {
-		return ""
-	}
-	primary := group.Models[0]
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	binding, ok := groupSessions[session+"\x00"+group.ID]
-	if !ok || binding == nil || binding.LastTipTurn != 0 {
-		return ""
-	}
-	refused := false
-	if ms, ok := binding.ModelStates[primary]; ok && ms != nil && ms.FailureKind == "refusal" {
-		refused = true
-	}
-	if !refused {
-		for _, a := range attempts {
-			if a.Model == primary && strings.HasPrefix(a.Result, "failed: ") && classifyAttemptFailure(strings.TrimPrefix(a.Result, "failed: ")) == "refusal" {
-				refused = true
-				break
-			}
-		}
-	}
-	if !refused {
-		return ""
-	}
-	binding.LastTipTurn = binding.Turns
-	savePersistedSessionsLocked()
-	return fmt.Sprintf("💡 Tip: compact history (`/compact`) if you want to retry this session with `%s`", primary)
-}
-
-// conversationCompacted reports whether payload replaced a long transcript with a summary.
-func conversationCompacted(binding *sessionBinding, payload []byte) bool {
-	if binding.LastPayloadBytes < compactionMinPrevBytes || binding.LastMessageCount < compactionMinMessages || len(payload) == 0 {
-		return false
-	}
-	if float64(len(payload)) >= float64(binding.LastPayloadBytes)*compactionShrinkRatio {
-		return false
-	}
-	messageCount := payloadMessageCount(payload)
-	return messageCount > 0 && messageCount*2 <= binding.LastMessageCount
-}
-
-func payloadMessageCount(payload []byte) int {
-	var body struct {
-		Messages []json.RawMessage `json:"messages"`
-		Request  struct {
-			Messages []json.RawMessage `json:"messages"`
-		} `json:"request"`
-	}
-	if len(payload) == 0 {
-		return 0
-	}
-	if err := json.Unmarshal(payload, &body); err != nil {
-		panic(fmt.Errorf("decode group history payload: %w", err))
-	}
-	if n := len(body.Messages); n > 0 {
-		return n
-	}
-	return len(body.Request.Messages)
-}
-
-// A parent identity describes ancestry, not the transcript whose routing state may be reset.
-func groupSessionKey(req executorRequest) string {
-	key := sessionKey(req.Metadata)
-	var body struct {
-		SessionID      string `json:"session_id"`
-		ConversationID string `json:"conversation_id"`
-		PromptCacheKey string `json:"prompt_cache_key"`
-		Metadata       struct {
-			UserID     string `json:"user_id"`
-			AgentID    string `json:"agent_id"`
-			SubagentID string `json:"subagent_id"`
-		} `json:"metadata"`
-		Request struct {
-			Metadata struct {
-				UserID     string `json:"user_id"`
-				AgentID    string `json:"agent_id"`
-				SubagentID string `json:"subagent_id"`
-			} `json:"metadata"`
-		} `json:"request"`
-	}
-	var agentID string
-	if len(req.Payload) > 0 {
-		if err := json.Unmarshal(req.Payload, &body); err != nil {
-			panic(fmt.Errorf("decode group session payload: %w", err))
-		}
-		userID := strings.TrimSpace(body.Metadata.UserID)
-		if userID == "" {
-			userID = strings.TrimSpace(body.Request.Metadata.UserID)
-		}
-		for _, candidate := range []string{body.Metadata.AgentID, body.Metadata.SubagentID, body.Request.Metadata.AgentID, body.Request.Metadata.SubagentID} {
-			if trimmed := strings.TrimSpace(candidate); trimmed != "" {
-				agentID = trimmed
-				break
-			}
-		}
-		if strings.HasPrefix(userID, "{") {
-			var parsed struct {
-				SessionID  string `json:"session_id"`
-				AgentID    string `json:"agent_id"`
-				SubagentID string `json:"subagent_id"`
-			}
-			if err := json.Unmarshal([]byte(userID), &parsed); err != nil {
-				panic(fmt.Errorf("decode Claude session metadata: %w", err))
-			}
-			if sid := strings.TrimSpace(parsed.SessionID); sid != "" {
-				key = "claude:" + sid
-			}
-			for _, candidate := range []string{parsed.AgentID, parsed.SubagentID} {
-				if trimmed := strings.TrimSpace(candidate); trimmed != "" {
-					agentID = trimmed
-					break
-				}
-			}
-		} else if idx := strings.LastIndex(userID, "_session_"); idx != -1 {
-			if sid := strings.TrimSpace(userID[idx+len("_session_"):]); sid != "" {
-				key = "claude:" + sid
-			}
-		}
-		if key == "" {
-			for _, candidate := range []string{body.SessionID, body.ConversationID, body.PromptCacheKey} {
-				if trimmed := strings.TrimSpace(candidate); trimmed != "" {
-					key = "session:" + trimmed
-					break
-				}
-			}
-		}
-	}
-	if key == "" {
-		for _, header := range []string{"Session_id", "X-Session-Id", "Conversation_id", "X-Claude-Code-Session-Id"} {
-			if val := strings.TrimSpace(req.Headers.Get(header)); val != "" {
-				key = "header:" + val
-				break
-			}
-		}
-	}
-	if key == "" {
-		return ""
-	}
-	if agentID != "" {
-		key += "\x00agent:" + agentID
-	}
-	if isAuxiliaryRequest(req.Payload) {
-		key += "\x00auxiliary"
-	}
-	return key
-}
-
-// isAuxiliaryRequest reports whether the request is a background helper call (such as Claude Code's
-// away_summary recap, prompt_suggestion, session rename, or agent_summary) where injecting a
-// human-facing router banner would corrupt the caller's parsed output.
-func isAuxiliaryRequest(payload []byte) bool {
-	for _, marker := range []string{
-		"The user stepped away and is coming back. Recap in under",
-		"Reply with ONLY the suggestion, no quotes or explanation.",
-		`Return JSON with a "name" field.`,
-		"most recent action in 3-5 words using present tense (-ing).",
-		"Never consult the advisor tool.",
-		"Your task is to create a detailed summary of the conversation",
-	} {
-		if bytes.Contains(payload, []byte(marker)) {
-			return true
-		}
-	}
-	return false
-}
-
-// detectAutoModeClassifierKind reports whether a request is Claude Code's local auto-mode safety
-// classifier check, returning "severity" or "block" when it is. Classifier requests are always
-// non-streaming, carry no tools array (whereas normal turns and forks carry tools), and contain
-// a <transcript> wrapper plus a <severity> or <block> output instruction in stop_sequences,
-// system, or the final user message.
-func detectAutoModeClassifierKind(payload []byte, stream bool) string {
-	if stream {
-		return ""
-	}
-	var req struct {
-		Stream        bool              `json:"stream"`
-		Tools         []json.RawMessage `json:"tools"`
-		StopSequences []string          `json:"stop_sequences"`
-		System        json.RawMessage   `json:"system"`
-		Messages      []json.RawMessage `json:"messages"`
-	}
-	if json.Unmarshal(payload, &req) != nil || req.Stream || len(req.Tools) > 0 || len(req.Messages) == 0 {
-		return ""
-	}
-	for _, seq := range req.StopSequences {
-		switch seq {
-		case "</severity>":
-			return "severity"
-		case "</block>":
-			return "block"
-		}
-	}
-	lastMsg := req.Messages[len(req.Messages)-1]
-	if !bytes.Contains(payload, []byte("<transcript>")) {
-		return ""
-	}
-	if bytes.Contains(req.System, []byte("<severity>N</severity>")) ||
-		bytes.Contains(lastMsg, []byte("<severity>N</severity>")) ||
-		bytes.Contains(lastMsg, []byte("</severity>")) {
-		return "severity"
-	}
-	if bytes.Contains(req.System, []byte("<block>")) ||
-		bytes.Contains(lastMsg, []byte("<block>")) ||
-		bytes.Contains(lastMsg, []byte("</block>")) {
-		return "block"
-	}
-	return ""
-}
-
-// textRefusalPattern matches the structural forms of plain-text LLM refusals, tuned against a
-// corpus of real session transcripts (95% of verified refusals match within 128 bytes; median
-// match ends at byte 21):
-//  1. Direct refusal ("I can't/cannot/won't/... help/assist/provide/generate/build/extract/run/fuzz/...")
-//  2. Stop or maintained-refusal openers ("I'm not going to continue/...", "I'm going to stop here",
-//     "I'm stopping here", "I'll stop there", "My answer is the same/final", "Não vou construir/fazer")
-//  3. Authorization-gated continuation ("Before continuing ... confirm ... authorized/scope")
-//  4. Explicit refusal/decline ("I must/have to refuse/decline")
-//  5. Scope-limiting refusal ("I can only help/assist/...")
-//  6. Safe-completion / conditional-gate pivot ("I can <thing>, but not / but I can't / but I need ...")
-//  7. Authorization interrogation and lecturing ("need ... authorization first", "without ... permission",
-//     "against my safety policies", "safety guidelines")
-//  8. Filter/block notifications ("request was blocked", "blocked by X's filters", "try rephrasing your
-//     prompt", "the harness blocked", "auto-mode classifier flagged")
-//
-// Bare "I can't/won't" is never sufficient: innocuous openers like "I can't see that run" or
-// "I can't confirm it yet" must not match, so every branch requires refusal-specific content.
-var textRefusalPattern = regexp.MustCompile(
-	`(?i)(?:` +
-		`\bi\s+(?:can't|cannot|won't|will\s+not|must\s+not|am\s+(?:not\s+able|unable)|'m\s+(?:not\s+able|unable))\s+(?:to\s+)?(?:\w+ly\s+)?(?:help|assist|provide|fulfill|comply|generate|create|build|write|support|supply|give|share|perform|execute|facilitate|aid|extract|send|produce|re-?run|add|tune|keep|make|continue|run\s+(?:these|that|this|the\s+(?:sweep|scan|prob\w*|enum\w*|fuzz\w*|exploit\w*|attack\w*|script\w*)|more\s+(?:brute|scan|prob|fuzz)|active|destructive|a\s+workflow)|fuzz|probe|compile|remove|rewrite|redesign|integrate|forge|fabricate|automate|bypass|hack|exploit|attack|break|answer\s+that)\b` +
-		`|\bi\s+(?:can't|cannot|won't|will\s+not)\s+do\s+(?:that|this)(?:\s+one)?(?:\s*[.,:;!\n—-]|$)` +
-		`|^\s*(?:i'm|i\s+am)\s+not\s+going\s+to\s+(?:continue|keep|do|build|run|help|make|add|re-?run|produce|generate|satisfy|type|finish|try|attempt|work|write)\b` +
-		`|^\s*i'm\s+(?:going\s+to\s+stop\s+(?:here|there|the\s|this\s|that\s)|stopping\s+here\b|not\s+running\s+the\b|done\s+here\b)` +
-		`|^\s*i'll\s+stop\s+there\b` +
-		`|^\s*(?:stopping\s+here\b|i(?:'ve|\s+have)?\s+stopped\s+(?:here|there|partway|the\s))` +
-		`|^\s*i\s+(?:need|have)\s+to\s+(?:stop\s+here|flag\s+something\s+before\s+continuing)\b` +
-		`|^\s*(?:not\s+going\s+to\s+run\s+this|not\s+running\s+this)\b` +
-		`|^\s*can't\s+(?:do|help|probe|run|fuzz|build)\s+(?:this|that)\b` +
-		`|^\s*my\s+(?:answer|position|decision)\s+(?:is|stands)\b[^.!\n]{0,40}(?:same|final|stands)` +
-		`|^\s*before\s+(?:i\s+)?(?:continu\w+|send\s+more\s+probes|fuzzing)[^.\n]{0,160}?\b(?:confirm|authoriz|permission|scope|flag)` +
-		`|\bi\s+(?:must|have\s+to|need\s+to)\s+(?:refuse|decline)\b` +
-		`|\bi\s+can\s+only\s+(?:help|assist|provide|discuss|explain|share|cover|answer)\b` +
-		`|\bi\s+can\b[^.!\n]{0,200}\b(?:but\s+not|but\s+i\s+(?:can't|cannot|won't|will\s+not|am\s+unable|'m\s+unable|need\b|must\b|have\s+to\b))\b` +
-		`|\b(?:i\s+(?:need|require|must\s+have)|requires?)\b[^.!\n]{0,120}\b(?:authorization|permission|context\s+first|clear\s+context|engagement\s+scope)\b` +
-		`|\b(?:authorization|permission)\s+(?:context|scope)\b` +
-		`|\bwithout\s+(?:[\w-]+\s+){0,2}(?:permission|authorization|consent)\b` +
-		`|\b(?:against|violates?)\s+(?:my|our|the)?\s*(?:safety|usage|content|acceptable\s+use)?\s*(?:policies|policy|guidelines|rules|principles|terms)\b` +
-		`|\bsafety\s+(?:guidelines|policy|policies|reasons|filters)\b` +
-		`|(?:request|response|message|prompt|query)\s+(?:was\s+|has\s+been\s+)?(?:blocked|filtered|flagged|refused)\b` +
-		`|\bblocked\s+by\s+[\w'’.-]+\s*(?:filters?|safeguards?|safety|policies|policy)\b` +
-		`|\btry\s+rephrasing\s+your\s+(?:prompt|request|question|query)\b` +
-		`|\b(?:the\s+harness\s+blocked|auto-mode\s+classifier\s+flagged)\b` +
-		`|\bn[ãa]o\s+(?:vou|posso)\s+(?:te\s+)?(?:ajudar|construir|fazer|reproduzir|continuar|gerar|criar|executar)\b` +
-		`|\bn[ãa]o\s+d[áa]\s+pra\s+(?:usar|fazer)\b` +
-		`)`,
-)
-
-func detectTextRefusal(text string) string {
-	normalized := strings.NewReplacer("’", "'", "‘", "'").Replace(text)
-	if textRefusalPattern.MatchString(normalized) {
-		return "refusal (text)"
-	}
-	return ""
-}
-
-// inspectPayload parses a non-streaming response body or one JSON event from an SSE chunk and
-// returns any refusal/error reason, the visible text, whether a tool call is present, and whether
-// the JSON matches a known model response envelope.
-func inspectPayload(raw []byte) (refusal string, visibleText string, sawToolUse bool, sawEnvelope bool) {
-	var msg struct {
-		Type  string `json:"type"`
-		Error *struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-		} `json:"error"`
-		StopReason  string `json:"stop_reason"`
-		StopDetails *struct {
-			Category string `json:"category"`
-		} `json:"stop_details"`
-		Delta *struct {
-			Type        string `json:"type"`
-			Text        string `json:"text"`
-			PartialJSON string `json:"partial_json"`
-			Refusal     string `json:"refusal"`
-			StopReason  string `json:"stop_reason"`
-			StopDetails *struct {
-				Category string `json:"category"`
-			} `json:"stop_details"`
-		} `json:"delta"`
-		ContentBlock *struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content_block"`
-		Content json.RawMessage `json:"content"`
-		Choices []struct {
-			FinishReason string `json:"finish_reason"`
-			Message      *struct {
-				Content      json.RawMessage `json:"content"`
-				Refusal      string          `json:"refusal"`
-				ToolCalls    []any           `json:"tool_calls"`
-				FunctionCall any             `json:"function_call"`
-			} `json:"message"`
-			Delta *struct {
-				Content      string `json:"content"`
-				Refusal      string `json:"refusal"`
-				ToolCalls    []any  `json:"tool_calls"`
-				FunctionCall any    `json:"function_call"`
-			} `json:"delta"`
-		} `json:"choices"`
-		IncompleteDetails *struct {
-			Reason string `json:"reason"`
-		} `json:"incomplete_details"`
-		Response *struct {
-			IncompleteDetails *struct {
-				Reason string `json:"reason"`
-			} `json:"incomplete_details"`
-			PromptFeedback *struct {
-				BlockReason string `json:"blockReason"`
-			} `json:"promptFeedback"`
-			Candidates []geminiCandidate `json:"candidates"`
-		} `json:"response"`
-		Item *struct {
-			Type string `json:"type"`
-		} `json:"item"`
-		Output []struct {
-			Type    string `json:"type"`
-			Content []struct {
-				Type    string `json:"type"`
-				Text    string `json:"text"`
-				Refusal string `json:"refusal"`
-			} `json:"content"`
-		} `json:"output"`
-		PromptFeedback *struct {
-			BlockReason string `json:"blockReason"`
-		} `json:"promptFeedback"`
-		Candidates []geminiCandidate `json:"candidates"`
-	}
-	if errUnmarshal := json.Unmarshal(raw, &msg); errUnmarshal != nil {
-		return "", "", false, false
-	}
-	sawEnvelope = msg.StopReason != "" || msg.Delta != nil || msg.ContentBlock != nil ||
-		len(msg.Content) > 0 || len(msg.Choices) > 0 || len(msg.Candidates) > 0 ||
-		msg.Response != nil || len(msg.Output) > 0 ||
-		strings.HasPrefix(msg.Type, "message_") || strings.HasPrefix(msg.Type, "content_block_") || strings.HasPrefix(msg.Type, "response.")
-
-	if msg.Type == "error" || (msg.Error != nil && (msg.Error.Message != "" || msg.Error.Type != "")) {
-		if msg.Error != nil && msg.Error.Message != "" {
-			return "upstream error: " + msg.Error.Message, "", false, true
-		}
-		return "upstream error", "", false, true
-	}
-	if reason := claudeStopRefusal(msg.StopReason, msg.StopDetails); reason != "" {
-		return reason, "", false, true
-	}
-	var textBuf strings.Builder
-	if msg.Delta != nil {
-		if reason := claudeStopRefusal(msg.Delta.StopReason, msg.Delta.StopDetails); reason != "" {
-			return reason, "", false, true
-		}
-		if msg.Delta.Refusal != "" {
-			return "refusal", "", false, true
-		}
-		switch msg.Delta.Type {
-		case "text_delta":
-			textBuf.WriteString(msg.Delta.Text)
-		case "input_json_delta":
-			if msg.Delta.PartialJSON != "" {
-				sawToolUse = true
-			}
-		}
-	}
-	if msg.ContentBlock != nil {
-		switch msg.ContentBlock.Type {
-		case "tool_use", "server_tool_use":
-			sawToolUse = true
-		case "text":
-			textBuf.WriteString(msg.ContentBlock.Text)
-		}
-	}
-	if len(msg.Content) > 0 {
-		ref, vis, tool := inspectClaudeContent(msg.Content)
-		if ref != "" {
-			return ref, "", false, true
-		}
-		textBuf.WriteString(vis)
-		sawToolUse = sawToolUse || tool
-	}
-	if msg.IncompleteDetails != nil && msg.IncompleteDetails.Reason == "content_filter" {
-		return "refusal (content_filter)", "", false, true
-	}
-	if msg.Response != nil && msg.Response.IncompleteDetails != nil && msg.Response.IncompleteDetails.Reason == "content_filter" {
-		return "refusal (content_filter)", "", false, true
-	}
-	if msg.Type == "response.output_text.delta" {
-		var deltaEvt struct {
-			Delta string `json:"delta"`
-		}
-		if json.Unmarshal(raw, &deltaEvt) == nil {
-			textBuf.WriteString(deltaEvt.Delta)
-		}
-	}
-	if msg.Type == "response.function_call_arguments.delta" || (msg.Item != nil && msg.Item.Type == "function_call") {
-		sawToolUse = true
-	}
-	for _, item := range msg.Output {
-		if item.Type == "function_call" {
-			sawToolUse = true
-		}
-		for _, part := range item.Content {
-			if part.Type == "refusal" || part.Refusal != "" {
-				return "refusal", "", false, true
-			}
-			textBuf.WriteString(part.Text)
-		}
-	}
-	for _, choice := range msg.Choices {
-		if choice.FinishReason == "content_filter" {
-			return "refusal (content_filter)", "", false, true
-		}
-		if choice.Message != nil {
-			if choice.Message.Refusal != "" {
-				return "refusal", "", false, true
-			}
-			if len(choice.Message.ToolCalls) > 0 || choice.Message.FunctionCall != nil {
-				sawToolUse = true
-			}
-			textBuf.WriteString(inspectOpenAIMessageContent(choice.Message.Content))
-		}
-		if choice.Delta != nil {
-			if choice.Delta.Refusal != "" {
-				return "refusal", "", false, true
-			}
-			if len(choice.Delta.ToolCalls) > 0 || choice.Delta.FunctionCall != nil {
-				sawToolUse = true
-			}
-			textBuf.WriteString(choice.Delta.Content)
-		}
-	}
-	if msg.PromptFeedback != nil && msg.PromptFeedback.BlockReason != "" {
-		return "refusal (" + msg.PromptFeedback.BlockReason + ")", "", false, true
-	}
-	if msg.Response != nil && msg.Response.PromptFeedback != nil && msg.Response.PromptFeedback.BlockReason != "" {
-		return "refusal (" + msg.Response.PromptFeedback.BlockReason + ")", "", false, true
-	}
-	candidates := msg.Candidates
-	if msg.Response != nil && len(msg.Response.Candidates) > 0 {
-		candidates = append(candidates, msg.Response.Candidates...)
-	}
-	for _, cand := range candidates {
-		if isGeminiRefusalFinishReason(cand.FinishReason) {
-			return "refusal (" + cand.FinishReason + ")", "", false, true
-		}
-		for _, part := range cand.Content.Parts {
-			if part.FunctionCall != nil {
-				sawToolUse = true
-			}
-			if !part.Thought {
-				textBuf.WriteString(part.Text)
-			}
-		}
-	}
-	return "", textBuf.String(), sawToolUse, sawEnvelope
-}
-
-type geminiCandidate struct {
-	FinishReason string `json:"finishReason"`
-	Content      struct {
-		Parts []struct {
-			Text         string `json:"text"`
-			Thought      bool   `json:"thought"`
-			FunctionCall any    `json:"functionCall"`
-		} `json:"parts"`
-	} `json:"content"`
-}
-
-func claudeStopRefusal(stopReason string, details *struct {
-	Category string `json:"category"`
-}) string {
-	if stopReason != "refusal" && stopReason != "sensitive" {
-		return ""
-	}
-	if details != nil && details.Category != "" {
-		return "refusal (" + details.Category + ")"
-	}
-	return "refusal"
-}
-
-func inspectClaudeContent(raw json.RawMessage) (string, string, bool) {
-	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		return "", strings.TrimSpace(text), false
-	}
-	var blocks []struct {
-		Type    string `json:"type"`
-		Text    string `json:"text"`
-		Refusal string `json:"refusal"`
-	}
-	if json.Unmarshal(raw, &blocks) != nil {
-		return "", "", false
-	}
-	var visible strings.Builder
-	tool := false
-	for _, block := range blocks {
-		switch block.Type {
-		case "refusal":
-			return "refusal", "", false
-		case "tool_use", "server_tool_use":
-			tool = true
-		case "text":
-			visible.WriteString(block.Text)
-		}
-	}
-	return "", strings.TrimSpace(visible.String()), tool
-}
-
-func inspectOpenAIMessageContent(raw json.RawMessage) string {
-	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		return strings.TrimSpace(text)
-	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if json.Unmarshal(raw, &parts) != nil {
-		return ""
-	}
-	var total strings.Builder
-	for _, part := range parts {
-		if part.Type != "thinking" && part.Type != "reasoning" {
-			total.WriteString(part.Text)
-		}
-	}
-	return strings.TrimSpace(total.String())
-}
-
-func isGeminiRefusalFinishReason(reason string) bool {
-	switch reason {
-	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST", "IMAGE_SAFETY":
-		return true
-	default:
-		return false
-	}
-}
-
-// inspectStreamChunk inspects all JSON objects in an SSE or raw-JSON stream chunk.
-func inspectStreamChunk(payload []byte) (refusal string, visibleText string, sawToolUse bool, sawEnvelope bool) {
-	trimmed := bytes.TrimSpace(payload)
-	if len(trimmed) == 0 {
-		return "", "", false, false
-	}
-	if trimmed[0] == '{' {
-		return inspectPayload(trimmed)
-	}
-	var textBuf strings.Builder
-	for _, line := range bytes.Split(payload, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if !bytes.HasPrefix(line, []byte("data:")) {
-			continue
-		}
-		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-		if len(data) == 0 || data[0] != '{' {
-			continue
-		}
-		ref, vis, tool, env := inspectPayload(data)
-		if ref != "" {
-			return ref, "", false, true
-		}
-		textBuf.WriteString(vis)
-		sawToolUse = sawToolUse || tool
-		sawEnvelope = sawEnvelope || env
-	}
-	return "", textBuf.String(), sawToolUse, sawEnvelope
-}
-
-// checkNonStreamResponse returns an error if a non-streaming response is a refusal or has no
-// visible text or tool calls.
-func checkNonStreamResponse(body []byte) error {
-	refusal, visible, sawTool, sawEnvelope := inspectPayload(bytes.TrimSpace(body))
-	if refusal != "" {
-		return fmt.Errorf("%s", refusal)
-	}
-	if !sawTool {
-		if textRefusal := detectTextRefusal(visible); textRefusal != "" {
-			return fmt.Errorf("%s", textRefusal)
-		}
-	}
-	if sawEnvelope && len(strings.TrimSpace(visible)) == 0 && !sawTool {
-		return fmt.Errorf("empty response (no text or tool calls)")
-	}
-	return nil
-}
-
-// prefetchStream reads initial chunks from sourceStreamID until at least prefetchBytes of
-// visible text (or a tool call) arrive, or the stream finishes. When checkRefusal is true and a
-// refusal or error occurs before that threshold, sourceStreamID is closed and an error is returned
 // so the caller can switch to the next model in the group before emitting anything to the client.
 func prefetchStream(sourceStreamID, callbackID string, checkRefusal bool, prefetchBytes int) ([][]byte, bool, error) {
 	var prefetched [][]byte
@@ -2137,4 +932,408 @@ func handleRequestIntercept(raw []byte) ([]byte, error) {
 		resp.Headers = http.Header{"Anthropic-Beta": headersOut.Values("Anthropic-Beta")}
 	}
 	return okEnvelope(resp)
+}
+
+// system, or the final user message.
+func detectAutoModeClassifierKind(payload []byte, stream bool) string {
+	if stream {
+		return ""
+	}
+	var req struct {
+		Stream        bool              `json:"stream"`
+		Tools         []json.RawMessage `json:"tools"`
+		StopSequences []string          `json:"stop_sequences"`
+		System        json.RawMessage   `json:"system"`
+		Messages      []json.RawMessage `json:"messages"`
+	}
+	if json.Unmarshal(payload, &req) != nil || req.Stream || len(req.Tools) > 0 || len(req.Messages) == 0 {
+		return ""
+	}
+	for _, seq := range req.StopSequences {
+		switch seq {
+		case "</severity>":
+			return "severity"
+		case "</block>":
+			return "block"
+		}
+	}
+	lastMsg := req.Messages[len(req.Messages)-1]
+	if !bytes.Contains(payload, []byte("<transcript>")) {
+		return ""
+	}
+	if bytes.Contains(req.System, []byte("<severity>N</severity>")) ||
+		bytes.Contains(lastMsg, []byte("<severity>N</severity>")) ||
+		bytes.Contains(lastMsg, []byte("</severity>")) {
+		return "severity"
+	}
+	if bytes.Contains(req.System, []byte("<block>")) ||
+		bytes.Contains(lastMsg, []byte("<block>")) ||
+		bytes.Contains(lastMsg, []byte("</block>")) {
+		return "block"
+	}
+	return ""
+}
+
+// visible text or tool calls.
+func checkNonStreamResponse(body []byte) error {
+	refusal, visible, sawTool, sawEnvelope := inspectPayload(bytes.TrimSpace(body))
+	if refusal != "" {
+		return fmt.Errorf("%s", refusal)
+	}
+	if !sawTool {
+		if textRefusal := detectTextRefusal(visible); textRefusal != "" {
+			return fmt.Errorf("%s", textRefusal)
+		}
+	}
+	if sawEnvelope && len(strings.TrimSpace(visible)) == 0 && !sawTool {
+		return fmt.Errorf("empty response (no text or tool calls)")
+	}
+	return nil
+}
+
+// inspectStreamChunk inspects all JSON objects in an SSE or raw-JSON stream chunk.
+func inspectStreamChunk(payload []byte) (refusal string, visibleText string, sawToolUse bool, sawEnvelope bool) {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return "", "", false, false
+	}
+	if trimmed[0] == '{' {
+		return inspectPayload(trimmed)
+	}
+	var textBuf strings.Builder
+	for _, line := range bytes.Split(payload, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(data) == 0 || data[0] != '{' {
+			continue
+		}
+		ref, vis, tool, env := inspectPayload(data)
+		if ref != "" {
+			return ref, "", false, true
+		}
+		textBuf.WriteString(vis)
+		sawToolUse = sawToolUse || tool
+		sawEnvelope = sawEnvelope || env
+	}
+	return "", textBuf.String(), sawToolUse, sawEnvelope
+}
+
+// "I can't confirm it yet" must not match, so every branch requires refusal-specific content.
+var textRefusalPattern = regexp.MustCompile(
+	`(?i)(?:` +
+		`\bi\s+(?:can't|cannot|won't|will\s+not|must\s+not|am\s+(?:not\s+able|unable)|'m\s+(?:not\s+able|unable))\s+(?:to\s+)?(?:\w+ly\s+)?(?:help|assist|provide|fulfill|comply|generate|create|build|write|support|supply|give|share|perform|execute|facilitate|aid|extract|send|produce|re-?run|add|tune|keep|make|continue|run\s+(?:these|that|this|the\s+(?:sweep|scan|prob\w*|enum\w*|fuzz\w*|exploit\w*|attack\w*|script\w*)|more\s+(?:brute|scan|prob|fuzz)|active|destructive|a\s+workflow)|fuzz|probe|compile|remove|rewrite|redesign|integrate|forge|fabricate|automate|bypass|hack|exploit|attack|break|answer\s+that)\b` +
+		`|\bi\s+(?:can't|cannot|won't|will\s+not)\s+do\s+(?:that|this)(?:\s+one)?(?:\s*[.,:;!\n—-]|$)` +
+		`|^\s*(?:i'm|i\s+am)\s+not\s+going\s+to\s+(?:continue|keep|do|build|run|help|make|add|re-?run|produce|generate|satisfy|type|finish|try|attempt|work|write)\b` +
+		`|^\s*i'm\s+(?:going\s+to\s+stop\s+(?:here|there|the\s|this\s|that\s)|stopping\s+here\b|not\s+running\s+the\b|done\s+here\b)` +
+		`|^\s*i'll\s+stop\s+there\b` +
+		`|^\s*(?:stopping\s+here\b|i(?:'ve|\s+have)?\s+stopped\s+(?:here|there|partway|the\s))` +
+		`|^\s*i\s+(?:need|have)\s+to\s+(?:stop\s+here|flag\s+something\s+before\s+continuing)\b` +
+		`|^\s*(?:not\s+going\s+to\s+run\s+this|not\s+running\s+this)\b` +
+		`|^\s*can't\s+(?:do|help|probe|run|fuzz|build)\s+(?:this|that)\b` +
+		`|^\s*my\s+(?:answer|position|decision)\s+(?:is|stands)\b[^.!\n]{0,40}(?:same|final|stands)` +
+		`|^\s*before\s+(?:i\s+)?(?:continu\w+|send\s+more\s+probes|fuzzing)[^.\n]{0,160}?\b(?:confirm|authoriz|permission|scope|flag)` +
+		`|\bi\s+(?:must|have\s+to|need\s+to)\s+(?:refuse|decline)\b` +
+		`|\bi\s+can\s+only\s+(?:help|assist|provide|discuss|explain|share|cover|answer)\b` +
+		`|\bi\s+can\b[^.!\n]{0,200}\b(?:but\s+not|but\s+i\s+(?:can't|cannot|won't|will\s+not|am\s+unable|'m\s+unable|need\b|must\b|have\s+to\b))\b` +
+		`|\b(?:i\s+(?:need|require|must\s+have)|requires?)\b[^.!\n]{0,120}\b(?:authorization|permission|context\s+first|clear\s+context|engagement\s+scope)\b` +
+		`|\b(?:authorization|permission)\s+(?:context|scope)\b` +
+		`|\bwithout\s+(?:[\w-]+\s+){0,2}(?:permission|authorization|consent)\b` +
+		`|\b(?:against|violates?)\s+(?:my|our|the)?\s*(?:safety|usage|content|acceptable\s+use)?\s*(?:policies|policy|guidelines|rules|principles|terms)\b` +
+		`|\bsafety\s+(?:guidelines|policy|policies|reasons|filters)\b` +
+		`|(?:request|response|message|prompt|query)\s+(?:was\s+|has\s+been\s+)?(?:blocked|filtered|flagged|refused)\b` +
+		`|\bblocked\s+by\s+[\w'’.-]+\s*(?:filters?|safeguards?|safety|policies|policy)\b` +
+		`|\btry\s+rephrasing\s+your\s+(?:prompt|request|question|query)\b` +
+		`|\b(?:the\s+harness\s+blocked|auto-mode\s+classifier\s+flagged)\b` +
+		`|\bn[ãa]o\s+(?:vou|posso)\s+(?:te\s+)?(?:ajudar|construir|fazer|reproduzir|continuar|gerar|criar|executar)\b` +
+		`|\bn[ãa]o\s+d[áa]\s+pra\s+(?:usar|fazer)\b` +
+		`)`,
+)
+
+func detectTextRefusal(text string) string {
+	normalized := strings.NewReplacer("’", "'", "‘", "'").Replace(text)
+	if textRefusalPattern.MatchString(normalized) {
+		return "refusal (text)"
+	}
+	return ""
+}
+
+// the JSON matches a known model response envelope.
+func inspectPayload(raw []byte) (refusal string, visibleText string, sawToolUse bool, sawEnvelope bool) {
+	var msg struct {
+		Type  string `json:"type"`
+		Error *struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+		StopReason  string `json:"stop_reason"`
+		StopDetails *struct {
+			Category string `json:"category"`
+		} `json:"stop_details"`
+		Delta *struct {
+			Type        string `json:"type"`
+			Text        string `json:"text"`
+			PartialJSON string `json:"partial_json"`
+			Refusal     string `json:"refusal"`
+			StopReason  string `json:"stop_reason"`
+			StopDetails *struct {
+				Category string `json:"category"`
+			} `json:"stop_details"`
+		} `json:"delta"`
+		ContentBlock *struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content_block"`
+		Content json.RawMessage `json:"content"`
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      *struct {
+				Content      json.RawMessage `json:"content"`
+				Refusal      string          `json:"refusal"`
+				ToolCalls    []any           `json:"tool_calls"`
+				FunctionCall any             `json:"function_call"`
+			} `json:"message"`
+			Delta *struct {
+				Content      string `json:"content"`
+				Refusal      string `json:"refusal"`
+				ToolCalls    []any  `json:"tool_calls"`
+				FunctionCall any    `json:"function_call"`
+			} `json:"delta"`
+		} `json:"choices"`
+		IncompleteDetails *struct {
+			Reason string `json:"reason"`
+		} `json:"incomplete_details"`
+		Response *struct {
+			IncompleteDetails *struct {
+				Reason string `json:"reason"`
+			} `json:"incomplete_details"`
+			PromptFeedback *struct {
+				BlockReason string `json:"blockReason"`
+			} `json:"promptFeedback"`
+			Candidates []geminiCandidate `json:"candidates"`
+		} `json:"response"`
+		Item *struct {
+			Type string `json:"type"`
+		} `json:"item"`
+		Output []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type    string `json:"type"`
+				Text    string `json:"text"`
+				Refusal string `json:"refusal"`
+			} `json:"content"`
+		} `json:"output"`
+		PromptFeedback *struct {
+			BlockReason string `json:"blockReason"`
+		} `json:"promptFeedback"`
+		Candidates []geminiCandidate `json:"candidates"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &msg); errUnmarshal != nil {
+		return "", "", false, false
+	}
+	sawEnvelope = msg.StopReason != "" || msg.Delta != nil || msg.ContentBlock != nil ||
+		len(msg.Content) > 0 || len(msg.Choices) > 0 || len(msg.Candidates) > 0 ||
+		msg.Response != nil || len(msg.Output) > 0 ||
+		strings.HasPrefix(msg.Type, "message_") || strings.HasPrefix(msg.Type, "content_block_") || strings.HasPrefix(msg.Type, "response.")
+
+	if msg.Type == "error" || (msg.Error != nil && (msg.Error.Message != "" || msg.Error.Type != "")) {
+		if msg.Error != nil && msg.Error.Message != "" {
+			return "upstream error: " + msg.Error.Message, "", false, true
+		}
+		return "upstream error", "", false, true
+	}
+	if reason := claudeStopRefusal(msg.StopReason, msg.StopDetails); reason != "" {
+		return reason, "", false, true
+	}
+	var textBuf strings.Builder
+	if msg.Delta != nil {
+		if reason := claudeStopRefusal(msg.Delta.StopReason, msg.Delta.StopDetails); reason != "" {
+			return reason, "", false, true
+		}
+		if msg.Delta.Refusal != "" {
+			return "refusal", "", false, true
+		}
+		switch msg.Delta.Type {
+		case "text_delta":
+			textBuf.WriteString(msg.Delta.Text)
+		case "input_json_delta":
+			if msg.Delta.PartialJSON != "" {
+				sawToolUse = true
+			}
+		}
+	}
+	if msg.ContentBlock != nil {
+		switch msg.ContentBlock.Type {
+		case "tool_use", "server_tool_use":
+			sawToolUse = true
+		case "text":
+			textBuf.WriteString(msg.ContentBlock.Text)
+		}
+	}
+	if len(msg.Content) > 0 {
+		ref, vis, tool := inspectClaudeContent(msg.Content)
+		if ref != "" {
+			return ref, "", false, true
+		}
+		textBuf.WriteString(vis)
+		sawToolUse = sawToolUse || tool
+	}
+	if msg.IncompleteDetails != nil && msg.IncompleteDetails.Reason == "content_filter" {
+		return "refusal (content_filter)", "", false, true
+	}
+	if msg.Response != nil && msg.Response.IncompleteDetails != nil && msg.Response.IncompleteDetails.Reason == "content_filter" {
+		return "refusal (content_filter)", "", false, true
+	}
+	if msg.Type == "response.output_text.delta" {
+		var deltaEvt struct {
+			Delta string `json:"delta"`
+		}
+		if json.Unmarshal(raw, &deltaEvt) == nil {
+			textBuf.WriteString(deltaEvt.Delta)
+		}
+	}
+	if msg.Type == "response.function_call_arguments.delta" || (msg.Item != nil && msg.Item.Type == "function_call") {
+		sawToolUse = true
+	}
+	for _, item := range msg.Output {
+		if item.Type == "function_call" {
+			sawToolUse = true
+		}
+		for _, part := range item.Content {
+			if part.Type == "refusal" || part.Refusal != "" {
+				return "refusal", "", false, true
+			}
+			textBuf.WriteString(part.Text)
+		}
+	}
+	for _, choice := range msg.Choices {
+		if choice.FinishReason == "content_filter" {
+			return "refusal (content_filter)", "", false, true
+		}
+		if choice.Message != nil {
+			if choice.Message.Refusal != "" {
+				return "refusal", "", false, true
+			}
+			if len(choice.Message.ToolCalls) > 0 || choice.Message.FunctionCall != nil {
+				sawToolUse = true
+			}
+			textBuf.WriteString(inspectOpenAIMessageContent(choice.Message.Content))
+		}
+		if choice.Delta != nil {
+			if choice.Delta.Refusal != "" {
+				return "refusal", "", false, true
+			}
+			if len(choice.Delta.ToolCalls) > 0 || choice.Delta.FunctionCall != nil {
+				sawToolUse = true
+			}
+			textBuf.WriteString(choice.Delta.Content)
+		}
+	}
+	if msg.PromptFeedback != nil && msg.PromptFeedback.BlockReason != "" {
+		return "refusal (" + msg.PromptFeedback.BlockReason + ")", "", false, true
+	}
+	if msg.Response != nil && msg.Response.PromptFeedback != nil && msg.Response.PromptFeedback.BlockReason != "" {
+		return "refusal (" + msg.Response.PromptFeedback.BlockReason + ")", "", false, true
+	}
+	candidates := msg.Candidates
+	if msg.Response != nil && len(msg.Response.Candidates) > 0 {
+		candidates = append(candidates, msg.Response.Candidates...)
+	}
+	for _, cand := range candidates {
+		if isGeminiRefusalFinishReason(cand.FinishReason) {
+			return "refusal (" + cand.FinishReason + ")", "", false, true
+		}
+		for _, part := range cand.Content.Parts {
+			if part.FunctionCall != nil {
+				sawToolUse = true
+			}
+			if !part.Thought {
+				textBuf.WriteString(part.Text)
+			}
+		}
+	}
+	return "", textBuf.String(), sawToolUse, sawEnvelope
+}
+
+type geminiCandidate struct {
+	FinishReason string `json:"finishReason"`
+	Content      struct {
+		Parts []struct {
+			Text         string `json:"text"`
+			Thought      bool   `json:"thought"`
+			FunctionCall any    `json:"functionCall"`
+		} `json:"parts"`
+	} `json:"content"`
+}
+
+func claudeStopRefusal(stopReason string, details *struct {
+	Category string `json:"category"`
+}) string {
+	if stopReason != "refusal" && stopReason != "sensitive" {
+		return ""
+	}
+	if details != nil && details.Category != "" {
+		return "refusal (" + details.Category + ")"
+	}
+	return "refusal"
+}
+
+func inspectClaudeContent(raw json.RawMessage) (string, string, bool) {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return "", strings.TrimSpace(text), false
+	}
+	var blocks []struct {
+		Type    string `json:"type"`
+		Text    string `json:"text"`
+		Refusal string `json:"refusal"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return "", "", false
+	}
+	var visible strings.Builder
+	tool := false
+	for _, block := range blocks {
+		switch block.Type {
+		case "refusal":
+			return "refusal", "", false
+		case "tool_use", "server_tool_use":
+			tool = true
+		case "text":
+			visible.WriteString(block.Text)
+		}
+	}
+	return "", strings.TrimSpace(visible.String()), tool
+}
+
+func inspectOpenAIMessageContent(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return strings.TrimSpace(text)
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	var total strings.Builder
+	for _, part := range parts {
+		if part.Type != "thinking" && part.Type != "reasoning" {
+			total.WriteString(part.Text)
+		}
+	}
+	return strings.TrimSpace(total.String())
+}
+
+func isGeminiRefusalFinishReason(reason string) bool {
+	switch reason {
+	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST", "IMAGE_SAFETY":
+		return true
+	default:
+		return false
+	}
 }

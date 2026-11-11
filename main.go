@@ -63,7 +63,7 @@ const (
 	schemaVersion uint32 = 9
 
 	pluginName    = "Safeguard Killer"
-	pluginVersion = "1.0.3"
+	pluginVersion = "2.0.0"
 	pluginAuthor  = "esauvisky"
 	pluginRepo    = "https://github.com/esauvisky/CLIProxyAPI-Safeguard-Killer-Plugin"
 	pluginLogo    = "https://raw.githubusercontent.com/esauvisky/CLIProxyAPI-Safeguard-Killer-Plugin/main/assets/logo.png"

@@ -65,7 +65,9 @@ type decision struct {
 	Model   string `json:"model"`
 	Session string `json:"session,omitempty"`
 	// AuthID is the chosen credential for "balance" and the serving model for "group".
-	AuthID   string         `json:"auth_id,omitempty"`
+	AuthID string `json:"auth_id,omitempty"`
+	// Version is the plugin version that recorded this decision.
+	Version  string         `json:"version,omitempty"`
 	Reason   string         `json:"reason"`
 	Ranking  []rankEntry    `json:"ranking,omitempty"`
 	Attempts []groupAttempt `json:"attempts,omitempty"`

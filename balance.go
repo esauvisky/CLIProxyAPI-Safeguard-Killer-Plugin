@@ -202,9 +202,9 @@ func pruneSessions(now time.Time) {
 			delete(sessions, key)
 		}
 	}
-	for key, binding := range groupSessions {
-		if now.Sub(binding.LastSeen) > sessionRetention {
-			delete(groupSessions, key)
+	for key, state := range groupStates {
+		if now.Sub(state.LastSeen) > sessionRetention {
+			delete(groupStates, key)
 		}
 	}
 }
@@ -346,8 +346,8 @@ func buildUIState() uiState {
 	for _, binding := range sessions {
 		state.Sessions = append(state.Sessions, *binding)
 	}
-	for _, binding := range groupSessions {
-		state.Sessions = append(state.Sessions, *binding)
+	for _, conversation := range groupStates {
+		state.Sessions = append(state.Sessions, conversationBindingView(conversation))
 	}
 	sort.Slice(state.Sessions, func(i, j int) bool { return state.Sessions[i].LastSeen.After(state.Sessions[j].LastSeen) })
 	for index := len(decisions) - 1; index >= 0; index-- {

@@ -152,7 +152,7 @@ func resolveTargetGroup(cfg pluginConfig, requestedModel, session string) (model
 	if session != "" {
 		stateMu.Lock()
 		for _, g := range cfg.Groups {
-			if _, ok := groupSessions[session+"\x00"+g.ID]; ok {
+			if _, ok := groupStates[session+"\x00"+g.ID]; ok {
 				picked = g
 				break
 			}
@@ -196,7 +196,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	session := groupSessionKey(req)
+	session := conversationKey(req)
 	group, ok := resolveTargetGroup(cfg, req.Model, session)
 	if !ok {
 		return nil, fmt.Errorf("model group %s is not configured", req.Model)
@@ -204,7 +204,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 	now := time.Now()
 	aux := isAuxiliaryRequest(req.Payload)
 	sanitizedPayload, sanitizedHeaders, _, _ := sanitizeRequest(req.Payload, req.Headers, cfg)
-	plan := planGroupExecution(cfg, session, group, req.Payload, now)
+	plan := planConversation(cfg, session, group, req.Payload, now)
 	attempts := plan.Skipped
 	prevLookupModel := plan.PrevModel
 	var lastErr error
@@ -260,7 +260,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 			res := <-results
 			if res.err != nil {
 				attempts = append(attempts, groupAttempt{Model: res.model, Result: "failed: " + res.err.Error(), Duration: res.duration})
-				recordSessionModelFailure(session, group.ID, res.model, res.err.Error(), len(req.Payload), time.Now())
+				recordConversationFailure(session, group.ID, res.model, res.err.Error(), len(req.Payload), time.Now())
 				lastErr = res.err
 				continue
 			}
@@ -268,8 +268,8 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 			recordGroupDecision(group, session, attempts, res.model)
 			bodyOut := res.resp.Body
 			if !aux {
-				prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, res.model, prevLookupModel, req.Payload, time.Now())
-				observeGroupSessionUsage(session, group.ID, res.resp.Body)
+				prevModel := recordServed(cfg, session, group.ID, res.model, prevLookupModel, req.Payload, time.Now())
+				observeConversationUsage(session, group.ID, res.resp.Body)
 				notice := buildGroupNotice(cfg, group, attempts, res.model, prevModel)
 				notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, res.model, len(req.Payload)))
 				bodyOut = injectNonStreamNotice(res.resp.Body, effectiveFormat(req.Format, req.SourceFormat), notice)
@@ -280,7 +280,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 					for k := 0; k < rem; k++ {
 						late := <-results
 						if late.err != nil {
-							recordSessionModelFailure(session, group.ID, late.model, late.err.Error(), len(req.Payload), time.Now())
+							recordConversationFailure(session, group.ID, late.model, late.err.Error(), len(req.Payload), time.Now())
 						} else if !aux && late.rank < winnerRank && group.effectiveStrategy() == groupStrategyUpgrade {
 							promoteProbedModel(cfg, session, group.ID, late.model, time.Now())
 						}
@@ -311,7 +311,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		})
 		if errCall != nil {
 			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error(), Duration: time.Since(attemptStart)})
-			recordSessionModelFailure(session, group.ID, model, errCall.Error(), len(req.Payload), time.Now())
+			recordConversationFailure(session, group.ID, model, errCall.Error(), len(req.Payload), time.Now())
 			lastErr = errCall
 			continue
 		}
@@ -322,7 +322,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if cfg.Features.FallbackOnRefusal {
 			if errRefusal := checkNonStreamResponse(resp.Body); errRefusal != nil {
 				attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errRefusal.Error(), Duration: time.Since(attemptStart)})
-				recordSessionModelFailure(session, group.ID, model, errRefusal.Error(), len(req.Payload), time.Now())
+				recordConversationFailure(session, group.ID, model, errRefusal.Error(), len(req.Payload), time.Now())
 				lastErr = errRefusal
 				continue
 			}
@@ -331,8 +331,8 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		recordGroupDecision(group, session, attempts, model)
 		bodyOut := resp.Body
 		if !aux {
-			prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, model, prevLookupModel, req.Payload, time.Now())
-			observeGroupSessionUsage(session, group.ID, resp.Body)
+			prevModel := recordServed(cfg, session, group.ID, model, prevLookupModel, req.Payload, time.Now())
+			observeConversationUsage(session, group.ID, resp.Body)
 			notice := buildGroupNotice(cfg, group, attempts, model, prevModel)
 			notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, model, len(req.Payload)))
 			bodyOut = injectNonStreamNotice(resp.Body, effectiveFormat(req.Format, req.SourceFormat), notice)
@@ -358,7 +358,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 	if req.StreamID == "" {
 		return nil, fmt.Errorf("executor.execute_stream request has no stream_id")
 	}
-	session := groupSessionKey(req)
+	session := conversationKey(req)
 	group, ok := resolveTargetGroup(cfg, req.Model, session)
 	if !ok {
 		return nil, fmt.Errorf("model group %s is not configured", req.Model)
@@ -367,7 +367,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 	aux := isAuxiliaryRequest(req.Payload)
 	sanitizedPayload, sanitizedHeaders, _, hadSafeguards := sanitizeRequest(req.Payload, req.Headers, cfg)
 	stampSafeguards := cfg.Features.BypassAutoModeClassifier && hadSafeguards
-	plan := planGroupExecution(cfg, session, group, req.Payload, now)
+	plan := planConversation(cfg, session, group, req.Payload, now)
 	attempts := plan.Skipped
 	prevLookupModel := plan.PrevModel
 	var lastErr error
@@ -422,7 +422,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 			res := <-results
 			if res.err != nil {
 				attempts = append(attempts, groupAttempt{Model: res.model, Result: "failed: " + res.err.Error(), Duration: res.duration})
-				recordSessionModelFailure(session, group.ID, res.model, res.err.Error(), len(req.Payload), time.Now())
+				recordConversationFailure(session, group.ID, res.model, res.err.Error(), len(req.Payload), time.Now())
 				lastErr = res.err
 				continue
 			}
@@ -431,9 +431,9 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 			shiftIndices := false
 			prefetched := res.prefetched
 			if !aux {
-				prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, res.model, prevLookupModel, req.Payload, time.Now())
+				prevModel := recordServed(cfg, session, group.ID, res.model, prevLookupModel, req.Payload, time.Now())
 				for _, ch := range prefetched {
-					observeGroupSessionUsage(session, group.ID, ch)
+					observeConversationUsage(session, group.ID, ch)
 				}
 				notice := buildGroupNotice(cfg, group, attempts, res.model, prevModel)
 				notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, res.model, len(req.Payload)))
@@ -450,7 +450,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 								promoteProbedModel(cfg, session, group.ID, late.model, time.Now())
 							}
 						} else if late.err != nil {
-							recordSessionModelFailure(session, group.ID, late.model, late.err.Error(), len(req.Payload), time.Now())
+							recordConversationFailure(session, group.ID, late.model, late.err.Error(), len(req.Payload), time.Now())
 						}
 					}
 				}(remaining, res.rank)
@@ -480,7 +480,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		})
 		if errCall != nil {
 			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error(), Duration: time.Since(attemptStart)})
-			recordSessionModelFailure(session, group.ID, model, errCall.Error(), len(req.Payload), time.Now())
+			recordConversationFailure(session, group.ID, model, errCall.Error(), len(req.Payload), time.Now())
 			lastErr = errCall
 			continue
 		}
@@ -491,7 +491,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		prefetched, done, errPrefetch := prefetchStream(resp.StreamID, req.HostCallbackID, cfg.Features.FallbackOnRefusal, cfg.StreamPrefetchBytes)
 		if errPrefetch != nil {
 			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errPrefetch.Error(), Duration: time.Since(attemptStart)})
-			recordSessionModelFailure(session, group.ID, model, errPrefetch.Error(), len(req.Payload), time.Now())
+			recordConversationFailure(session, group.ID, model, errPrefetch.Error(), len(req.Payload), time.Now())
 			lastErr = errPrefetch
 			continue
 		}
@@ -499,9 +499,9 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		recordGroupDecision(group, session, attempts, model)
 		shiftIndices := false
 		if !aux {
-			prevModel := bindGroupSessionWithPayload(cfg, session, group.ID, model, prevLookupModel, req.Payload, time.Now())
+			prevModel := recordServed(cfg, session, group.ID, model, prevLookupModel, req.Payload, time.Now())
 			for _, ch := range prefetched {
-				observeGroupSessionUsage(session, group.ID, ch)
+				observeConversationUsage(session, group.ID, ch)
 			}
 			notice := buildGroupNotice(cfg, group, attempts, model, prevModel)
 			notice = appendNoticeTip(cfg, notice, compactionTipForSession(cfg, session, group, attempts, model, len(req.Payload)))
@@ -547,10 +547,10 @@ func forwardStream(source, target, callbackID string, prefetched [][]byte, sourc
 			return
 		}
 		if len(chunk.Payload) > 0 {
-			observeGroupSessionUsage(session, group.ID, chunk.Payload)
+			observeConversationUsage(session, group.ID, chunk.Payload)
 			if checkRefusal {
 				if refusal, _, _, _ := inspectStreamChunk(chunk.Payload); refusal != "" {
-					advanceGroupSessionOnRefusal(session, group, model, time.Now())
+					advanceConversationOnRefusal(session, group, model, time.Now())
 				}
 			}
 			payload := chunk.Payload

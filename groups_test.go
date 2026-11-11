@@ -299,7 +299,7 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 	// Simulate 20+ minutes passing without context dilution or compaction: the session stays
 	// pinned to abliterated instead of wasting tokens re-probing models that refused the unchanged context.
 	stateMu.Lock()
-	for _, b := range groupSessions {
+	for _, b := range groupStates {
 		b.LastSeen = time.Now().Add(-20 * time.Minute)
 		b.IdleExpiresAt = b.LastSeen.Add(groupCacheTTL)
 	}
@@ -319,7 +319,7 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 
 	// Growth does not retry models that refused. The first large turn tells the user once.
 	stateMu.Lock()
-	for _, b := range groupSessions {
+	for _, b := range groupStates {
 		b.Turns += 12
 	}
 	stateMu.Unlock()
@@ -385,8 +385,8 @@ func TestGroupSessionKeySeparatesConversations(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := executorRequest{Payload: []byte(tc.payload), Metadata: map[string]any{metadataCanonicalSessionID: "shared-host"}}
-			if got := groupSessionKey(req); got != tc.want {
-				t.Fatalf("groupSessionKey() = %q, want %q", got, tc.want)
+			if got := conversationKey(req); got != tc.want {
+				t.Fatalf("conversationKey() = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -409,9 +409,9 @@ func TestChildAndHelperRequestsPreserveParentRefusal(t *testing.T) {
 		t.Fatal(err)
 	}
 	parent := executorRequest{Payload: payload, Metadata: map[string]any{metadataCanonicalSessionID: "shared-host"}}
-	parentKey := groupSessionKey(parent)
-	recordSessionModelFailure(parentKey, group.ID, "primary", "refusal (cyber)", len(payload), now)
-	bindGroupSessionWithPayload(cfg, parentKey, group.ID, "fallback", "", payload, now)
+	parentKey := conversationKey(parent)
+	recordConversationFailure(parentKey, group.ID, "primary", "refusal (cyber)", len(payload), now)
+	recordServed(cfg, parentKey, group.ID, "fallback", "", payload, now)
 	if tip := compactionTipForSession(cfg, parentKey, group, nil, "fallback", len(payload)); tip == "" {
 		t.Fatal("missing initial tip")
 	}
@@ -421,14 +421,14 @@ func TestChildAndHelperRequestsPreserveParentRefusal(t *testing.T) {
 		`{"metadata":{"user_id":"{\"session_id\":\"parent\"}"},"messages":[{"role":"user","content":"Your task is to create a detailed summary of the conversation"}]}`,
 	} {
 		child := executorRequest{Payload: []byte(childPayload), Metadata: parent.Metadata}
-		childKey := groupSessionKey(child)
+		childKey := conversationKey(child)
 		if childKey == parentKey {
 			t.Fatal("child/helper shares parent routing key")
 		}
-		planGroupExecution(cfg, childKey, group, child.Payload, now)
-		recordSessionModelFailure(childKey, group.ID, "primary", "refusal (cyber)", len(child.Payload), now)
-		bindGroupSessionWithPayload(cfg, childKey, group.ID, "fallback", "", child.Payload, now)
-		plan := planGroupExecution(cfg, parentKey, group, payload, now)
+		planConversation(cfg, childKey, group, child.Payload, now)
+		recordConversationFailure(childKey, group.ID, "primary", "refusal (cyber)", len(child.Payload), now)
+		recordServed(cfg, childKey, group.ID, "fallback", "", child.Payload, now)
+		plan := planConversation(cfg, parentKey, group, payload, now)
 		if plan.Compacted || len(plan.Parallel) != 0 || strings.Join(plan.Sequential, ",") != "fallback" {
 			t.Fatalf("child/helper changed parent plan: %+v", plan)
 		}
@@ -446,14 +446,14 @@ func TestGroupDoesNotRetrySkippedModelsWhenExhausted(t *testing.T) {
 			group := modelGroup{ID: "smart", Strategy: strategy, Models: []string{"primary", "fallback"}}
 			now := time.Now()
 			payload := []byte(`{"messages":[{"role":"user","content":"work"}]}`)
-			recordSessionModelFailure("session", group.ID, "primary", "refusal (cyber)", len(payload), now)
-			bindGroupSessionWithPayload(cfg, "session", group.ID, "fallback", "", payload, now)
-			plan := planGroupExecution(cfg, "session", group, payload, now)
+			recordConversationFailure("session", group.ID, "primary", "refusal (cyber)", len(payload), now)
+			recordServed(cfg, "session", group.ID, "fallback", "", payload, now)
+			plan := planConversation(cfg, "session", group, payload, now)
 			if strings.Join(plan.Sequential, ",") != "fallback" || len(plan.Parallel) != 0 {
 				t.Fatalf("refused model was scheduled: %+v", plan)
 			}
-			recordSessionModelFailure("session", group.ID, "fallback", "refusal (cyber)", len(payload), now)
-			plan = planGroupExecution(cfg, "session", group, payload, now)
+			recordConversationFailure("session", group.ID, "fallback", "refusal (cyber)", len(payload), now)
+			plan = planConversation(cfg, "session", group, payload, now)
 			if len(plan.Sequential) != 0 || len(plan.Parallel) != 0 || len(plan.Skipped) != 2 {
 				t.Fatalf("exhausted plan retried skipped models: %+v", plan)
 			}
@@ -462,8 +462,8 @@ func TestGroupDoesNotRetrySkippedModelsWhenExhausted(t *testing.T) {
 }
 
 func TestCompactionRequiresConversationMessages(t *testing.T) {
-	binding := &sessionBinding{LastPayloadBytes: 256 * 1024, LastMessageCount: 100}
-	if conversationCompacted(binding, []byte(`{"model":"smart"}`)) {
+	state := &conversationState{LastPayloadBytes: 256 * 1024, LastMessageCount: 100}
+	if state.conversationCompactedLocked([]byte(`{"model":"smart"}`)) {
 		t.Fatal("request without messages treated as compaction")
 	}
 }
@@ -489,34 +489,34 @@ func TestProgrammaticCompactionResetAndCapabilitySkips(t *testing.T) {
 		return []byte(`{"messages":[` + strings.Join(parts, ",") + `]}`)
 	}
 	bigPayload := history(8, strings.Repeat("a", 8*1024))
-	recordSessionModelFailure(sess, group.ID, "m1", "refusal (cyber)", len(bigPayload), now)
-	recordSessionModelFailure(sess, group.ID, "m2", `{"error":{"message":"The capability 'tools' is not supported by this gateway profile.","code":"unsupported_capability"}}`, len(bigPayload), now)
-	recordSessionModelFailure(sess, group.ID, "m3", `{"error":{"message":"Message 1 carries an image, and the selected model route accepts text only.","code":"unsupported_capability"}}`, len(bigPayload), now)
-	bindGroupSessionWithPayload(cfg, sess, group.ID, "m4", "", bigPayload, now)
+	recordConversationFailure(sess, group.ID, "m1", "refusal (cyber)", len(bigPayload), now)
+	recordConversationFailure(sess, group.ID, "m2", `{"error":{"message":"The capability 'tools' is not supported by this gateway profile.","code":"unsupported_capability"}}`, len(bigPayload), now)
+	recordConversationFailure(sess, group.ID, "m3", `{"error":{"message":"Message 1 carries an image, and the selected model route accepts text only.","code":"unsupported_capability"}}`, len(bigPayload), now)
+	recordServed(cfg, sess, group.ID, "m4", "", bigPayload, now)
 
-	plan1 := planGroupExecution(cfg, sess, group, bigPayload, now.Add(10*time.Minute))
+	plan1 := planConversation(cfg, sess, group, bigPayload, now.Add(10*time.Minute))
 	if len(plan1.Parallel) != 0 || len(plan1.Sequential) == 0 || plan1.Sequential[0] != "m4" {
 		t.Fatalf("plan1 = %+v, want sequential starting with m4", plan1)
 	}
 
 	stateMu.Lock()
-	groupSessions[sess+"\x00"+group.ID].Turns += 20
+	groupStates[sess+"\x00"+group.ID].Turns += 20
 	stateMu.Unlock()
 	grownPayload := history(8, strings.Repeat("a", 20*1024))
-	plan2 := planGroupExecution(cfg, sess, group, grownPayload, now.Add(15*time.Minute))
+	plan2 := planConversation(cfg, sess, group, grownPayload, now.Add(15*time.Minute))
 	if len(plan2.Parallel) != 0 || plan2.Sequential[0] != "m4" || plan2.Compacted {
 		t.Fatalf("plan2 after growth = %+v, want no probe and no compaction", plan2)
 	}
 
-	bindGroupSessionWithPayload(cfg, sess, group.ID, "m4", "m4", grownPayload, now.Add(15*time.Minute))
+	recordServed(cfg, sess, group.ID, "m4", "m4", grownPayload, now.Add(15*time.Minute))
 	editedPayload := history(8, "cleared tool result")
-	plan3 := planGroupExecution(cfg, sess, group, editedPayload, now.Add(20*time.Minute))
+	plan3 := planConversation(cfg, sess, group, editedPayload, now.Add(20*time.Minute))
 	if plan3.Compacted || len(plan3.Parallel) != 0 || plan3.Sequential[0] != "m4" {
 		t.Fatalf("plan3 context edit = %+v, want still pinned to m4", plan3)
 	}
 
 	compactedPayload := []byte(`{"messages":[{"text":"compacted summary"}]}`)
-	plan4 := planGroupExecution(cfg, sess, group, compactedPayload, now.Add(25*time.Minute))
+	plan4 := planConversation(cfg, sess, group, compactedPayload, now.Add(25*time.Minute))
 	if !plan4.Compacted || len(plan4.Sequential) == 0 || plan4.Sequential[0] != "m1" {
 		t.Fatalf("plan4 after compaction = %+v, want Compacted=true and Sequential[0]=m1", plan4)
 	}
@@ -591,16 +591,16 @@ func TestGroupRoutingStrategiesRandomAndQuotaSticky(t *testing.T) {
 		Models:   []string{"m1", "m2", "m3"},
 	}
 	now := time.Now()
-	order1, skipped1, prev1 := groupCandidateOrder(cfg, "sess-q", group, now)
+	order1, skipped1, prev1 := conversationCandidateOrder(cfg, "sess-q", group, now)
 	if len(order1) != 3 || len(skipped1) != 0 || prev1 != "" {
 		t.Fatalf("initial quota order = %v skipped=%v prev=%q", order1, skipped1, prev1)
 	}
 	chosen := order1[0]
-	bindGroupSession(cfg, "sess-q", group.ID, chosen, prev1, now)
+	recordServed(cfg, "sess-q", group.ID, chosen, prev1, nil, now)
 
 	// Within 5 minutes, the chosen model is always placed first to preserve prompt cache.
 	for i := 0; i < 10; i++ {
-		order2, _, prev2 := groupCandidateOrder(cfg, "sess-q", group, now.Add(2*time.Minute))
+		order2, _, prev2 := conversationCandidateOrder(cfg, "sess-q", group, now.Add(2*time.Minute))
 		if order2[0] != chosen || prev2 != chosen {
 			t.Fatalf("sticky quota order[0] = %q (prev %q), want %q", order2[0], prev2, chosen)
 		}
@@ -610,8 +610,8 @@ func TestGroupRoutingStrategiesRandomAndQuotaSticky(t *testing.T) {
 	cfgZero := cfg
 	cfgZero.IdleMinutes = 0
 	groupOrder := modelGroup{ID: "ord", Name: "Ord", Strategy: groupStrategyOrder, Models: []string{"m1", "m2", "m3"}}
-	bindGroupSession(cfgZero, "sess-zero", groupOrder.ID, "m2", "", now)
-	orderZero, skippedZero, prevZero := groupCandidateOrder(cfgZero, "sess-zero", groupOrder, now.Add(time.Second))
+	recordServed(cfgZero, "sess-zero", groupOrder.ID, "m2", "", nil, now)
+	orderZero, skippedZero, prevZero := conversationCandidateOrder(cfgZero, "sess-zero", groupOrder, now.Add(time.Second))
 	if orderZero[0] != "m1" || len(skippedZero) != 0 || prevZero != "m2" {
 		t.Fatalf("idle_minutes=0 order = %v skipped=%v prev=%q", orderZero, skippedZero, prevZero)
 	}

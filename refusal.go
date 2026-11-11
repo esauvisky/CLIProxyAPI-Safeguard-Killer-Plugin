@@ -15,9 +15,6 @@ import (
 )
 
 const (
-	// groupCacheTTL is the default idle horizon before a non-refusal session binding may re-rank.
-	groupCacheTTL = 5 * time.Minute
-
 	// dilutionBaseBytes is the payload size at which a session on a fallback model is large enough
 	// for one compaction tip.
 	dilutionBaseBytes = 128 * 1024
@@ -66,7 +63,6 @@ var sessionStatePath = filepath.Join(os.TempDir(), "safeguard-killer-sessions.js
 
 type persistedSessionState struct {
 	Sessions      map[string]*sessionBinding    `json:"sessions"`
-	GroupSessions map[string]*sessionBinding    `json:"group_sessions"`
 	Conversations map[string]*conversationState `json:"conversations"`
 }
 
@@ -89,7 +85,7 @@ func loadPersistedSessions(now time.Time) {
 		}
 	}
 	for k, v := range snap.Conversations {
-		if v != nil && now.Sub(v.LastSeen) <= sessionRetention {
+		if v != nil {
 			groupStates[k] = v
 		}
 	}
@@ -262,7 +258,7 @@ func summarizeAttemptReason(detail string) string {
 // A session that stayed on its model is silent when every other attempt was only a transient
 // cooldown (quota, rate limit, upstream): those retries are not news. A refusal, an empty
 // response, or a capability rejection still prints.
-func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttempt, served, prevModel string) string {
+func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttempt, served, prevModel string, suppressedRefusalNotices map[string]bool) string {
 	if !cfg.Features.ClientFallbackNotices {
 		return ""
 	}
@@ -275,6 +271,9 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 			break
 		}
 		if strings.HasPrefix(attempt.Result, "failed: ") {
+			if suppressedRefusalNotices[attempt.Model] {
+				continue
+			}
 			hadActiveFailure = true
 			secs := formatAttemptSecs(attempt.Duration)
 			rawDetail := strings.TrimPrefix(attempt.Result, "failed: ")
@@ -298,9 +297,7 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 			failedChain = append(failedChain, fmt.Sprintf("`%s` (%s)", attempt.Model, reason))
 		}
 	}
-	strat := group.effectiveStrategy()
-	modelChanged := (prevModel != "" && prevModel != served) ||
-		(prevModel == "" && (strat == groupStrategyUpgrade || strat == groupStrategyStick) && len(group.Models) > 0 && served != group.Models[0])
+	modelChanged := prevModel != "" && prevModel != served
 	if !hadActiveFailure && !modelChanged {
 		return ""
 	}

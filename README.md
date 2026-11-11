@@ -2,7 +2,7 @@
 
 <img src="assets/logo.png" width="96" align="right" alt="Safeguard Killer logo">
 
-**Safeguard Killer** is an ABI v1 plugin for CLIProxyAPI that neutralizes client/upstream safety classifiers, strips refusal-taint telemetry, and provides **Smart Groups** — virtual models that automatically route around safeguard refusals across providers while preserving 5-minute prompt-cache stickiness and balancing provider quota.
+**Safeguard Killer** is an ABI v1 plugin for CLIProxyAPI that neutralizes client/upstream safety classifiers, strips refusal-taint telemetry, and provides **Smart Groups** — virtual models that automatically route around safeguard refusals across providers, select models by quality and cost ratings, keep conversations sticky to preserve prompt caches, and balance provider quota.
 
 It is built to work particularly well with **Claude Code**, **Claude models**, **OpenAI models**, **Codex**, and **Gemini models**.
 
@@ -21,7 +21,7 @@ Every adaptation can be toggled individually in **Safeguard Killer > General Set
   - OpenAI / Codex `content_filter` and refusal content blocks
   - Gemini / Antigravity `SAFETY`, `PROHIBITED_CONTENT`, `BLOCKLIST`, `RECITATION`, `SPII`, and empty `end_turn` blocks
   - Plain-text refusals, OpenAI safe-completion pivots (`"I can help with ..., but not ..."`), and authorization/scope interrogations (`"I need a clear authorization context..."`)
-  When any refusal is detected during prefetch, the stream is closed before a single chunk reaches the client and the request transparently switches to the next model in the group.
+  When any refusal is detected during prefetch, the stream is closed before a single chunk reaches the client and the request transparently switches to another eligible model in the group.
 - **Client fallback & model-switch notices (`client_fallback_notices` + `verbose_notices` + `notice_prefix`):** Emits a customizable notice (default `⚡ [Safeguard Killer] `) in the client whenever a model in a group refuses/fails and Safeguard Killer recovers on another model, or when the active model for the session changes. By default, notices highlight the model transition, elapsed call seconds, and concise reason (e.g. ``⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal: cyber) → `gemini-4-argon-high` (4s, refusal: regex) → `kimi-k3.1-pro` ``); enable `verbose_notices` to include the full raw upstream error/skip strings. On subsequent turns, the notice is stripped from `messages` before forwarding upstream so it never enters any model's context.
 - **Rewrite cyber & dual-use system prompt gate (`rewrite_cyber_system_prompt`):** Replaces Claude Code's built-in `"Dual-use security tools ... require clear authorization context"` gate and strips Fable/Mythos dual-use restriction blurbs in `body.system` so models answer directly without interrogating for authorization scope or ownership.
 - **Strip refusal-taint headers (`strip_refusal_taint_headers`):** Removes `x-is-refusal-fallback`, `x-cc-fallback-latched-by`, `x-cc-fallback-from-model`, `x-cc-fallback-category`, `x-cc-fallback-trigger`, `x-cc-original-request-id`, and `x-cc-atis` headers that Claude Code attaches after a flagged turn.
@@ -37,41 +37,45 @@ Every adaptation can be toggled individually in **Safeguard Killer > General Set
 
 ## 2. Smart Groups (Refusal-Bypass Chains & Multi-Provider Routing)
 
-A **Smart Group** exposes a virtual model ID (e.g. `best`, `heavy`, `fast`, `uncensored-best`) backed by a list of target models across providers. While Smart Groups can also be used simply for convenience or spreading usage across providers, they are designed first and foremost to **survive safeguard refusals without interrupting your session**:
+A **Smart Group** exposes a virtual model ID (e.g. `best`, `heavy`, `fast`, `uncensored-best`) backed by rated target models across providers. While Smart Groups can also be used simply for convenience or spreading usage across providers, they are designed first and foremost to **survive safeguard refusals without interrupting your session**:
 
-### Programmatic Cache Stickiness, Parallel Probing & Compaction Reset
-When a message triggers a refusal (or error) on an earlier model in the group and a later model accepts and answers:
-- **Sticky across idle gaps:** Sessions stay pinned to the working fallback model across idle pauses (preserving long-lived provider prefix caches on Kimi, DeepSeek, GLM, and OpenAI without wasting uncached tokens re-sending unchanged history).
-- **Refusal stickiness:** A safeguard refusal stays on the working fallback for the rest of the transcript. Growing the conversation does not call the refused model again, because the refused content is still in the history. Exhausting the remaining models reports failure instead of retrying models already marked as refused.
+### Conversation Stickiness & Compaction Reset
+Once a model answers, the conversation stays on it:
+- **Sticky across idle gaps:** Sessions stay pinned to the current model across idle pauses until compaction, reset, or the model becomes unusable (preserving long-lived provider prefix caches on Kimi, DeepSeek, GLM, and OpenAI without wasting uncached tokens re-sending unchanged history).
+- **Refusal stickiness:** After a safeguard refusal, the conversation stays on the model that answered for the rest of the transcript. Growing the conversation does not call the refused model again, because the refused content is still in the history. Exhausting the remaining models reports failure instead of retrying models already marked as refused.
 - **Per-conversation isolation:** Claude's own session ID and agent/subagent ID identify each transcript. Parent IDs do not merge child state into the parent, and background summary/helper requests have separate state. Child requests cannot reset the parent's refusal records, history measurements, or compaction tip.
-- **Compaction Reset & One Tip:** Records reset to Model #1 only when the payload shrinks below 70% **and** the message list collapses to at most half (a real `/compact`, auto-compaction, or `/clear`). Claude Code clearing old tool results shrinks bytes without collapsing messages, and does not reset. On the first large fallback turn (`>= 128 KB`), one tip says that `/compact` retries the primary. It is not repeated.
+- **Compaction Reset & One Tip:** Refusal records and the current model reset, and the next turn selects again, only when the payload shrinks below 70% **and** the message list collapses to at most half (a real `/compact`, auto-compaction, or `/clear`). Claude Code clearing old tool results shrinks bytes without collapsing messages, and does not reset. On the first large fallback turn (`>= 128 KB`), one tip says that `/compact` retries the refused models. It is not repeated.
 - **Session-Scoped Capability Memory:** Models that fail with `no tools`, `not found`, `no vision` (while images are in payload), or `context too long` (until compaction shrinks the payload) are skipped automatically without re-trying.
 
-### Per-Group Routing Strategies (`strategy`)
-Each Smart Group can choose how it selects models and handles upgrades:
+### Model Selection (`mode`, `quality`, `cost`)
+Each Smart Group needs an explicit `mode`, and each model in it needs `quality` and `cost` ratings from `0` to `100`. Higher `quality` is better; higher `cost` is more expensive. The order of `models` has no effect on selection.
 
-1. **`upgrade` — Priority + Auto-Upgrade (Parallel Probe, default):**
-   Tries models in priority order (`#1 → #2 → #3...`) and pins to the answering model. A refused model is not called again until compaction resets the session. Models with no refusal record are still raced alongside the pinned model once its cache window expires.
-2. **`stick` — Priority + Sticky Until Compact (Max Cache Saver):**
-   Tries models in priority order (`#1 → #2 → #3...`). Once a model refuses on safeguards, stays locked on the working fallback model for the entire session without re-probing higher models mid-session — only resetting to `#1` when history is compacted (`/compact`) or cleared.
-3. **`quota` — Quota Balanced (Cache-Sticky):**
-   Scores each model in the group by its best eligible credential's quota burn rate (`remaining / hours_until_reset`) and selects the starting model via Efraimidis–Spirakis weighted random sampling (`u^(1/rate)`), staying pinned while the session's prefix cache is warm.
-4. **`race` — Fastest Non-Refusing (Parallel Race):**
-   Races candidate models in parallel for new or cold sessions and streams the first one that passes prefetch without refusing or failing, then stays pinned while its server cache is warm.
-5. **`random` — Round-Robin / Random Pool (Cache-Sticky):**
-   Distributes new or cold sessions uniformly across the group's models, stays pinned while the cache is warm, and fails over on refusal or error.
+| `mode` | UI label | Score |
+| --- | --- | --- |
+| `quality` | Quality first | `0.8 × quality − 0.2 × cost` |
+| `cost` | Lower cost first | `0.2 × quality − 0.8 × cost` |
+
+A new conversation, or one reset by compaction, scores every eligible model (excluding refused, capability-incompatible, and unavailable models). Only models within `3` points of the best score stay in the pool, and one is picked by softmax over their scores with temperature `1`. Models farther from the best get no traffic. The pick then stays sticky as described above. When it refuses or becomes unusable, the remaining eligible models are scored the same way.
+
+Every group decision logs `mode` and `model_scores` (`model`, `quality`, `cost`, `score`, `probability`, `excluded`). The **Recent Decisions** tab and the conversation trail show these for each pick.
 
 ---
 
 ## 3. Quota-Aware Credential Balancing
 
-When an individual model is served by two or more credentials (for example multiple Claude Max or OpenCode Go accounts), Safeguard Killer ranks eligible credentials by:
+Credential balancing is separate from model selection. After a group picks a model, or when a client requests a model directly, Safeguard Killer checks eligible credentials (including a sole credential) and ranks them by:
+
+- **Account weight:** the credential's management weight multiplies its score, so preferred accounts fill first.
+- **Quota bottleneck:** `remaining / hours_until_reset` of the most constraining quota window governing that model. A credential with 30% left resetting in 24h (`1.25%/h`) beats one with 60% left resetting in 6 days (`0.42%/h`).
+- **Load:** active session bindings on the credential, not in-flight request counts.
 
 ```
-rate = remaining / hours_until_reset
+score = weight × (remaining / hours_until_reset) / (1 + load)
 ```
 
-of the longest quota window governing that model. A credential with 30% left resetting in 24h (`1.25%/h`) beats one with 60% left resetting in 6 days (`0.42%/h`).
+The ranking view shows rate, weight, load, and the resulting score. Quota fractions are relative to each account's allowance; they are not absolute token capacities. Providers without a quota source, model-specific windows, or reset times use a neutral rate of `1`, with account weight and load still applied. Reported quota-fetch errors and invalid account weights are surfaced rather than silently handed back to the host selector.
+
+This replaces the former strategy and cost-tier flags. Existing group configurations must be converted to the rated-model schema below; legacy fields and string-only model lists are rejected.
 
 - Credentials with any applicable window below `min_remaining` are excluded.
 - Active sessions stay bound to their credential until `idle_minutes` (default 5) pass without a prompt.
@@ -82,10 +86,10 @@ of the longest quota window governing that model. A credential with 30% left res
 
 Open **Safeguard Killer** in the CPA Management Center sidebar. The interface is organized into five tabs:
 
-1. **General Settings:** Configure `management_key`, `min_remaining`, `idle_minutes`, `stream_prefetch_bytes`, the 8 safeguard/adaptation toggles, and the custom client notice prefix.
-2. **Smart Groups:** Add, reorder, and delete Smart Groups, pick each group's routing strategy (`In Order`, `Quota Spread`, or `Random`), and manage each group's model chain.
-3. **Sessions:** Live view of active credential bindings and 5-minute Smart Group model pins with expiry countdowns.
-4. **Recent Decisions:** Full audit log of every group failover chain and credential quota ranking.
+1. **General Settings:** Configure `management_key`, `min_remaining`, `idle_minutes`, `stream_prefetch_bytes`, the safeguard/adaptation toggles, and the custom client notice prefix.
+2. **Smart Groups:** Add and delete Smart Groups, pick each group's mode (**Quality first** or **Lower cost first**), and add, remove, and rate models (quality and cost, `0` to `100`). New groups default to Quality first; new models default to quality `50` and cost `50`.
+3. **Sessions:** Live view of active credential bindings and Smart Group model pins.
+4. **Recent Decisions:** Routing metrics (refusals, compaction resets), a per-conversation trail, and an audit log of every group selection (mode, model scores, probabilities, exclusions), failover chain, and credential quota ranking.
 5. **Credentials:** Live status and quota windows for every host credential.
 
 ---
@@ -133,19 +137,37 @@ plugins:
       groups:
         - id: "best"
           name: "General Purpose"
-          strategy: "order"
+          mode: "quality"
           models:
-            - "claude-opus-5-5"
-            - "gpt-6.1-sol"
-            - "glm-5.3"
-            - "kimi-k3.1-pro"
-            - "gemini-4-argon-high"
+            - id: "claude-opus-5-5"
+              quality: 95
+              cost: 90
+            - id: "gpt-6.1-sol"
+              quality: 94
+              cost: 85
+            - id: "gemini-4-argon-high"
+              quality: 90
+              cost: 60
+            - id: "kimi-k3.1-pro"
+              quality: 82
+              cost: 25
+            - id: "glm-5.3"
+              quality: 80
+              cost: 10
         - id: "uncensored-best"
           name: "Uncensored Best"
-          strategy: "order"
+          mode: "cost"
           models:
-            - "glm-5.3-uncensored"
-            - "deepseek-v4.1-flash-uncensored"
-            - "hermes-4-405b"
-            - "abliterated-model-large-v2"
+            - id: "glm-5.3-uncensored"
+              quality: 75
+              cost: 10
+            - id: "deepseek-v4.1-flash-uncensored"
+              quality: 70
+              cost: 5
+            - id: "hermes-4-405b"
+              quality: 72
+              cost: 30
+            - id: "abliterated-model-large-v2"
+              quality: 60
+              cost: 20
 ```

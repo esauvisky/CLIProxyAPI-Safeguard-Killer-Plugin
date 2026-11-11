@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,6 +43,13 @@ const (
 	// boundaries (xAI) use the real span instead.
 	quotaMonth = 30 * 24 * time.Hour
 )
+
+// quotaSourceNone marks a snapshot of a credential whose provider has no quota source (CPA
+// quota/fetch answers 501). Quota is optional for such providers, so the balancer excludes the
+// credential with that reason instead of treating it as a telemetry failure.
+const quotaSourceNone = "none"
+
+var errNoQuotaSource = errors.New("no quota source")
 
 // managementBlock stops all management calls after CPA rejected the key: every failed attempt
 // counts toward CPA's IP ban, so retrying a bad key would lock the plugin out.
@@ -175,6 +183,9 @@ func fetchCredentialQuota(key string, cred hostAuth) credentialQuota {
 	default:
 		snapshot.Source = "cpa-quota-fetch"
 		windows, plan, errFetch = fetchPluginQuota(key, cred)
+		if errors.Is(errFetch, errNoQuotaSource) {
+			snapshot.Source = quotaSourceNone
+		}
 	}
 	if errFetch != nil {
 		snapshot.Error = errFetch.Error()
@@ -1197,7 +1208,7 @@ func fetchPluginQuota(key string, cred hostAuth) ([]quotaWindow, string, error) 
 		return nil, "", fmt.Errorf("%s: %w", cred.Provider, errCall)
 	}
 	if status == http.StatusNotImplemented {
-		return nil, "", fmt.Errorf("%s: no quota source", cred.Provider)
+		return nil, "", fmt.Errorf("%s: %w", cred.Provider, errNoQuotaSource)
 	}
 	if status != http.StatusOK {
 		return nil, "", fmt.Errorf("%s: management quota/fetch: HTTP %d: %s", cred.Provider, status, snippet(body))
@@ -1245,4 +1256,89 @@ func parsePluginQuota(provider string, body []byte) ([]quotaWindow, string, erro
 		plan = payload.Subscription.Plan
 	}
 	return windows, plan, nil
+}
+
+// authWeightCache holds per-auth weights read from the management auth-files list.
+var (
+	authWeightMu  sync.Mutex
+	authWeights   = make(map[string]float64)
+	authWeightsAt time.Time
+)
+
+// authWeightTTL bounds how often the auth list is re-read for weight changes.
+const authWeightTTL = 5 * time.Minute
+
+// loadAuthWeights reads the per-credential weight from the management auth-files list when the
+// cache is older than authWeightTTL or lacks one of ids. It holds authWeightMu across the fetch
+// so concurrent picks share one management call. Any failure (management unavailable, an
+// invalid weight, a credential missing from the list) is returned.
+func loadAuthWeights(key string, ids []string, now time.Time) error {
+	authWeightMu.Lock()
+	defer authWeightMu.Unlock()
+	if !authWeightsAt.IsZero() && now.Sub(authWeightsAt) < authWeightTTL && hasAuthWeights(ids) {
+		return nil
+	}
+	var resp struct {
+		Files []struct {
+			ID     string          `json:"id"`
+			Weight json.RawMessage `json:"weight"`
+		} `json:"files"`
+	}
+	if errCall := cpaManagementJSON(key, http.MethodGet, "/v0/management/auth-files", nil, &resp); errCall != nil {
+		return fmt.Errorf("load account weights: %w", errCall)
+	}
+	weights := make(map[string]float64, len(resp.Files))
+	for index, file := range resp.Files {
+		if file.ID == "" {
+			return fmt.Errorf("load account weights: auth-files entry %d has no id", index)
+		}
+		weight, errWeight := parseAuthWeight(file.Weight)
+		if errWeight != nil {
+			return fmt.Errorf("load account weights: credential %s: %w", file.ID, errWeight)
+		}
+		weights[file.ID] = weight
+	}
+	for _, id := range ids {
+		if _, ok := weights[id]; !ok {
+			return fmt.Errorf("load account weights: credential %s is not in the management auth-files list", id)
+		}
+	}
+	authWeights = weights
+	authWeightsAt = now
+	return nil
+}
+
+// hasAuthWeights reports whether every id has a cached weight; callers hold authWeightMu.
+func hasAuthWeights(ids []string) bool {
+	for _, id := range ids {
+		if _, ok := authWeights[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// parseAuthWeight decodes an account weight. The weight is optional: absent or null means 1.
+// Zero is a real setting that excludes the account from balancing; negative values and
+// non-numbers are rejected.
+func parseAuthWeight(raw json.RawMessage) (float64, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return 1, nil
+	}
+	var weight float64
+	if errDecode := json.Unmarshal(raw, &weight); errDecode != nil {
+		return 0, fmt.Errorf("weight %s is not a number: %w", snippet(raw), errDecode)
+	}
+	if weight < 0 {
+		return 0, fmt.Errorf("weight %v is negative", weight)
+	}
+	return weight, nil
+}
+
+// authWeight returns the loaded multiplier for an auth ID.
+func authWeight(authID string) (float64, bool) {
+	authWeightMu.Lock()
+	defer authWeightMu.Unlock()
+	weight, ok := authWeights[authID]
+	return weight, ok
 }

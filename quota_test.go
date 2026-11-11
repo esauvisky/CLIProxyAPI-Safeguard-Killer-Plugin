@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -478,5 +479,30 @@ func TestRejectedManagementKeyStopsCalls(t *testing.T) {
 	}
 	if status := managementStatus("", time.Now()); !strings.Contains(status, "not set") {
 		t.Fatalf("managementStatus without key = %q, want not set", status)
+	}
+}
+
+func TestParseAuthWeight(t *testing.T) {
+	cases := []struct {
+		raw     string
+		want    float64
+		wantErr string
+	}{
+		{raw: "", want: 1},
+		{raw: "null", want: 1},
+		{raw: "2.5", want: 2.5},
+		{raw: "0", want: 0},
+		{raw: "-1", wantErr: "negative"},
+		{raw: `"high"`, wantErr: "not a number"},
+	}
+	for _, tt := range cases {
+		got, errParse := parseAuthWeight(json.RawMessage(tt.raw))
+		if tt.wantErr != "" {
+			assertErrorContains(t, errParse, tt.wantErr)
+			continue
+		}
+		if errParse != nil || got != tt.want {
+			t.Fatalf("parseAuthWeight(%q) = %v, %v; want %v", tt.raw, got, errParse, tt.want)
+		}
 	}
 }

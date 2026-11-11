@@ -49,10 +49,16 @@ type rankEntry struct {
 	Provider  string  `json:"provider"`
 	Window    string  `json:"window,omitempty"`
 	Remaining float64 `json:"remaining"`
-	// HoursToReset is the time until the governing window resets.
+	// HoursToReset is the time until the bottleneck window resets.
 	HoursToReset float64 `json:"hours_to_reset"`
-	// Rate is remaining / hours_to_reset; higher wins.
+	// Rate is the lowest remaining / hours_to_reset among applicable windows.
 	Rate float64 `json:"rate"`
+	// Weight is the account's configured priority multiplier (default 1).
+	Weight float64 `json:"weight"`
+	// Load counts active credential session bindings, not in-flight requests.
+	Load int `json:"load"`
+	// Score is Rate * Weight / (1+Load).
+	Score float64 `json:"score"`
 	// Excluded explains why the credential was not eligible; empty when eligible.
 	Excluded string `json:"excluded,omitempty"`
 }
@@ -67,10 +73,12 @@ type decision struct {
 	// AuthID is the chosen credential for "balance" and the serving model for "group".
 	AuthID string `json:"auth_id,omitempty"`
 	// Version is the plugin version that recorded this decision.
-	Version  string         `json:"version,omitempty"`
-	Reason   string         `json:"reason"`
-	Ranking  []rankEntry    `json:"ranking,omitempty"`
-	Attempts []groupAttempt `json:"attempts,omitempty"`
+	Version     string         `json:"version,omitempty"`
+	Reason      string         `json:"reason"`
+	Ranking     []rankEntry    `json:"ranking,omitempty"`
+	Attempts    []groupAttempt `json:"attempts,omitempty"`
+	Mode        string         `json:"mode,omitempty"`
+	ModelScores []modelScore   `json:"model_scores,omitempty"`
 }
 
 // modelSessionState tracks how a model in a Smart Group failed within a specific session.
@@ -118,6 +126,8 @@ type uiState struct {
 	Error string `json:"error,omitempty"`
 	// ManagementError explains why quota collection is not running (no key, rejected key, IP ban).
 	ManagementError string `json:"management_error,omitempty"`
+	// Metrics aggregates routing decisions for the metrics chart row.
+	Metrics routingMetrics `json:"metrics"`
 }
 
 // uiCredential joins a credential with its models and quota.

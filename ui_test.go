@@ -9,8 +9,18 @@ import (
 
 func TestManagementRegistrationPaths(t *testing.T) {
 	reg := managementRegistrationPayload()
-	if len(reg.Routes) != 1 || reg.Routes[0].Method != http.MethodGet || reg.Routes[0].Path != "/plugins/safeguard-killer/state" {
+	wantRoutes := []struct{ method, path string }{
+		{http.MethodGet, "/plugins/safeguard-killer/state"},
+		{http.MethodGet, "/plugins/safeguard-killer/trail"},
+		{http.MethodPost, "/plugins/safeguard-killer/drain"},
+	}
+	if len(reg.Routes) != len(wantRoutes) {
 		t.Fatalf("routes = %+v", reg.Routes)
+	}
+	for i, want := range wantRoutes {
+		if reg.Routes[i].Method != want.method || reg.Routes[i].Path != want.path {
+			t.Fatalf("routes[%d] = %+v, want %s %s", i, reg.Routes[i], want.method, want.path)
+		}
 	}
 	if len(reg.Resources) != 1 || reg.Resources[0].Path != "/ui" || reg.Resources[0].Menu != "Safeguard Killer" {
 		t.Fatalf("resources = %+v", reg.Resources)
@@ -70,6 +80,55 @@ func TestHandleManagementUI(t *testing.T) {
 	for _, want := range []string{"/v0/management/plugins/safeguard-killer/state", "/v8/management/config/plugins/configs/safeguard-killer"} {
 		if !strings.Contains(string(resp.Body), want) {
 			t.Fatalf("ui html does not reference %s", want)
+		}
+	}
+}
+
+func TestGroupSchemaJSONRoundtrip(t *testing.T) {
+	want := modelGroup{ID: "best", Name: "General Purpose", Mode: "cost", Models: []groupModel{{ID: "claude-opus-5-5", Quality: 95, Cost: 90}, {ID: "glm-5.3", Quality: 70, Cost: 10}}}
+	raw, errMarshal := json.Marshal(want)
+	if errMarshal != nil {
+		t.Fatal(errMarshal)
+	}
+	var fields map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(raw, &fields); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if len(fields) != 4 || fields["id"] == nil || fields["name"] == nil || fields["mode"] == nil || fields["models"] == nil {
+		t.Fatalf("group fields = %s", raw)
+	}
+	var models []map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(fields["models"], &models); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	for _, m := range models {
+		if len(m) != 3 || m["id"] == nil || m["quality"] == nil || m["cost"] == nil {
+			t.Fatalf("model fields = %s", fields["models"])
+		}
+	}
+	var got modelGroup
+	if errUnmarshal := json.Unmarshal(raw, &got); errUnmarshal != nil {
+		t.Fatal(errUnmarshal)
+	}
+	if got.ID != want.ID || got.Name != want.Name || got.Mode != want.Mode || len(got.Models) != len(want.Models) {
+		t.Fatalf("roundtrip = %+v, want %+v", got, want)
+	}
+	for i := range want.Models {
+		if got.Models[i] != want.Models[i] {
+			t.Fatalf("roundtrip model %d = %+v, want %+v", i, got.Models[i], want.Models[i])
+		}
+	}
+}
+
+func TestUIUsesRatedGroupSchema(t *testing.T) {
+	for _, want := range []string{`data-gfield="mode"`, `data-mfield="quality"`, `data-mfield="cost"`, "Quality first", "Lower cost first", "model_scores"} {
+		if !strings.Contains(uiHTML, want) {
+			t.Fatalf("ui html does not contain %s", want)
+		}
+	}
+	for _, gone := range []string{"strategy", "cheap_models", "cheap_first", "cheap_probe", "tier_up_after", "tier_ups"} {
+		if strings.Contains(uiHTML, gone) {
+			t.Fatalf("ui html still references %s", gone)
 		}
 	}
 }

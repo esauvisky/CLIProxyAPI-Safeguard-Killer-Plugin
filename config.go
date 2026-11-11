@@ -1,9 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -14,12 +15,8 @@ const (
 	// groupProvider is the executor identifier model groups are registered and executed under.
 	groupProvider = "model-groups"
 
-	groupStrategyUpgrade = "upgrade"
-	groupStrategyOrder   = "upgrade"
-	groupStrategyStick   = "stick"
-	groupStrategyQuota   = "quota"
-	groupStrategyRace    = "race"
-	groupStrategyRandom  = "random"
+	groupModeQuality = "quality"
+	groupModeCost    = "cost"
 )
 
 // executorFormats lists every client protocol; group requests pass through in the client's own format.
@@ -105,32 +102,93 @@ func (f featureConfig) effectiveNoticePrefix() string {
 	return defaultNoticePrefix
 }
 
-// modelGroup is a virtual model that routes across its target models according to Strategy.
 type modelGroup struct {
-	// ID is the model codename clients request.
-	ID string `yaml:"id" json:"id"`
-	// Name is the display name shown in model lists.
-	Name string `yaml:"name" json:"name"`
-	// Strategy is "order" (default), "random", or "quota".
-	Strategy string   `yaml:"strategy,omitempty" json:"strategy,omitempty"`
-	Models   []string `yaml:"models" json:"models"`
+	ID     string       `yaml:"id" json:"id"`
+	Name   string       `yaml:"name" json:"name"`
+	Mode   string       `yaml:"mode" json:"mode"`
+	Models []groupModel `yaml:"models" json:"models"`
 }
 
-func (g modelGroup) effectiveStrategy() string {
-	switch strings.ToLower(strings.TrimSpace(g.Strategy)) {
-	case "", groupStrategyUpgrade, "order", "fallback", "priority":
-		return groupStrategyUpgrade
-	case groupStrategyStick, "sticky":
-		return groupStrategyStick
-	case groupStrategyQuota:
-		return groupStrategyQuota
-	case groupStrategyRace, "fastest":
-		return groupStrategyRace
-	case groupStrategyRandom, "round-robin":
-		return groupStrategyRandom
-	default:
-		return strings.ToLower(strings.TrimSpace(g.Strategy))
+type groupModel struct {
+	ID      string  `yaml:"id" json:"id"`
+	Quality float64 `yaml:"quality" json:"quality"`
+	Cost    float64 `yaml:"cost" json:"cost"`
+}
+
+func (g *modelGroup) UnmarshalJSON(raw []byte) error {
+	type plain modelGroup
+	var decoded plain
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return fmt.Errorf("group needs {id, name, mode, models: [{id, quality, cost}]}: %w", err)
 	}
+	*g = modelGroup(decoded)
+	return nil
+}
+
+func (g *modelGroup) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("group must be a mapping with id, name, mode, models")
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		switch node.Content[i].Value {
+		case "id", "name", "mode", "models":
+		default:
+			return fmt.Errorf("unknown group field %q; use mode: quality or cost and rated model entries", node.Content[i].Value)
+		}
+	}
+	type plain modelGroup
+	var decoded plain
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	*g = modelGroup(decoded)
+	return nil
+}
+
+func (m *groupModel) UnmarshalJSON(raw []byte) error {
+	var decoded struct {
+		ID string `json:"id"`
+		Quality *float64 `json:"quality"`
+		Cost *float64 `json:"cost"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	if decoded.Quality == nil || decoded.Cost == nil {
+		return fmt.Errorf("model %q needs explicit quality and cost ratings (0–100)", decoded.ID)
+	}
+	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost}
+	return nil
+}
+
+func (m *groupModel) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("model must be {id, quality, cost}; string model lists are no longer supported")
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		switch node.Content[i].Value {
+		case "id", "quality", "cost":
+		default:
+			return fmt.Errorf("unknown model field %q", node.Content[i].Value)
+		}
+	}
+	var decoded struct {
+		ID string `yaml:"id"`
+		Quality *float64 `yaml:"quality"`
+		Cost *float64 `yaml:"cost"`
+	}
+	if err := node.Decode(&decoded); err != nil {
+		return err
+	}
+	if decoded.Quality == nil || decoded.Cost == nil {
+		return fmt.Errorf("model %q needs explicit quality and cost ratings (0–100)", decoded.ID)
+	}
+	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost}
+	return nil
 }
 
 var activeConfig atomic.Value
@@ -211,16 +269,25 @@ func validateConfig(cfg pluginConfig) error {
 		if len(group.Models) == 0 {
 			return fmt.Errorf("group %s needs at least one model", group.ID)
 		}
-		switch group.effectiveStrategy() {
-		case groupStrategyUpgrade, groupStrategyStick, groupStrategyQuota, groupStrategyRace, groupStrategyRandom:
-		default:
-			return fmt.Errorf("group %s has unknown strategy %q (want upgrade, stick, quota, race, or random)", group.ID, group.Strategy)
+		if group.Mode != groupModeQuality && group.Mode != groupModeCost {
+			return fmt.Errorf("group %s needs mode quality or cost, got %q", group.ID, group.Mode)
+		}
+		models := make(map[string]bool, len(group.Models))
+		for _, model := range group.Models {
+			if model.ID == "" || models[model.ID] {
+				return fmt.Errorf("group %s has an empty or duplicate model id %q", group.ID, model.ID)
+			}
+			models[model.ID] = true
+			if math.IsNaN(model.Quality) || math.IsInf(model.Quality, 0) || model.Quality < 0 || model.Quality > 100 ||
+				math.IsNaN(model.Cost) || math.IsInf(model.Cost, 0) || model.Cost < 0 || model.Cost > 100 {
+				return fmt.Errorf("group %s model %s: quality and cost must be finite ratings in [0, 100]", group.ID, model.ID)
+			}
 		}
 	}
 	for _, group := range cfg.Groups {
 		for _, model := range group.Models {
-			if ids[model] {
-				return fmt.Errorf("group %s lists group %s as a target; groups cannot nest", group.ID, model)
+			if ids[model.ID] {
+				return fmt.Errorf("group %s lists group %s as a target; groups cannot nest", group.ID, model.ID)
 			}
 		}
 	}
@@ -248,9 +315,9 @@ func pluginRegistration() registration {
 			ConfigFields: []configField{
 				{Name: "management_key", Type: "string", Description: "Required: CPA management key used to read provider quota and save settings from the UI."},
 				{Name: "min_remaining", Type: "number", Default: 0.02, Description: "Quota fraction (0-1) every window of a credential must keep for it to be used."},
-				{Name: "idle_minutes", Type: "integer", Default: 5, Description: "Minutes without a prompt after which a credential or smart group session binding may re-rank (0 disables session stickiness)."},
+				{Name: "idle_minutes", Type: "integer", Default: 5, Description: "Minutes without a prompt after which a credential binding may re-rank (0 disables credential affinity). Group model bindings last until compaction, reset, or failure."},
 				{Name: "stream_prefetch_bytes", Type: "integer", Default: 128, Description: "Bytes of visible text a smart group stream buffers and checks for refusals before forwarding to the client."},
-				{Name: "groups", Type: "array", Description: "Smart Groups ({id, name, strategy, models}): virtual models that automatically route around safeguard refusals, errors, and low quota with 5m cache stickiness."},
+				{Name: "groups", Type: "array", Description: "Smart Groups ({id, name, mode: quality|cost, models: [{id, quality, cost}]}). Ratings are 0–100; higher quality is better, higher cost is more expensive. Weighted selection among models within 3 score points of the best; conversations stay pinned until compaction, reset, or failure."},
 				{Name: "features", Type: "object", Description: "Safeguard and client-wire adaptation toggles and custom notice_prefix."},
 			},
 		},

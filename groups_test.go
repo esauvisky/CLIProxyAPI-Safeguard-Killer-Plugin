@@ -3,15 +3,26 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
+
+func ratedGroupModels(ids ...string) []groupModel {
+	models := make([]groupModel, len(ids))
+	for i, id := range ids {
+		models[i] = groupModel{ID: id, Quality: 90 - 20*float64(i), Cost: 10}
+	}
+	return models
+}
 
 func groupConfig() pluginConfig {
 	cfg := balanceConfig()
-	cfg.Groups = []modelGroup{{ID: "uncensored-models", Name: "Uncensored", Models: []string{"glm-5.3-uncensored", "deepseek-v4.1-flash-uncensored", "abliterated"}}}
+	cfg.Groups = []modelGroup{{ID: "uncensored-models", Name: "Uncensored", Mode: groupModeQuality, Models: ratedGroupModels("glm-5.3-uncensored", "deepseek-v4.1-flash-uncensored", "abliterated")}}
 	return cfg
 }
 
@@ -66,6 +77,7 @@ func TestExecuteGroupFallsThroughFailuresAndLowQuota(t *testing.T) {
 		}
 		return json.Marshal(hostModelResponse{StatusCode: 200, Body: []byte(`{"served":"` + req.Model + `"}`)})
 	}, "only-cred")
+	setQuota(t, "only-cred", quotaWindow{Name: "daily", Remaining: 1, ResetAt: time.Now().Add(time.Hour)})
 	// The credential's deepseek-only window is drained, so deepseek is skipped without a call.
 	// skipReason runs on the real clock, so the windows are anchored to it.
 	now := time.Now()
@@ -85,7 +97,7 @@ func TestExecuteGroupFallsThroughFailuresAndLowQuota(t *testing.T) {
 	stateMu.Lock()
 	last := decisions[len(decisions)-1]
 	stateMu.Unlock()
-	if last.Kind != "group" || len(last.Attempts) != 3 || !strings.HasPrefix(last.Attempts[1].Result, "skipped") {
+	if last.Kind != "group" || len(last.Attempts) != 3 || last.Attempts[0].Model != "deepseek-v4.1-flash-uncensored" || !strings.HasPrefix(last.Attempts[0].Result, "skipped") {
 		t.Fatalf("decision = %+v", last)
 	}
 }
@@ -103,6 +115,7 @@ func TestInsufficientQuotaIsNotRequestedAgain(t *testing.T) {
 		}
 		return json.Marshal(hostModelResponse{StatusCode: 200, Body: []byte(`{"served":"abliterated"}`)})
 	}, "only-cred")
+	setQuota(t, "only-cred", quotaWindow{Name: "daily", Remaining: 1, ResetAt: time.Now().Add(time.Hour)})
 	t.Cleanup(func() {
 		quotaMu.Lock()
 		delete(quotaDenials, "glm-5.3-uncensored")
@@ -110,7 +123,7 @@ func TestInsufficientQuotaIsNotRequestedAgain(t *testing.T) {
 	})
 	body := []byte(`{"Model":"uncensored-models","SourceFormat":"openai","Format":"openai","Payload":"` + b64(`{"model":"uncensored-models","messages":[]}`) + `","host_callback_id":"cb"}`)
 	cfg := groupConfig()
-	cfg.Groups[0].Models = []string{"glm-5.3-uncensored", "abliterated"}
+	cfg.Groups[0].Models = ratedGroupModels("glm-5.3-uncensored", "abliterated")
 	if _, errExec := executeGroup(body, cfg); errExec != nil {
 		t.Fatalf("first executeGroup() error = %v", errExec)
 	}
@@ -133,9 +146,10 @@ func TestInsufficientQuotaIsNotRequestedAgain(t *testing.T) {
 }
 
 func TestExecuteGroupAllFailReturnsLastStatus(t *testing.T) {
-	fakeHost(t, nil, func(method string, payload any) (json.RawMessage, error) {
+	fakeHost(t, []string{"glm-5.3-uncensored", "deepseek-v4.1-flash-uncensored", "abliterated"}, func(method string, payload any) (json.RawMessage, error) {
 		return nil, &statusError{Code: "host_call_failed", Message: "rate limited", HTTPStatus: 429}
-	})
+	}, "only-cred")
+	setQuota(t, "only-cred", quotaWindow{Name: "daily", Remaining: 1, ResetAt: time.Now().Add(time.Hour)})
 	_, errExec := executeGroup([]byte(`{"Model":"uncensored-models","SourceFormat":"openai","Payload":"`+b64(`{"model":"x"}`)+`"}`), groupConfig())
 	var errStatus *statusError
 	if !errors.As(errExec, &errStatus) || errStatus.HTTPStatus != 429 || !strings.Contains(errStatus.Message, "abliterated: failed") {
@@ -146,7 +160,7 @@ func TestExecuteGroupAllFailReturnsLastStatus(t *testing.T) {
 func TestExecuteGroupStreamForwardsChunks(t *testing.T) {
 	emitted := make(chan string, 8)
 	reads := 0
-	fakeHost(t, nil, func(method string, payload any) (json.RawMessage, error) {
+	fakeHost(t, []string{"glm-5.3-uncensored", "deepseek-v4.1-flash-uncensored", "abliterated"}, func(method string, payload any) (json.RawMessage, error) {
 		switch method {
 		case methodHostModelStream:
 			if payload.(hostModelRequest).Model == "glm-5.3-uncensored" {
@@ -168,7 +182,8 @@ func TestExecuteGroupStreamForwardsChunks(t *testing.T) {
 		}
 		t.Errorf("unexpected host call %s", method)
 		return nil, nil
-	})
+	}, "only-cred")
+	setQuota(t, "only-cred", quotaWindow{Name: "daily", Remaining: 1, ResetAt: time.Now().Add(time.Hour)})
 	raw, errExec := executeGroupStream([]byte(`{"Model":"uncensored-models","SourceFormat":"claude","Stream":true,"Payload":"`+b64(`{"model":"x","stream":true}`)+`","stream_id":"dst"}`), groupConfig())
 	if errExec != nil {
 		t.Fatalf("executeGroupStream() error = %v", errExec)
@@ -202,7 +217,7 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 	var closedStreams []string
 	var openedModels []string
 	var lastNudgeBody string
-	fakeHost(t, nil, func(method string, payload any) (json.RawMessage, error) {
+	fakeHost(t, []string{"glm-5.3-uncensored", "deepseek-v4.1-flash-uncensored", "abliterated"}, func(method string, payload any) (json.RawMessage, error) {
 		switch method {
 		case methodHostModelStream:
 			req := payload.(hostModelRequest)
@@ -242,7 +257,8 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 		}
 		t.Errorf("unexpected host call %s", method)
 		return nil, nil
-	})
+	}, "only-cred")
+	setQuota(t, "only-cred", quotaWindow{Name: "daily", Remaining: 1, ResetAt: time.Now().Add(time.Hour)})
 
 	// Session ID is inside payload metadata.user_id (not top-level req.Metadata), matching production.
 	reqJSON := `{"Model":"uncensored-models","SourceFormat":"claude","Format":"claude","Stream":true,"Payload":"` +
@@ -301,7 +317,6 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 	stateMu.Lock()
 	for _, b := range groupStates {
 		b.LastSeen = time.Now().Add(-20 * time.Minute)
-		b.IdleExpiresAt = b.LastSeen.Add(groupCacheTTL)
 	}
 	stateMu.Unlock()
 	openedModels = nil
@@ -395,7 +410,7 @@ func TestGroupSessionKeySeparatesConversations(t *testing.T) {
 func TestChildAndHelperRequestsPreserveParentRefusal(t *testing.T) {
 	resetHostState(t)
 	cfg := defaultPluginConfig()
-	group := modelGroup{ID: "smart", Strategy: groupStrategyUpgrade, Models: []string{"primary", "fallback"}}
+	group := modelGroup{ID: "smart", Mode: groupModeQuality, Models: ratedGroupModels("primary", "fallback")}
 	now := time.Now()
 	messages := make([]map[string]string, 20)
 	for i := range messages {
@@ -410,7 +425,7 @@ func TestChildAndHelperRequestsPreserveParentRefusal(t *testing.T) {
 	}
 	parent := executorRequest{Payload: payload, Metadata: map[string]any{metadataCanonicalSessionID: "shared-host"}}
 	parentKey := conversationKey(parent)
-	recordConversationFailure(parentKey, group.ID, "primary", "refusal (cyber)", len(payload), now)
+	recordConversationFailure(parentKey, group.ID, "primary", "refusal (cyber)", payload, now)
 	recordServed(cfg, parentKey, group.ID, "fallback", "", payload, now)
 	if tip := compactionTipForSession(cfg, parentKey, group, nil, "fallback", len(payload)); tip == "" {
 		t.Fatal("missing initial tip")
@@ -426,10 +441,11 @@ func TestChildAndHelperRequestsPreserveParentRefusal(t *testing.T) {
 			t.Fatal("child/helper shares parent routing key")
 		}
 		planConversation(cfg, childKey, group, child.Payload, now)
-		recordConversationFailure(childKey, group.ID, "primary", "refusal (cyber)", len(child.Payload), now)
+		recordConversationFailure(childKey, group.ID, "primary", "refusal (cyber)", child.Payload, now)
 		recordServed(cfg, childKey, group.ID, "fallback", "", child.Payload, now)
 		plan := planConversation(cfg, parentKey, group, payload, now)
-		if plan.Compacted || len(plan.Parallel) != 0 || strings.Join(plan.Sequential, ",") != "fallback" {
+		model, ok := plan.nextModel(0)
+		if plan.Err != nil || plan.Compacted || !ok || model != "fallback" {
 			t.Fatalf("child/helper changed parent plan: %+v", plan)
 		}
 		if tip := compactionTipForSession(cfg, parentKey, group, nil, "fallback", len(payload)); tip != "" {
@@ -439,23 +455,37 @@ func TestChildAndHelperRequestsPreserveParentRefusal(t *testing.T) {
 }
 
 func TestGroupDoesNotRetrySkippedModelsWhenExhausted(t *testing.T) {
-	for _, strategy := range []string{groupStrategyUpgrade, groupStrategyStick, groupStrategyRace, groupStrategyQuota, groupStrategyRandom} {
-		t.Run(strategy, func(t *testing.T) {
+	for _, mode := range []string{groupModeQuality, groupModeCost} {
+		t.Run(mode, func(t *testing.T) {
 			resetHostState(t)
 			cfg := defaultPluginConfig()
-			group := modelGroup{ID: "smart", Strategy: strategy, Models: []string{"primary", "fallback"}}
+			group := modelGroup{ID: "smart", Mode: mode, Models: ratedGroupModels("primary", "fallback")}
 			now := time.Now()
 			payload := []byte(`{"messages":[{"role":"user","content":"work"}]}`)
-			recordConversationFailure("session", group.ID, "primary", "refusal (cyber)", len(payload), now)
+			recordConversationFailure("session", group.ID, "primary", "refusal (cyber)", payload, now)
 			recordServed(cfg, "session", group.ID, "fallback", "", payload, now)
 			plan := planConversation(cfg, "session", group, payload, now)
-			if strings.Join(plan.Sequential, ",") != "fallback" || len(plan.Parallel) != 0 {
+			if plan.Err != nil || !plan.Sticky || len(plan.Skipped) != 1 {
 				t.Fatalf("refused model was scheduled: %+v", plan)
 			}
-			recordConversationFailure("session", group.ID, "fallback", "refusal (cyber)", len(payload), now)
+			if model, ok := plan.nextModel(0.99); !ok || model != "fallback" {
+				t.Fatalf("nextModel = %q, %v, want fallback", model, ok)
+			}
+			if model, ok := plan.nextModel(0); ok || model != "" {
+				t.Fatalf("exhausted draw = %q, %v", model, ok)
+			}
+			recordConversationFailure("session", group.ID, "fallback", "refusal (cyber)", payload, now)
 			plan = planConversation(cfg, "session", group, payload, now)
-			if len(plan.Sequential) != 0 || len(plan.Parallel) != 0 || len(plan.Skipped) != 2 {
+			if plan.Err != nil || plan.Sticky || len(plan.Skipped) != 2 {
 				t.Fatalf("exhausted plan retried skipped models: %+v", plan)
+			}
+			for _, score := range plan.Scores {
+				if score.Excluded == "" || score.Probability != 0 {
+					t.Fatalf("exhausted score = %+v", score)
+				}
+			}
+			if model, ok := plan.nextModel(0); ok || model != "" {
+				t.Fatalf("exhausted plan selected %q, %v", model, ok)
 			}
 		})
 	}
@@ -474,8 +504,8 @@ func TestProgrammaticCompactionResetAndCapabilitySkips(t *testing.T) {
 	group := modelGroup{
 		ID:       "smart",
 		Name:     "Smart",
-		Strategy: groupStrategyUpgrade,
-		Models:   []string{"m1", "m2", "m3", "m4"},
+		Mode:     groupModeQuality,
+		Models:   ratedGroupModels("m1", "m2", "m3", "m4"),
 	}
 	cfg.Groups = []modelGroup{group}
 	now := time.Now()
@@ -489,13 +519,13 @@ func TestProgrammaticCompactionResetAndCapabilitySkips(t *testing.T) {
 		return []byte(`{"messages":[` + strings.Join(parts, ",") + `]}`)
 	}
 	bigPayload := history(8, strings.Repeat("a", 8*1024))
-	recordConversationFailure(sess, group.ID, "m1", "refusal (cyber)", len(bigPayload), now)
-	recordConversationFailure(sess, group.ID, "m2", `{"error":{"message":"The capability 'tools' is not supported by this gateway profile.","code":"unsupported_capability"}}`, len(bigPayload), now)
-	recordConversationFailure(sess, group.ID, "m3", `{"error":{"message":"Message 1 carries an image, and the selected model route accepts text only.","code":"unsupported_capability"}}`, len(bigPayload), now)
+	recordConversationFailure(sess, group.ID, "m1", "refusal (cyber)", bigPayload, now)
+	recordConversationFailure(sess, group.ID, "m2", `{"error":{"message":"The capability 'tools' is not supported by this gateway profile.","code":"unsupported_capability"}}`, bigPayload, now)
+	recordConversationFailure(sess, group.ID, "m3", `{"error":{"message":"Message 1 carries an image, and the selected model route accepts text only.","code":"unsupported_capability"}}`, bigPayload, now)
 	recordServed(cfg, sess, group.ID, "m4", "", bigPayload, now)
 
 	plan1 := planConversation(cfg, sess, group, bigPayload, now.Add(10*time.Minute))
-	if len(plan1.Parallel) != 0 || len(plan1.Sequential) == 0 || plan1.Sequential[0] != "m4" {
+	if plan1.Err != nil || !plan1.Sticky || len(plan1.Skipped) != 3 || plan1.Scores[3].Probability != 1 {
 		t.Fatalf("plan1 = %+v, want sequential starting with m4", plan1)
 	}
 
@@ -504,21 +534,21 @@ func TestProgrammaticCompactionResetAndCapabilitySkips(t *testing.T) {
 	stateMu.Unlock()
 	grownPayload := history(8, strings.Repeat("a", 20*1024))
 	plan2 := planConversation(cfg, sess, group, grownPayload, now.Add(15*time.Minute))
-	if len(plan2.Parallel) != 0 || plan2.Sequential[0] != "m4" || plan2.Compacted {
+	if plan2.Err != nil || !plan2.Sticky || plan2.Scores[3].Probability != 1 || plan2.Compacted {
 		t.Fatalf("plan2 after growth = %+v, want no probe and no compaction", plan2)
 	}
 
 	recordServed(cfg, sess, group.ID, "m4", "m4", grownPayload, now.Add(15*time.Minute))
 	editedPayload := history(8, "cleared tool result")
 	plan3 := planConversation(cfg, sess, group, editedPayload, now.Add(20*time.Minute))
-	if plan3.Compacted || len(plan3.Parallel) != 0 || plan3.Sequential[0] != "m4" {
+	if plan3.Err != nil || plan3.Compacted || !plan3.Sticky || plan3.Scores[3].Probability != 1 {
 		t.Fatalf("plan3 context edit = %+v, want still pinned to m4", plan3)
 	}
 
 	compactedPayload := []byte(`{"messages":[{"text":"compacted summary"}]}`)
 	plan4 := planConversation(cfg, sess, group, compactedPayload, now.Add(25*time.Minute))
-	if !plan4.Compacted || len(plan4.Sequential) == 0 || plan4.Sequential[0] != "m1" {
-		t.Fatalf("plan4 after compaction = %+v, want Compacted=true and Sequential[0]=m1", plan4)
+	if plan4.Err != nil || !plan4.Compacted || plan4.Sticky || plan4.Scores[0].Probability != 1 || len(plan4.Skipped) != 0 {
+		t.Fatalf("plan4 after compaction = %+v, want compaction and m1 selected", plan4)
 	}
 }
 
@@ -580,53 +610,16 @@ func TestAutoModeClassifierShortCircuitAndSafeguardSanitization(t *testing.T) {
 	}
 }
 
-func TestGroupRoutingStrategiesRandomAndQuotaSticky(t *testing.T) {
-	fakeHost(t, []string{"m1", "m2", "m3"}, noOther(t), "c1")
-	setQuota(t, "c1", weekly(0.5, 24*time.Hour))
-	cfg := balanceConfig()
-	group := modelGroup{
-		ID:       "spread",
-		Name:     "Spread",
-		Strategy: groupStrategyQuota,
-		Models:   []string{"m1", "m2", "m3"},
-	}
-	now := time.Now()
-	order1, skipped1, prev1 := conversationCandidateOrder(cfg, "sess-q", group, now)
-	if len(order1) != 3 || len(skipped1) != 0 || prev1 != "" {
-		t.Fatalf("initial quota order = %v skipped=%v prev=%q", order1, skipped1, prev1)
-	}
-	chosen := order1[0]
-	recordServed(cfg, "sess-q", group.ID, chosen, prev1, nil, now)
-
-	// Within 5 minutes, the chosen model is always placed first to preserve prompt cache.
-	for i := 0; i < 10; i++ {
-		order2, _, prev2 := conversationCandidateOrder(cfg, "sess-q", group, now.Add(2*time.Minute))
-		if order2[0] != chosen || prev2 != chosen {
-			t.Fatalf("sticky quota order[0] = %q (prev %q), want %q", order2[0], prev2, chosen)
-		}
-	}
-
-	// With idle_minutes = 0, session stickiness is disabled while previous model tracking remains.
-	cfgZero := cfg
-	cfgZero.IdleMinutes = 0
-	groupOrder := modelGroup{ID: "ord", Name: "Ord", Strategy: groupStrategyOrder, Models: []string{"m1", "m2", "m3"}}
-	recordServed(cfgZero, "sess-zero", groupOrder.ID, "m2", "", nil, now)
-	orderZero, skippedZero, prevZero := conversationCandidateOrder(cfgZero, "sess-zero", groupOrder, now.Add(time.Second))
-	if orderZero[0] != "m1" || len(skippedZero) != 0 || prevZero != "m2" {
-		t.Fatalf("idle_minutes=0 order = %v skipped=%v prev=%q", orderZero, skippedZero, prevZero)
-	}
-}
-
 func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 	cfg := defaultPluginConfig()
-	group := modelGroup{ID: "best", Name: "General Purpose", Models: []string{"claude-opus-5-5", "gemini-4-argon-high", "kimi-k3.1-pro"}}
+	group := modelGroup{ID: "best", Name: "General Purpose", Mode: groupModeQuality, Models: ratedGroupModels("claude-opus-5-5", "gemini-4-argon-high", "kimi-k3.1-pro")}
 	attempts := []groupAttempt{
 		{Model: "claude-opus-5-5", Result: "failed: refusal (cyber)", Duration: 16 * time.Second},
 		{Model: "gemini-4-argon-high", Result: "failed: refusal (text)", Duration: 4 * time.Second},
 		{Model: "kimi-k3.1-pro", Result: "served", Duration: 2 * time.Second},
 	}
 
-	gotConcise := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5")
+	gotConcise := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5", nil)
 	wantConcise := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal: cyber) → `gemini-4-argon-high` (4s, refusal: regex) → `kimi-k3.1-pro`"
 	if gotConcise != wantConcise {
 		t.Fatalf("concise notice = %q, want %q", gotConcise, wantConcise)
@@ -635,7 +628,7 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 	gotSameModelQuota := buildGroupNotice(cfg, group, []groupAttempt{
 		{Model: "gpt-6.1-sol", Result: "failed: insufficient_quota", Duration: 0},
 		{Model: "grok-4.7", Result: "served", Duration: time.Second},
-	}, "grok-4.7", "grok-4.7")
+	}, "grok-4.7", "grok-4.7", nil)
 	if gotSameModelQuota != "" {
 		t.Fatalf("unchanged model with only a quota failure printed %q", gotSameModelQuota)
 	}
@@ -643,12 +636,12 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 		{Model: "claude-opus-5-5", Result: "failed: refusal (cyber)", Duration: 6 * time.Second},
 		{Model: "gpt-6.1-sol", Result: "failed: insufficient_quota", Duration: 0},
 		{Model: "grok-4.7", Result: "served", Duration: time.Second},
-	}, "grok-4.7", "grok-4.7")
+	}, "grok-4.7", "grok-4.7", nil)
 	if gotSameModelRefusal == "" {
 		t.Fatal("unchanged model with a refusal was silenced")
 	}
 
-	gotSwitchConcise := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high")
+	gotSwitchConcise := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high", nil)
 	wantSwitchConcise := "⚡ [Safeguard Killer] `gemini-4-argon-high` → `claude-opus-5-5`"
 	if gotSwitchConcise != wantSwitchConcise {
 		t.Fatalf("concise switch notice = %q, want %q", gotSwitchConcise, wantSwitchConcise)
@@ -661,13 +654,13 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 	}
 
 	cfg.Features.VerboseNotices = true
-	gotVerbose := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5")
+	gotVerbose := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5", nil)
 	wantVerbose := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal (cyber)) → `gemini-4-argon-high` (4s, refusal (text)) → switched to `kimi-k3.1-pro`"
 	if gotVerbose != wantVerbose {
 		t.Fatalf("verbose notice = %q, want %q", gotVerbose, wantVerbose)
 	}
 
-	gotSwitchVerbose := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high")
+	gotSwitchVerbose := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high", nil)
 	wantSwitchVerbose := "⚡ [Safeguard Killer] switched from `gemini-4-argon-high` → `claude-opus-5-5`"
 	if gotSwitchVerbose != wantSwitchVerbose {
 		t.Fatalf("verbose switch notice = %q, want %q", gotSwitchVerbose, wantSwitchVerbose)
@@ -677,4 +670,380 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 func b64(s string) string {
 	raw, _ := json.Marshal([]byte(s))
 	return strings.Trim(string(raw), `"`)
+}
+
+func TestRepeatRefusalNoticeSuppressed(t *testing.T) {
+	resetHostState(t)
+	now := time.Now()
+	sess := "claude:dedup"
+	groupID := "g"
+	payload := []byte(`{"messages":[{"role":"user","content":"same"}]}`)
+	recordConversationFailure(sess, groupID, "m1", "refusal (cyber)", payload, now)
+	if suppressedRefusals(sess, groupID, []string{"m1"})["m1"] {
+		t.Fatal("first refusal must notify")
+	}
+	recordConversationFailure(sess, groupID, "m1", "refusal (cyber)", payload, now)
+	if !suppressedRefusals(sess, groupID, []string{"m1"})["m1"] {
+		t.Fatal("identical repeat refusal must be suppressed")
+	}
+	if suppressedRefusals(sess, groupID, []string{"m1"})["m1"] {
+		t.Fatal("suppression must be consumed once")
+	}
+	changed := []byte(`{"messages":[{"role":"user","content":"changed"}]}`)
+	recordConversationFailure(sess, groupID, "m1", "refusal (cyber)", changed, now)
+	if suppressedRefusals(sess, groupID, []string{"m1"})["m1"] {
+		t.Fatal("a changed payload must notify again")
+	}
+}
+
+func TestDrainAndTrailEndpoints(t *testing.T) {
+	resetHostState(t)
+	cfg := defaultPluginConfig()
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: ratedGroupModels("a", "b")}
+	now := time.Now()
+	payload := []byte(`{"messages":[{"role":"user","content":"x"}]}`)
+	recordConversationFailure("claude:k", group.ID, "a", "refusal (cyber)", payload, now)
+	recordServed(cfg, "claude:k", group.ID, "b", "", payload, now)
+
+	trail := buildConversationTrail("claude:k")
+	if len(trail) == 0 {
+		t.Fatal("trail is empty")
+	}
+	for _, e := range trail {
+		if e.Version != pluginVersion {
+			t.Fatalf("trail entry version = %q, want %q", e.Version, pluginVersion)
+		}
+	}
+	stateMu.Lock()
+	_, exists := groupStates["claude:k\x00g"]
+	stateMu.Unlock()
+	if !exists {
+		t.Fatal("state missing before drain")
+	}
+	drainConversationState("claude:k", "")
+	stateMu.Lock()
+	_, exists = groupStates["claude:k\x00g"]
+	stateMu.Unlock()
+	if exists {
+		t.Fatal("drain left conversation state behind")
+	}
+}
+
+func TestRoutingMetricsAggregatesRefusals(t *testing.T) {
+	resetHostState(t)
+	now := time.Now()
+	payload := []byte(`{"messages":[{"role":"user","content":"x"}]}`)
+	recordConversationFailure("claude:met", "g", "m1", "refusal (cyber)", payload, now)
+	recordConversationFailure("claude:met", "g", "m2", "refusal (regex)", payload, now)
+	m := computeRoutingMetrics()
+	if m.RefusalsByModelAndCategory["m1 (refusal: cyber)"] != 1 || m.RefusalsByModelAndCategory["m2 (refusal: regex)"] != 1 {
+		t.Fatalf("metrics = %+v", m.RefusalsByModelAndCategory)
+	}
+}
+
+func TestGroupScoreModes(t *testing.T) {
+	models := []groupModel{{ID: "premium", Quality: 90, Cost: 80}, {ID: "economy", Quality: 70, Cost: 10}, {ID: "zero", Quality: 0, Cost: 0}}
+	for _, tc := range []struct {
+		mode string
+		want []float64
+	}{
+		{groupModeQuality, []float64{56, 54, 0}},
+		{groupModeCost, []float64{-46, 6, 0}},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			scores := scoreModels(modelGroup{ID: "g", Mode: tc.mode, Models: models})
+			if len(scores) != len(models) {
+				t.Fatalf("scores = %+v", scores)
+			}
+			for i, score := range scores {
+				if score.Model != models[i].ID || score.Quality != models[i].Quality || score.Cost != models[i].Cost || math.Abs(score.Score-tc.want[i]) > 1e-12 || score.Excluded != "" || score.Probability != 0 {
+					t.Fatalf("score[%d] = %+v, want score %v", i, score, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestGroupModesSelectDifferentPreferredModels(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		want string
+	}{
+		{groupModeQuality, "premium"},
+		{groupModeCost, "economy"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			resetHostState(t)
+			group := modelGroup{ID: "g", Mode: tc.mode, Models: []groupModel{{ID: "premium", Quality: 100, Cost: 60}, {ID: "economy", Quality: 60, Cost: 10}}}
+			plan := planConversation(defaultPluginConfig(), "session", group, []byte(`{"messages":[]}`), time.Now())
+			if plan.Err != nil || plan.Sticky || len(plan.Skipped) != 0 {
+				t.Fatalf("new conversation plan = %+v", plan)
+			}
+			if model, ok := plan.nextModel(math.Nextafter(1, 0)); !ok || model != tc.want {
+				t.Fatalf("%s selected %q, %v, want %q", tc.mode, model, ok, tc.want)
+			}
+		})
+	}
+}
+
+func TestGroupSelectionShortlistProbabilities(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		scores []modelScore
+		want   []float64
+	}{
+		{"equal", []modelScore{{Model: "a", Score: 10}, {Model: "b", Score: 10}, {Model: "c", Score: 10}}, []float64{1.0 / 3, 1.0 / 3, 1.0 / 3}},
+		{"near", []modelScore{{Model: "a", Score: 10}, {Model: "b", Score: 9}}, []float64{1 / (1 + math.Exp(-1)), math.Exp(-1) / (1 + math.Exp(-1))}},
+		{"threshold inclusive", []modelScore{{Model: "a", Score: -10}, {Model: "b", Score: -13}, {Model: "c", Score: -13.0001}}, []float64{1 / (1 + math.Exp(-3)), math.Exp(-3) / (1 + math.Exp(-3)), 0}},
+		{"excluded best", []modelScore{{Model: "a", Score: 100, Excluded: "refusal"}, {Model: "b", Score: 10}, {Model: "c", Score: 6}}, []float64{0, 1, 0}},
+		{"all excluded", []modelScore{{Model: "a", Score: 10, Excluded: "refusal"}, {Model: "b", Score: 10, Excluded: "no tools"}}, []float64{0, 0}},
+		{"empty", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := range tc.scores {
+				tc.scores[i].Probability = 0.75
+			}
+			setSelectionProbabilities(tc.scores, "", false)
+			for i, score := range tc.scores {
+				if math.Abs(score.Probability-tc.want[i]) > 1e-12 {
+					t.Fatalf("score[%d] probability = %v, want %v", i, score.Probability, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestGroupSelectionBoundaryDraws(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		draw float64
+		want string
+	}{
+		{"zero", 0, "a"},
+		{"below boundary", math.Nextafter(0.5, 0), "a"},
+		{"boundary", 0.5, "b"},
+		{"upper bound", math.Nextafter(1, 0), "b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := groupRoutingPlan{Scores: []modelScore{{Model: "excluded", Score: 100, Excluded: "refusal"}, {Model: "a", Score: 10}, {Model: "outside", Score: 0}, {Model: "b", Score: 10}}}
+			setSelectionProbabilities(plan.Scores, "", false)
+			if model, ok := plan.nextModel(tc.draw); !ok || model != tc.want {
+				t.Fatalf("nextModel(%v) = %q, %v, want %q", tc.draw, model, ok, tc.want)
+			}
+			for _, score := range plan.Scores {
+				if score.Model == tc.want && (score.Excluded != "attempted" || score.Probability != 0) {
+					t.Fatalf("selected score = %+v", score)
+				}
+			}
+		})
+	}
+}
+
+func TestGroupFallbackRecalculatesShortlist(t *testing.T) {
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: []groupModel{{ID: "a", Quality: 90}, {ID: "b", Quality: 87.5}, {ID: "c", Quality: 85}, {ID: "d", Quality: 70}}}
+	plan := groupRoutingPlan{Scores: scoreModels(group)}
+	setSelectionProbabilities(plan.Scores, "", false)
+	if plan.Scores[2].Probability != 0 || plan.Scores[3].Probability != 0 {
+		t.Fatalf("initial shortlist = %+v", plan.Scores)
+	}
+	if model, ok := plan.nextModel(0); !ok || model != "a" {
+		t.Fatalf("first draw = %q, %v", model, ok)
+	}
+	wantB := 1 / (1 + math.Exp(-2))
+	if math.Abs(plan.Scores[1].Probability-wantB) > 1e-12 || math.Abs(plan.Scores[2].Probability-(1-wantB)) > 1e-12 || plan.Scores[3].Probability != 0 {
+		t.Fatalf("fallback shortlist = %+v", plan.Scores)
+	}
+	for _, want := range []string{"b", "c", "d"} {
+		if model, ok := plan.nextModel(0); !ok || model != want {
+			t.Fatalf("fallback draw = %q, %v, want %q", model, ok, want)
+		}
+	}
+	if model, ok := plan.nextModel(0); ok || model != "" {
+		t.Fatalf("exhausted draw = %q, %v", model, ok)
+	}
+}
+
+func TestGroupIdleStickinessAndReselection(t *testing.T) {
+	for _, mode := range []string{groupModeQuality, groupModeCost} {
+		for _, idleMinutes := range []int{0, 5} {
+			t.Run(mode+"/idle="+(time.Duration(idleMinutes)*time.Minute).String(), func(t *testing.T) {
+				resetHostState(t)
+				cfg := defaultPluginConfig()
+				cfg.IdleMinutes = idleMinutes
+				group := modelGroup{ID: "g", Mode: mode, Models: ratedGroupModels("best", "middle", "pinned")}
+				now := time.Now()
+				payload := []byte(`{"messages":[{"role":"user","content":"work"}]}`)
+				recordServed(cfg, "session", group.ID, "pinned", "", payload, now)
+				plan := planConversation(cfg, "session", group, payload, now.Add(24*time.Hour))
+				if plan.Err != nil || !plan.Sticky || plan.PrevModel != "pinned" || plan.Scores[2].Probability != 1 {
+					t.Fatalf("idle plan = %+v", plan)
+				}
+				if model, ok := plan.nextModel(0); !ok || model != "pinned" {
+					t.Fatalf("sticky draw = %q, %v", model, ok)
+				}
+				if plan.Sticky || plan.Scores[0].Probability != 1 {
+					t.Fatalf("sticky fallback not recalculated: %+v", plan)
+				}
+				if model, ok := plan.nextModel(0); !ok || model != "best" {
+					t.Fatalf("sticky fallback = %q, %v", model, ok)
+				}
+
+				removed := group
+				removed.Models = group.Models[:2]
+				plan = planConversation(cfg, "session", removed, payload, now.Add(24*time.Hour))
+				if plan.Err != nil || plan.Sticky || plan.PrevModel != "pinned" || plan.Scores[0].Probability != 1 {
+					t.Fatalf("removed current model plan = %+v", plan)
+				}
+
+				recordConversationFailure("session", group.ID, "pinned", "refusal (cyber)", payload, now)
+				plan = planConversation(cfg, "session", group, payload, now.Add(24*time.Hour))
+				if plan.Err != nil || plan.Sticky || len(plan.Skipped) != 1 || plan.Scores[2].Excluded == "" || plan.Scores[0].Probability != 1 {
+					t.Fatalf("failed current model plan = %+v", plan)
+				}
+
+				drainConversationState("session", group.ID)
+				plan = planConversation(cfg, "session", group, payload, now.Add(24*time.Hour))
+				if plan.Err != nil || plan.Sticky || plan.PrevModel != "" || len(plan.Skipped) != 0 || plan.Scores[0].Probability != 1 {
+					t.Fatalf("drained plan = %+v", plan)
+				}
+			})
+		}
+	}
+}
+
+func TestGroupPinnedModelQuotaTriggersReselection(t *testing.T) {
+	resetHostState(t)
+	cfg := defaultPluginConfig()
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: ratedGroupModels("best", "pinned")}
+	now := time.Now()
+	payload := []byte(`{"messages":[{"role":"user","content":"work"}]}`)
+	recordServed(cfg, "session", group.ID, "pinned", "", payload, now)
+	quotaMu.Lock()
+	quotaDenials["pinned"] = now.Add(time.Hour)
+	quotaMu.Unlock()
+	t.Cleanup(func() {
+		quotaMu.Lock()
+		delete(quotaDenials, "pinned")
+		quotaMu.Unlock()
+	})
+	plan := planConversation(cfg, "session", group, payload, now)
+	if plan.Err != nil || plan.Sticky || len(plan.Skipped) != 1 || plan.Scores[1].Excluded != "insufficient quota" || plan.Scores[0].Probability != 1 {
+		t.Fatalf("quota plan = %+v", plan)
+	}
+}
+
+func TestGroupPlanPropagatesHostFailure(t *testing.T) {
+	resetHostState(t)
+	want := errors.New("host metadata unavailable")
+	hostCall = func(string, any) (json.RawMessage, error) { return nil, want }
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: ratedGroupModels("m")}
+	plan := planConversation(balanceConfig(), "session", group, []byte(`{"messages":[]}`), time.Now())
+	if !errors.Is(plan.Err, want) {
+		t.Fatalf("plan.Err = %v, want %v", plan.Err, want)
+	}
+	if model, ok := plan.nextModel(0); ok || model != "" {
+		t.Fatalf("failed plan selected %q, %v", model, ok)
+	}
+}
+
+func TestGroupConfigValidation(t *testing.T) {
+	for _, mode := range []string{groupModeQuality, groupModeCost} {
+		cfg := defaultPluginConfig()
+		cfg.Groups = []modelGroup{{ID: "g", Name: "Group", Mode: mode, Models: []groupModel{{ID: "zero", Quality: 0, Cost: 0}, {ID: "max", Quality: 100, Cost: 100}}}}
+		if err := validateConfig(cfg); err != nil {
+			t.Fatalf("valid %s config rejected: %v", mode, err)
+		}
+	}
+	for _, mode := range []string{"", "order", "race", "invalid"} {
+		cfg := defaultPluginConfig()
+		cfg.Groups = []modelGroup{{ID: "g", Name: "Group", Mode: mode, Models: ratedGroupModels("m")}}
+		if err := validateConfig(cfg); err == nil {
+			t.Fatalf("invalid mode %q accepted", mode)
+		}
+	}
+	cfg := defaultPluginConfig()
+	cfg.Groups = []modelGroup{{ID: "g", Name: "Group", Mode: groupModeQuality, Models: ratedGroupModels("m", "m")}}
+	if err := validateConfig(cfg); err == nil {
+		t.Fatal("duplicate model IDs accepted")
+	}
+	for _, value := range []float64{-0.01, 100.01, math.NaN(), math.Inf(1), math.Inf(-1)} {
+		for _, field := range []string{"quality", "cost"} {
+			model := groupModel{ID: "m", Quality: 50, Cost: 50}
+			if field == "quality" {
+				model.Quality = value
+			} else {
+				model.Cost = value
+			}
+			cfg.Groups[0].Models = []groupModel{model}
+			if err := validateConfig(cfg); err == nil {
+				t.Fatalf("%s rating %v accepted", field, value)
+			}
+		}
+	}
+}
+
+func TestGroupConfigDecoding(t *testing.T) {
+	for _, format := range []string{"json", "yaml"} {
+		t.Run(format, func(t *testing.T) {
+			decode := func(raw string, group *modelGroup) error {
+				if format == "json" {
+					return json.Unmarshal([]byte(raw), group)
+				}
+				return yaml.Unmarshal([]byte(raw), group)
+			}
+			for _, mode := range []string{groupModeQuality, groupModeCost} {
+				var group modelGroup
+				raw := `{"id":"g","name":"Group","mode":"` + mode + `","models":[{"id":"m","quality":0,"cost":0}]}`
+				if err := decode(raw, &group); err != nil {
+					t.Fatalf("decode zero ratings: %v", err)
+				}
+				cfg := defaultPluginConfig()
+				cfg.Groups = []modelGroup{group}
+				if err := validateConfig(cfg); err != nil || group.Mode != mode || len(group.Models) != 1 || group.Models[0] != (groupModel{ID: "m"}) {
+					t.Fatalf("decoded group = %+v, validation = %v", group, err)
+				}
+			}
+			for _, oldField := range []string{`"strategy":"upgrade"`, `"cheap_models":["m"]`, `"cheap_first":true`, `"cheap_probe":true`, `"tier_up_after":2`} {
+				var group modelGroup
+				raw := `{"id":"g","name":"Group","mode":"quality",` + oldField + `,"models":[{"id":"m","quality":50,"cost":10}]}`
+				if err := decode(raw, &group); err == nil {
+					t.Fatalf("obsolete group field accepted: %s", oldField)
+				}
+			}
+			for _, raw := range []string{
+				`{"id":"g","name":"Group","mode":"quality","models":["m"]}`,
+				`{"id":"g","name":"Group","mode":"quality","models":[{"id":"m","cost":10}]}`,
+				`{"id":"g","name":"Group","mode":"quality","models":[{"id":"m","quality":50}]}`,
+				`{"id":"g","name":"Group","mode":"quality","models":[{"id":"m","quality":null,"cost":10}]}`,
+			} {
+				var group modelGroup
+				if err := decode(raw, &group); err == nil {
+					t.Fatalf("obsolete or incomplete group accepted: %s", raw)
+				}
+			}
+		})
+	}
+}
+
+func TestWeightedCredentialRanking(t *testing.T) {
+	resetHostState(t)
+	now := time.Now()
+	authWeightMu.Lock()
+	authWeights = map[string]float64{"a": 1, "b": 3}
+	authWeightsAt = now
+	authWeightMu.Unlock()
+	quotaMu.Lock()
+	quotaSnapshots["a"] = credentialQuota{AuthID: "a", Windows: []quotaWindow{{Name: "monthly", Remaining: 0.5, ResetAt: now.Add(10 * time.Hour)}}}
+	quotaSnapshots["b"] = credentialQuota{AuthID: "b", Windows: []quotaWindow{{Name: "monthly", Remaining: 0.5, ResetAt: now.Add(10 * time.Hour)}}}
+	quotaMu.Unlock()
+	cfg := defaultPluginConfig()
+	stateMu.Lock()
+	ranking := rankCredentials(cfg, []hostAuth{{ID: "a"}, {ID: "b"}}, "m", now)
+	stateMu.Unlock()
+	if ranking[0].AuthID != "b" {
+		t.Fatalf("weighted ranking put %q first, want b", ranking[0].AuthID)
+	}
+	if ranking[0].Weight != 3 || ranking[0].Score <= ranking[1].Score {
+		t.Fatalf("weights/scores wrong: %+v", ranking)
+	}
 }

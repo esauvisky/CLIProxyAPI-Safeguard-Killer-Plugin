@@ -11,6 +11,8 @@ import (
 const (
 	uiResourcePath     = "/ui"
 	mgmtStateRoutePath = "/plugins/safeguard-killer/state"
+	mgmtTrailRoutePath = "/plugins/safeguard-killer/trail"
+	mgmtDrainRoutePath = "/plugins/safeguard-killer/drain"
 )
 
 type managementRegistration struct {
@@ -53,12 +55,22 @@ func managementRegistrationPayload() managementRegistration {
 				Path:        mgmtStateRoutePath,
 				Description: "Returns config, safeguard adaptation toggles, smart groups, quota windows, session bindings, and recent routing decisions of Safeguard Killer.",
 			},
+			{
+				Method:      http.MethodGet,
+				Path:        mgmtTrailRoutePath,
+				Description: "Debug: full decision trail for one conversation key (?key=<conversation key>).",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        mgmtDrainRoutePath,
+				Description: "Drain one conversation's routing state ({key, group_id}) without restarting.",
+			},
 		},
 		Resources: []managementResource{
 			{
 				Path:        uiResourcePath,
 				Menu:        "Safeguard Killer",
-				Description: "Neutralize model safeguards and auto-mode classifiers across Claude Code, Claude, OpenAI/Codex, and Gemini models, and route refusal-evasion Smart Groups with 5m cache stickiness. Set management_key in the plugin config. Made to work alongside Reorder/Rename Models (https://github.com/esauvisky/CLIProxyAPI-Model-List-Tweaker-Plugin).",
+				Description: "Neutralize model safeguards and auto-mode classifiers across Claude Code, Claude, OpenAI/Codex, and Gemini models, and route refusal-evasion Smart Groups with conversation-sticky model selection. Set management_key in the plugin config. Made to work alongside Reorder/Rename Models (https://github.com/esauvisky/CLIProxyAPI-Model-List-Tweaker-Plugin).",
 			},
 		},
 	}
@@ -78,6 +90,48 @@ func handleManagement(request []byte) ([]byte, error) {
 		body, errMarshal := json.Marshal(buildUIState())
 		if errMarshal != nil {
 			return nil, fmt.Errorf("marshal ui state: %w", errMarshal)
+		}
+		return okEnvelope(managementResponse{
+			StatusCode: http.StatusOK,
+			Headers: http.Header{
+				"Content-Type":  []string{"application/json; charset=utf-8"},
+				"Cache-Control": []string{"no-store"},
+			},
+			Body: body,
+		})
+	case strings.HasSuffix(path, mgmtTrailRoutePath):
+		if req.Method != http.MethodGet {
+			return nil, fmt.Errorf("management route %s: unsupported method %q", path, req.Method)
+		}
+		body, errMarshal := json.Marshal(buildConversationTrail(req.Query.Get("key")))
+		if errMarshal != nil {
+			return nil, fmt.Errorf("marshal conversation trail: %w", errMarshal)
+		}
+		return okEnvelope(managementResponse{
+			StatusCode: http.StatusOK,
+			Headers: http.Header{
+				"Content-Type":  []string{"application/json; charset=utf-8"},
+				"Cache-Control": []string{"no-store"},
+			},
+			Body: body,
+		})
+	case strings.HasSuffix(path, mgmtDrainRoutePath):
+		if req.Method != http.MethodPost {
+			return nil, fmt.Errorf("management route %s: unsupported method %q", path, req.Method)
+		}
+		var payload struct {
+			Key     string `json:"key"`
+			GroupID string `json:"group_id"`
+		}
+		if len(req.Body) > 0 {
+			if errUnmarshal := json.Unmarshal(req.Body, &payload); errUnmarshal != nil {
+				return nil, fmt.Errorf("decode drain request: %w", errUnmarshal)
+			}
+		}
+		drainConversationState(payload.Key, payload.GroupID)
+		body, errMarshal := json.Marshal(struct{ Drained bool }{Drained: true})
+		if errMarshal != nil {
+			return nil, fmt.Errorf("marshal drain response: %w", errMarshal)
 		}
 		return okEnvelope(managementResponse{
 			StatusCode: http.StatusOK,
@@ -389,8 +443,9 @@ const uiHTML = `<!doctype html>
   .group-head { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
   .group-head .field { flex: 1; min-width: 180px; }
   .model-list { list-style: none; margin: 10px 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-  .model-row { display: flex; align-items: center; gap: 6px; }
-  .model-idx { width: 22px; text-align: right; color: var(--text-tertiary); }
+  .model-row { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 6px; }
+  .model-row .model-id { flex: 1; min-width: 160px; }
+  .model-row .model-rating { width: 100px; }
   .add-row { display: flex; gap: 6px; align-items: center; }
   .attempts { margin: 6px 0 0; padding-left: 20px; font-size: 12px; }
   .attempts li { padding: 1px 4px; border-radius: 4px; }
@@ -446,7 +501,7 @@ const uiHTML = `<!doctype html>
 <main class="main-content">
   <header class="page-header">
     <h1 class="page-title">Safeguard Killer</h1>
-    <p class="page-desc">Neutralize model safeguards and auto-mode classifiers across Claude Code, Claude, OpenAI/Codex, and Gemini models, route around refusals with Smart Groups (5m cache-sticky failover chains), and balance provider quota. Requires <span class="mono">management_key</span> in the plugin config. Made to work alongside <a href="https://github.com/esauvisky/CLIProxyAPI-Model-List-Tweaker-Plugin" target="_blank" rel="noopener" style="color:var(--text-primary);">Reorder/Rename Models</a>.</p>
+    <p class="page-desc">Neutralize model safeguards and auto-mode classifiers across Claude Code, Claude, OpenAI/Codex, and Gemini models, route around refusals with Smart Groups (conversation-sticky model selection), and balance provider quota. Requires <span class="mono">management_key</span> in the plugin config. Made to work alongside <a href="https://github.com/esauvisky/CLIProxyAPI-Model-List-Tweaker-Plugin" target="_blank" rel="noopener" style="color:var(--text-primary);">Reorder/Rename Models</a>.</p>
   </header>
 
   <div class="status-bar">
@@ -491,7 +546,7 @@ const uiHTML = `<!doctype html>
           <span class="hint">Every applicable quota window must keep at least this much for a credential to be used.</span></label>
         <label class="field"><span class="cfg-key">Idle minutes</span>
           <input class="input" type="number" step="1" min="0" data-field="idle_minutes" data-setting="idle_minutes">
-          <span class="hint">A session without prompts for this long may move to another credential or group model (0 disables stickiness).</span></label>
+          <span class="hint">Credential bindings may change after this idle period (0 disables credential stickiness). Group models stay pinned across idle gaps until compaction, reset, or becoming unusable.</span></label>
         <label class="field"><span class="cfg-key">Stream prefetch bytes</span>
           <input class="input" type="number" step="1" min="1" data-field="stream_prefetch_bytes" data-setting="stream_prefetch_bytes">
           <span class="hint">Bytes of visible text a group stream holds back and checks for refusals before forwarding to the client.</span></label>
@@ -506,7 +561,7 @@ const uiHTML = `<!doctype html>
           <input type="checkbox" data-feature="fallback_on_refusal">
           <span>
             <span class="feature-title">Fallback on refusal</span>
-            <span class="feature-desc">Detect safeguard stops, content filters, empty responses, and plain-text or scope-gate refusals during stream prefetch and automatically switch to the next model in the group.</span>
+            <span class="feature-desc">Detect safeguard stops, content filters, empty responses, and plain-text or scope-gate refusals during stream prefetch and automatically select another eligible model in the group.</span>
           </span>
         </label>
         <label class="feature-item">
@@ -580,7 +635,7 @@ const uiHTML = `<!doctype html>
         <h2 class="card-title">Smart Groups</h2>
         <button class="btn sm" data-action="add-group" id="addGroupBtn">Add group</button>
       </div>
-      <p class="card-desc">A Smart Group exposes a single virtual model ID that automatically routes around safeguard refusals, content filters, scope-gate lectures, capability mismatches, and quota exhaustion across multiple models. Pick a per-group strategy below to control how starting models are chosen and when fallback sessions probe back up to higher-ranked models.</p>
+      <p class="card-desc">A Smart Group exposes a single virtual model ID that automatically routes around safeguard refusals, content filters, scope-gate lectures, capability mismatches, and quota exhaustion across multiple models. Choose Quality first or Lower cost first and rate each model from 0 to 100. Higher quality is better; higher cost is more expensive. List order does not affect selection. The chosen model stays sticky across idle gaps until compaction, reset, or becoming unusable.</p>
       <div class="groups" id="groupsEditor"></div>
       <datalist id="modelList"></datalist>
     </section>
@@ -600,6 +655,20 @@ const uiHTML = `<!doctype html>
 
   <div class="tab-pane" id="pane-decisions">
     <section class="card">
+      <div class="card-header"><h2 class="card-title">Routing Metrics</h2></div>
+      <div id="metricsRow" style="display:flex; gap:12px; margin-bottom:14px; flex-wrap:wrap;"></div>
+      <div style="margin-bottom:14px;">
+        <span class="cfg-key">Conversation trail</span>
+        <span style="display:inline-flex; gap:6px; margin-left:8px;">
+          <input class="input mono" type="text" id="trailKey" placeholder="conversation key" style="max-width:340px;">
+          <button class="btn" id="trailBtn" onclick="loadTrail()">Show trail</button>
+          <button class="btn" id="drainBtn" onclick="drainKey()">Drain</button>
+        </span>
+      </div>
+      <table class="table" id="trailTable" style="display:none;">
+        <thead><tr><th>Time</th><th>Version</th><th>Event</th><th>Model</th><th>Reason</th></tr></thead>
+        <tbody id="trailBody"></tbody>
+      </table>
       <div class="card-header"><h2 class="card-title">Recent Decisions</h2></div>
       <div class="table-wrap">
         <table>
@@ -625,6 +694,8 @@ const uiHTML = `<!doctype html>
 
 <script>
 const STATE_API_URL = '/v0/management/plugins/safeguard-killer/state';
+const TRAIL_API_URL = '/v0/management/plugins/safeguard-killer/trail';
+const DRAIN_API_URL = '/v0/management/plugins/safeguard-killer/drain';
 const CONFIG_API_URL = '/v8/management/config/plugins/configs/safeguard-killer';
 const REFRESH_MS = 10000;
 const APPLY_WAIT_MS = 1500;
@@ -825,30 +896,12 @@ function featuresOf(cfg) {
   return out;
 }
 
-function normStrategy(s) {
-  switch ((s || '').toLowerCase().trim()) {
-    case 'stick':
-    case 'sticky':
-      return 'stick';
-    case 'quota':
-      return 'quota';
-    case 'race':
-    case 'fastest':
-      return 'race';
-    case 'random':
-    case 'round-robin':
-      return 'random';
-    default:
-      return 'upgrade';
-  }
-}
-
 function canonConfig(cfg) {
   return JSON.stringify({
     min_remaining: cfg.min_remaining,
     idle_minutes: cfg.idle_minutes,
     stream_prefetch_bytes: cfg.stream_prefetch_bytes,
-    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, strategy: normStrategy(g.strategy), models: g.models })),
+    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: m.quality, cost: m.cost })) })),
     features: featuresOf(cfg),
   });
 }
@@ -866,7 +919,7 @@ function loadDraft(cfg) {
       key: '',
     },
     features: featuresOf(cfg),
-    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, strategy: normStrategy(g.strategy), models: g.models.slice(), pending: '' })),
+    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: String(m.quality), cost: String(m.cost) })), pending: '' })),
   };
   draftSourceCanon = canonConfig(cfg);
   for (const el of document.querySelectorAll('[data-setting]')) el.value = draft.settings[el.dataset.setting];
@@ -906,7 +959,10 @@ function validateDraft() {
   const prefetch = parseNum(s.stream_prefetch_bytes);
   if (!Number.isInteger(prefetch) || prefetch < 1) errors.push(['stream_prefetch_bytes', 'Stream prefetch bytes must be a whole number of at least 1, got "' + s.stream_prefetch_bytes + '"']);
 
-  const groups = draft.groups.map(g => ({ id: g.id.trim(), name: g.name.trim(), strategy: normStrategy(g.strategy), models: g.models.map(m => m.trim()) }));
+  const groups = draft.groups.map(g => ({
+    id: g.id.trim(), name: g.name.trim(), mode: g.mode,
+    models: g.models.map(m => ({ id: m.id.trim(), quality: parseNum(m.quality), cost: parseNum(m.cost) })),
+  }));
   const ids = new Set();
   groups.forEach((g, i) => {
     const label = 'Group #' + (i + 1) + (g.id ? ' (' + g.id + ')' : '');
@@ -915,13 +971,20 @@ function validateDraft() {
     ids.add(g.id);
     if (g.name === '') errors.push(['groups.' + i + '.name', label + ' needs a name']);
     if (g.models.length === 0) errors.push(['groups.' + i + '.add', label + ' needs at least one model']);
+    if (g.mode !== 'quality' && g.mode !== 'cost') errors.push(['groups.' + i + '.mode', label + ': select Quality first or Lower cost first']);
+    const modelIDs = new Set();
     g.models.forEach((m, j) => {
-      if (m === '') errors.push(['groups.' + i + '.models.' + j, label + ': model #' + (j + 1) + ' is empty']);
+      if (m.id === '') errors.push(['groups.' + i + '.models.' + j + '.id', label + ': model #' + (j + 1) + ' is empty']);
+      else if (modelIDs.has(m.id)) errors.push(['groups.' + i + '.models.' + j + '.id', label + ': duplicate model ' + m.id]);
+      modelIDs.add(m.id);
+      for (const rating of ['quality', 'cost']) {
+        if (!Number.isFinite(m[rating]) || m[rating] < 0 || m[rating] > 100) errors.push(['groups.' + i + '.models.' + j + '.' + rating, label + ': model #' + (j + 1) + ' ' + rating + ' must be a number from 0 to 100']);
+      }
     });
   });
   groups.forEach((g, i) => {
     g.models.forEach((m, j) => {
-      if (ids.has(m)) errors.push(['groups.' + i + '.models.' + j, 'Group ' + g.id + ' lists group ' + m + ' as a target; groups cannot nest']);
+      if (ids.has(m.id)) errors.push(['groups.' + i + '.models.' + j + '.id', 'Group ' + g.id + ' lists group ' + m.id + ' as a target; groups cannot nest']);
     });
   });
 
@@ -1060,12 +1123,9 @@ function groupFieldAttr(i, rest) {
   return ' data-field="groups.' + i + '.' + rest + '"';
 }
 
-const STRATEGY_HINTS = {
-  upgrade: 'Priority + Auto-Upgrade: Tries models top to bottom (#1 → #2 → #3) and pins to the answering model. A refused model stays skipped until /compact collapses the transcript. Models that have not refused are raced with the pinned model after its cache window expires.',
-  stick: 'Priority + Sticky Until Compact (Max Cache Saver): Tries models top to bottom (#1 → #2 → #3). Once a model refuses on safeguards, stays locked on the working fallback model for the entire session without spending tokens re-probing higher models — only resetting to #1 when conversation history is compacted (/compact) or cleared.',
-  quota: 'Quota Balanced (Cache-Sticky): Picks the starting model for new/cold sessions weighted by each provider\'s available quota burn rate (remaining / hours to reset), stays pinned while the session\'s server cache is warm, and fails over around refusals or quota exhaustion.',
-  race: 'Fastest Non-Refusing (Parallel Race): Races candidate models in parallel for new or cold sessions and streams the first one that passes prefetch without refusing or failing, then stays pinned while its server cache is warm.',
-  random: 'Round-Robin / Random Pool (Cache-Sticky): Distributes new or cold sessions uniformly across the group\'s models (ideal for uncensored/open-weight pools without quota APIs), stays pinned while the cache is warm, and fails over on refusal or error.',
+const MODE_HINTS = {
+  quality: 'Quality first: score = 0.8 × quality − 0.2 × cost.',
+  cost: 'Lower cost first: score = 0.2 × quality − 0.8 × cost.',
 };
 
 function renderGroups() {
@@ -1077,13 +1137,14 @@ function renderGroups() {
     return;
   }
   root.innerHTML = draft.groups.map((g, i) => {
-    const strat = normStrategy(g.strategy);
     const models = g.models.map((m, j) =>
       '<li class="model-row">' +
-        '<span class="model-idx mono">' + (j + 1) + '.</span>' +
-        '<input class="input grow mono" list="modelList" value="' + esc(m) + '" data-group="' + i + '" data-model="' + j + '"' + groupFieldAttr(i, 'models.' + j) + '>' +
-        '<button class="btn sm" data-action="model-up" data-group="' + i + '" data-model="' + j + '"' + (j === 0 ? ' disabled' : '') + ' title="Move up">&uarr;</button>' +
-        '<button class="btn sm" data-action="model-down" data-group="' + i + '" data-model="' + j + '"' + (j === g.models.length - 1 ? ' disabled' : '') + ' title="Move down">&darr;</button>' +
+        '<label class="field model-id"><span class="cfg-key">Model ID</span>' +
+          '<input class="input mono" list="modelList" value="' + esc(m.id) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="id"' + groupFieldAttr(i, 'models.' + j + '.id') + '></label>' +
+        '<label class="field model-rating"><span class="cfg-key">Quality</span>' +
+          '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.quality) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="quality"' + groupFieldAttr(i, 'models.' + j + '.quality') + '></label>' +
+        '<label class="field model-rating"><span class="cfg-key">Cost</span>' +
+          '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.cost) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="cost"' + groupFieldAttr(i, 'models.' + j + '.cost') + '></label>' +
         '<button class="btn sm danger" data-action="model-remove" data-group="' + i + '" data-model="' + j + '" title="Remove">&times;</button>' +
       '</li>'
     ).join('');
@@ -1093,18 +1154,15 @@ function renderGroups() {
           '<input class="input mono" value="' + esc(g.id) + '" data-group="' + i + '" data-gfield="id"' + groupFieldAttr(i, 'id') + '></label>' +
         '<label class="field"><span class="cfg-key">Visible name</span>' +
           '<input class="input" value="' + esc(g.name) + '" data-group="' + i + '" data-gfield="name"' + groupFieldAttr(i, 'name') + '></label>' +
-        '<label class="field"><span class="cfg-key">Routing strategy</span>' +
-          '<select class="input" data-group="' + i + '" data-gfield="strategy"' + groupFieldAttr(i, 'strategy') + '>' +
-            '<option value="upgrade"' + (strat === 'upgrade' ? ' selected' : '') + '>Priority + Auto-Upgrade (Parallel Probe)</option>' +
-            '<option value="stick"' + (strat === 'stick' ? ' selected' : '') + '>Priority + Sticky Until Compact (Cache Saver)</option>' +
-            '<option value="quota"' + (strat === 'quota' ? ' selected' : '') + '>Quota Balanced (Cache-Sticky)</option>' +
-            '<option value="race"' + (strat === 'race' ? ' selected' : '') + '>Fastest Non-Refusing (Parallel Race)</option>' +
-            '<option value="random"' + (strat === 'random' ? ' selected' : '') + '>Round-Robin / Random Pool (Cache-Sticky)</option>' +
+        '<label class="field"><span class="cfg-key">Selection mode</span>' +
+          '<select class="input" data-group="' + i + '" data-gfield="mode"' + groupFieldAttr(i, 'mode') + '>' +
+            '<option value="quality"' + (g.mode === 'quality' ? ' selected' : '') + '>Quality first</option>' +
+            '<option value="cost"' + (g.mode === 'cost' ? ' selected' : '') + '>Lower cost first</option>' +
           '</select></label>' +
         '<button class="btn sm danger" data-action="group-remove" data-group="' + i + '">Delete group</button>' +
       '</div>' +
-      '<div class="hint" style="margin-top:6px" data-group-hint="' + i + '">' + esc(STRATEGY_HINTS[strat]) + '</div>' +
-      '<ol class="model-list">' + models + '</ol>' +
+      '<div class="hint" style="margin-top:6px" data-group-hint="' + i + '">' + esc(MODE_HINTS[g.mode]) + ' Weighted selection includes only eligible models within 3 points of the best score, using softmax temperature = 1. Credential balancing is separate: account weight, quota bottleneck, and load.' + '</div>' +
+      '<ul class="model-list">' + models + '</ul>' +
       '<div class="add-row">' +
         '<input class="input grow mono" list="modelList" placeholder="Add model (pick or type)" value="' + esc(g.pending) + '" data-group="' + i + '" data-gfield="pending"' + groupFieldAttr(i, 'add') + '>' +
         '<button class="btn sm" data-action="model-add" data-group="' + i + '">Add model</button>' +
@@ -1113,15 +1171,11 @@ function renderGroups() {
   }).join('');
 }
 
-function swap(list, a, b) {
-  const t = list[a]; list[a] = list[b]; list[b] = t;
-}
-
 function addPendingModel(gi) {
   const g = draft.groups[gi];
   const m = g.pending.trim();
   if (m === '') return;
-  g.models.push(m);
+  g.models.push({ id: m, quality: '50', cost: '50' });
   g.pending = '';
   setDirty(true);
   renderGroups();
@@ -1133,15 +1187,13 @@ function onEditorClick(ev) {
   if (btn === null) return;
   const action = btn.dataset.action;
   if (action === 'add-group') {
-    draft.groups.push({ id: '', name: '', strategy: 'upgrade', models: [], pending: '' });
+    draft.groups.push({ id: '', name: '', mode: 'quality', models: [], pending: '' });
   } else {
     const gi = Number(btn.dataset.group);
     const g = draft.groups[gi];
     const mi = Number(btn.dataset.model);
     if (action === 'group-remove') draft.groups.splice(gi, 1);
     else if (action === 'model-add') { addPendingModel(gi); return; }
-    else if (action === 'model-up') swap(g.models, mi, mi - 1);
-    else if (action === 'model-down') swap(g.models, mi, mi + 1);
     else if (action === 'model-remove') g.models.splice(mi, 1);
     else throw new Error('unknown editor action ' + action);
   }
@@ -1154,17 +1206,14 @@ function onEditorInput(ev) {
   if (el.dataset.group === undefined) return;
   const g = draft.groups[Number(el.dataset.group)];
   if (el.dataset.model !== undefined) {
-    g.models[Number(el.dataset.model)] = el.value;
+    g.models[Number(el.dataset.model)][el.dataset.mfield] = el.value;
     setDirty(true);
   } else if (el.dataset.gfield === 'pending') {
     // Text in the add box is not part of the config until "Add model".
     g.pending = el.value;
   } else {
     g[el.dataset.gfield] = el.value;
-    if (el.dataset.gfield === 'strategy') {
-      const hint = document.querySelector('[data-group-hint="' + el.dataset.group + '"]');
-      if (hint !== null) hint.textContent = STRATEGY_HINTS[normStrategy(el.value)];
-    }
+    if (el.dataset.gfield === 'mode') renderGroups();
     setDirty(true);
   }
 }
@@ -1235,12 +1284,11 @@ function renderSessionState(s) {
   if (s.provider !== 'model-groups') {
     return countdown(s.idle_expires_at);
   }
-  const pills = [];
+  // Group model pins have no idle expiry; they hold until compaction, reset, or the model becomes unusable.
+  const pills = ['<span class="badge">Until compaction or reset</span>'];
   if (s.cache_warm) {
     const tok = s.last_cache_read_tokens || s.last_cache_create_tokens || 0;
     pills.push('<span class="badge ok">cache warm' + (tok > 0 ? ' (' + Math.round(tok / 1000) + 'k tok)' : '') + '</span>');
-  } else {
-    pills.push('<span class="badge">pinned</span>');
   }
   if (s.turns) {
     pills.push('<span class="badge mono">' + esc(s.turns) + ' turns</span>');
@@ -1291,10 +1339,13 @@ function renderRanking(d) {
       '<td class="mono">' + esc(pct(r.remaining)) + '</td>' +
       '<td class="mono">' + esc(num(r.hours_to_reset, 2)) + '</td>' +
       '<td class="mono">' + esc(num(r.rate, 4)) + '</td>' +
+      '<td class="mono">' + esc(num(r.weight, 2)) + '</td>' +
+      '<td class="mono">' + esc(r.load) + '</td>' +
+      '<td class="mono">' + esc(num(r.score, 4)) + '</td>' +
       '<td>' + (r.excluded ? '<span class="badge bad">' + esc(r.excluded) + '</span>' : '') + '</td>' +
     '</tr>'
   ).join('');
-  return '<table class="rank"><thead><tr><th>Auth</th><th>Provider</th><th>Window</th><th>Remaining</th><th>Hours to reset</th><th>Rate</th><th>Excluded</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  return '<table class="rank"><thead><tr><th>Auth</th><th>Provider</th><th>Window</th><th>Remaining</th><th>Hours to reset</th><th>Rate</th><th>Weight</th><th>Load</th><th>Score</th><th>Excluded</th></tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
 function renderAttempts(d) {
@@ -1303,6 +1354,26 @@ function renderAttempts(d) {
       '<span class="mono">' + esc(at.model) + '</span> &rarr; ' + esc(at.result) +
     '</li>'
   ).join('') + '</ol>';
+}
+
+const MODE_LABELS = { quality: 'Quality first', cost: 'Lower cost first' };
+
+// mode and model_scores are omitempty on decisions and trail entries.
+function renderModelScores(e) {
+  let out = '';
+  if (e.mode) out += '<div class="win-meta">mode: ' + esc(MODE_LABELS[e.mode]) + '</div>';
+  if (!e.model_scores || e.model_scores.length === 0) return out;
+  const rows = e.model_scores.map(ms =>
+    '<tr class="' + (ms.model === e.auth_id ? 'winner' : '') + '">' +
+      '<td class="mono">' + esc(ms.model) + '</td>' +
+      '<td class="mono">' + esc(num(ms.quality, 1)) + '</td>' +
+      '<td class="mono">' + esc(num(ms.cost, 1)) + '</td>' +
+      '<td class="mono">' + esc(num(ms.score, 2)) + '</td>' +
+      '<td class="mono">' + (ms.excluded ? '<span class="subtle">-</span>' : esc(pct(ms.probability))) + '</td>' +
+      '<td>' + (ms.excluded ? '<span class="badge bad">' + esc(ms.excluded) + '</span>' : '') + '</td>' +
+    '</tr>'
+  ).join('');
+  return out + '<table class="rank"><thead><tr><th>Model</th><th>Quality</th><th>Cost</th><th>Score</th><th>Probability</th><th>Excluded</th></tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
 function renderDecisions() {
@@ -1322,7 +1393,12 @@ function renderDecisions() {
       chosen = d.auth_id ? esc(credNameByID(d.auth_id)) : '<span class="badge bad">none</span>';
     } else if (d.kind === 'group') {
       if (d.attempts && d.attempts.length > 0) extra = renderAttempts(d);
+      extra += renderModelScores(d);
       chosen = d.auth_id ? '<span class="mono">' + esc(d.auth_id) + '</span>' : '<span class="badge bad">none</span>';
+    } else if (d.kind === 'route') {
+      // auth_id carries the routing event name for "route" decisions.
+      extra = renderModelScores(d);
+      chosen = '<span class="badge">' + esc(d.auth_id) + '</span>';
     } else {
       throw new Error('unknown decision kind ' + d.kind);
     }
@@ -1337,7 +1413,41 @@ function renderDecisions() {
   }).join('');
 }
 
+function renderMetrics() {
+  const row = document.getElementById('metricsRow');
+  if (!row || !state.metrics) { row.style.display = 'none'; return; }
+  const m = state.metrics;
+  const refusals = Object.entries(m.refusals_by_model_category || {});
+  const cards = [
+    ['Refusals', refusals.length ? refusals.map(([k, v]) => esc(k) + ' (' + v + ')').join(', ') : 'none'],
+    ['Compaction resets', m.compaction_resets || 0],
+    ['Decisions', state.decisions ? state.decisions.length : 0],
+  ];
+  row.innerHTML = cards.map(([label, value]) =>
+    '<div style="background:var(--bg-tertiary); border:1px solid var(--border-color); border-radius:8px; padding:10px 14px; min-width:160px;"><div class="cfg-key">' + label + '</div><div class="mono" style="font-size:14px;">' + value + '</div></div>'
+  ).join('');
+}
+function loadTrail() {
+  const key = document.getElementById('trailKey').value.trim();
+  fetch(TRAIL_API_URL + '?key=' + encodeURIComponent(key), { method: 'GET', headers: authHeaders() })
+    .then(r => r.json()).then(data => {
+      const body = document.getElementById('trailBody');
+      const table = document.getElementById('trailTable');
+      if (!Array.isArray(data) || data.length === 0) { table.style.display = 'none'; return; }
+      table.style.display = '';
+      body.innerHTML = data.map(e =>
+        '<tr><td class="nowrap">' + esc(e.time) + '</td><td>' + esc(e.version) + '</td><td>' + esc(e.event) + '</td><td class="mono">' + esc(e.model) + '</td><td>' + esc(e.reason) + renderModelScores({ mode: e.mode, model_scores: e.model_scores, auth_id: e.event }) + '</td></tr>'
+      ).join('');
+    });
+}
+function drainKey() {
+  const key = document.getElementById('trailKey').value.trim();
+  if (!key) return;
+  fetch(DRAIN_API_URL, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ key: key }) })
+    .then(() => { loadTrail(); location.reload(); });
+}
 function render() {
+  renderMetrics();
   const hostBanner = document.getElementById('hostErrorBanner');
   if (state.error) {
     hostBanner.innerHTML = '<strong>Router could not read the host credential list</strong>' + esc(state.error);

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -120,16 +122,18 @@ func authsByID(snapshot hostSnapshot, ids []string) ([]hostAuth, error) {
 	return out, nil
 }
 
-// pick balances models served by two or more credentials: a session keeps its credential while
+// pick balances the candidate credentials of a model, a single candidate included so its
+// exclusions still apply: a session keeps its credential while
 // prompts keep coming, and a new or idle session goes to the credential with the highest
-// remaining / hours_to_reset. Without quota data for any candidate the host's own
-// selector decides.
+// weight * bottleneck rate / (1 + load). When every candidate is excluded the pick fails with
+// HTTP 503 listing each exclusion; handing the request back to the host would undo them.
 func pick(req schedulerPickRequest, cfg pluginConfig, now time.Time) (schedulerPickResponse, error) {
-	if len(req.Candidates) < 2 {
-		return schedulerPickResponse{Handled: false}, nil
-	}
+	// Without a management key balancing is off by configuration and the host selector decides.
 	if cfg.ManagementKey == "" {
 		return schedulerPickResponse{Handled: false}, nil
+	}
+	if len(req.Candidates) == 0 {
+		return schedulerPickResponse{}, &statusError{Code: "no_eligible_credential", Message: "scheduler offered no candidate credentials for " + req.Model, HTTPStatus: http.StatusServiceUnavailable}
 	}
 	requested, okRequested := req.Options.Metadata[metadataRequestedModel].(string)
 	if !okRequested {
@@ -148,13 +152,17 @@ func pick(req schedulerPickRequest, cfg pluginConfig, now time.Time) (schedulerP
 		return schedulerPickResponse{}, errAuths
 	}
 	ensureQuotaFresh(cfg.ManagementKey, auths)
-
-	ranking := rankCredentials(cfg, auths, req.Model, now)
+	if errWeights := loadAuthWeights(cfg.ManagementKey, ids, now); errWeights != nil {
+		return schedulerPickResponse{}, errWeights
+	}
 	session := sessionKey(req.Options.Metadata)
 	bindingKey := session + "\x00" + req.Model
 
+	// Ranking and binding happen under one lock so concurrent new sessions see each other's
+	// bindings in Load instead of all landing on the same credential.
 	stateMu.Lock()
 	defer stateMu.Unlock()
+	ranking := rankCredentials(cfg, auths, req.Model, now)
 	if session != "" {
 		if binding, ok := sessions[bindingKey]; ok && now.Before(binding.IdleExpiresAt) {
 			if entry, found := findRank(ranking, binding.AuthID); found && entry.Excluded == "" {
@@ -166,14 +174,19 @@ func pick(req schedulerPickRequest, cfg pluginConfig, now time.Time) (schedulerP
 	}
 	best, ok := bestRank(ranking)
 	if !ok {
-		recordDecision(decision{Time: now, Kind: "balance", Model: requested, Session: session, Reason: "no candidate with usable quota data, host selector decides", Ranking: ranking})
-		return schedulerPickResponse{Handled: false}, nil
+		exclusions := make([]string, 0, len(ranking))
+		for _, entry := range ranking {
+			exclusions = append(exclusions, entry.AuthID+": "+entry.Excluded)
+		}
+		message := "no credential eligible for " + requested + ": " + strings.Join(exclusions, "; ")
+		recordDecision(decision{Time: now, Kind: "balance", Model: requested, Session: session, Reason: message, Ranking: ranking})
+		return schedulerPickResponse{}, &statusError{Code: "no_eligible_credential", Message: message, HTTPStatus: http.StatusServiceUnavailable}
 	}
-	reason := "highest rate (no session identity)"
+	reason := "highest score (no session identity)"
 	if session != "" {
 		sessions[bindingKey] = &sessionBinding{Session: session, AuthID: best.AuthID, Provider: best.Provider, Model: req.Model, BoundAt: now}
 		touchSession(sessions[bindingKey], cfg, now)
-		reason = "new or idle session bound to highest rate"
+		reason = "new or idle session bound to highest score"
 	}
 	recordDecision(decision{Time: now, Kind: "balance", Model: requested, Session: session, AuthID: best.AuthID, Reason: reason, Ranking: ranking})
 	pruneSessions(now)
@@ -202,72 +215,129 @@ func pruneSessions(now time.Time) {
 			delete(sessions, key)
 		}
 	}
-	for key, state := range groupStates {
-		if now.Sub(state.LastSeen) > sessionRetention {
-			delete(groupStates, key)
-		}
-	}
 }
 
-// rankCredentials evaluates credentials for a model, best first; excluded ones go last.
+// rankCredentials evaluates credentials for a model, best first; excluded ones go last. Score is
+// weight * bottleneck rate / (1 + load), where load counts sessions bound to the credential
+// within idle_minutes. It reads sessions, so callers hold stateMu, and the account weights of
+// every auth must be loaded (loadAuthWeights).
 func rankCredentials(cfg pluginConfig, auths []hostAuth, model string, now time.Time) []rankEntry {
+	load := activeBindings(now)
 	ranking := make([]rankEntry, 0, len(auths))
 	for _, auth := range auths {
-		entry := rankEntry{AuthID: auth.ID, Provider: auth.Provider}
-		rateCredential(&entry, model, cfg.MinRemaining, now)
+		weight, ok := authWeight(auth.ID)
+		if !ok {
+			panic(fmt.Sprintf("account weight for credential %s is not loaded", auth.ID))
+		}
+		entry := rankEntry{AuthID: auth.ID, Provider: auth.Provider, Weight: weight, Load: load[auth.ID]}
+		switch {
+		case auth.Disabled:
+			entry.Excluded = "credential disabled"
+		case auth.Unavailable && auth.NextRetryAfter.IsZero():
+			entry.Excluded = "credential unavailable"
+		case auth.Unavailable && auth.NextRetryAfter.After(now):
+			entry.Excluded = "credential unavailable until " + auth.NextRetryAfter.Format(time.RFC3339)
+		case weight == 0:
+			entry.Excluded = "account weight is 0"
+		default:
+			// An unavailable credential whose retry time has passed is eligible again: the host
+			// offered it as a candidate and the host snapshot lags by up to hostCacheTTL.
+			rateCredential(&entry, model, cfg.MinRemaining, now)
+			if entry.Excluded == "" {
+				entry.Score = entry.Rate * weight / float64(1+entry.Load)
+			}
+		}
 		ranking = append(ranking, entry)
 	}
 	sort.SliceStable(ranking, func(i, j int) bool {
 		if (ranking[i].Excluded == "") != (ranking[j].Excluded == "") {
 			return ranking[i].Excluded == ""
 		}
-		return ranking[i].Rate > ranking[j].Rate
+		return ranking[i].Score > ranking[j].Score
 	})
 	return ranking
 }
 
-// rateCredential scores a credential from its quota windows that apply to the model. The longest
-// window governs the rate (quota that resets later can wait); every applicable window must keep
-// at least minRemaining.
+// activeBindings counts session bindings per credential that are still within idle_minutes;
+// callers hold stateMu. The host reports no per-credential request lifecycle (request.complete
+// carries only a request ID), so active sessions are the load signal, not in-flight requests.
+func activeBindings(now time.Time) map[string]int {
+	counts := make(map[string]int)
+	for _, binding := range sessions {
+		if now.Before(binding.IdleExpiresAt) {
+			counts[binding.AuthID]++
+		}
+	}
+	return counts
+}
+
+// neutralRate is the rate of a credential whose quota is optional by provider design: the
+// provider has no quota source, no reported window applies to the model, or no applicable window
+// reports a reset time. Weight and load still apply to it.
+const neutralRate = 1
+
+// rateCredential scores a credential from its quota windows that apply to the model. Every
+// applicable window must keep at least minRemaining. The rate is the bottleneck: the lowest
+// remaining / hours_to_reset among applicable windows that report a reset time. A window without
+// a reset time (the provider does not report one) only takes part in the threshold check.
+// A missing snapshot, a fetch error, or a snapshot without windows excludes the credential.
 func rateCredential(entry *rankEntry, model string, minRemaining float64, now time.Time) {
 	quota, ok := quotaFor(entry.AuthID)
 	if !ok {
 		entry.Excluded = "quota not fetched yet"
 		return
 	}
+	if quota.Source == quotaSourceNone {
+		entry.Window = "no quota source"
+		entry.Rate = neutralRate
+		return
+	}
 	if quota.Error != "" {
 		entry.Excluded = "quota error: " + quota.Error
 		return
 	}
-	var governing *quotaWindow
-	for index := range quota.Windows {
-		window := &quota.Windows[index]
+	if len(quota.Windows) == 0 {
+		entry.Excluded = "quota snapshot has no windows"
+		return
+	}
+	applicable := 0
+	found := false
+	var bottleneck string
+	var bottleneckRemaining, bottleneckHours, bottleneckRate float64
+	for _, window := range quota.Windows {
 		if len(window.Models) > 0 && !containsString(window.Models, model) {
 			continue
 		}
-		remaining, resetAt := rolledWindow(*window, now)
+		applicable++
+		remaining, resetAt := rolledWindow(window, now)
 		if remaining < minRemaining {
 			entry.Excluded = fmt.Sprintf("%s has %.0f%% left", window.Name, remaining*100)
 			return
 		}
-		if governing == nil || resetAt.After(governingReset(*governing, now)) {
-			governing = window
+		if resetAt.IsZero() {
+			continue
+		}
+		hours := math.Max(resetAt.Sub(now).Hours(), minHoursToReset)
+		rate := remaining / hours
+		if !found || rate < bottleneckRate {
+			found = true
+			bottleneck, bottleneckRemaining, bottleneckHours, bottleneckRate = window.Name, remaining, hours, rate
 		}
 	}
-	if governing == nil {
-		entry.Excluded = "no quota window applies to " + model
+	if applicable == 0 {
+		entry.Window = "no window applies to " + model
+		entry.Rate = neutralRate
 		return
 	}
-	remaining, resetAt := rolledWindow(*governing, now)
-	if resetAt.IsZero() {
-		entry.Excluded = governing.Name + " has no reset time"
+	if !found {
+		entry.Window = "no reset time reported"
+		entry.Rate = neutralRate
 		return
 	}
-	hours := math.Max(resetAt.Sub(now).Hours(), minHoursToReset)
-	entry.Window = governing.Name
-	entry.Remaining = remaining
-	entry.HoursToReset = hours
-	entry.Rate = remaining / hours
+	entry.Window = bottleneck
+	entry.Remaining = bottleneckRemaining
+	entry.HoursToReset = bottleneckHours
+	entry.Rate = bottleneckRate
 }
 
 // rolledWindow applies resets that happened since the snapshot: a passed reset with a known
@@ -278,11 +348,6 @@ func rolledWindow(window quotaWindow, now time.Time) (float64, time.Time) {
 	}
 	periods := math.Floor(float64(now.Sub(window.ResetAt))/float64(window.Period)) + 1
 	return 1, window.ResetAt.Add(time.Duration(periods) * window.Period)
-}
-
-func governingReset(window quotaWindow, now time.Time) time.Time {
-	_, resetAt := rolledWindow(window, now)
-	return resetAt
 }
 
 func bestRank(ranking []rankEntry) (rankEntry, bool) {
@@ -321,7 +386,7 @@ func containsString(values []string, target string) bool {
 func buildUIState() uiState {
 	now := time.Now()
 	cfg := currentConfig()
-	state := uiState{Version: pluginVersion, Now: now, Config: cfg, ManagementError: managementStatus(cfg.ManagementKey, now)}
+	state := uiState{Version: pluginVersion, Now: now, Config: cfg, ManagementError: managementStatus(cfg.ManagementKey, now), Metrics: computeRoutingMetrics()}
 	snapshot, errHost := hostState(now)
 	if errHost != nil {
 		state.Error = errHost.Error()
@@ -346,8 +411,10 @@ func buildUIState() uiState {
 	for _, binding := range sessions {
 		state.Sessions = append(state.Sessions, *binding)
 	}
-	for _, conversation := range groupStates {
-		state.Sessions = append(state.Sessions, conversationBindingView(conversation))
+	for full, conversation := range groupStates {
+		view := conversationBindingView(conversation)
+		view.Model = strings.TrimPrefix(full, conversation.Key+"\x00")
+		state.Sessions = append(state.Sessions, view)
 	}
 	sort.Slice(state.Sessions, func(i, j int) bool { return state.Sessions[i].LastSeen.After(state.Sessions[j].LastSeen) })
 	for index := len(decisions) - 1; index >= 0; index-- {

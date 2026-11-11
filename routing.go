@@ -2,12 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand/v2"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 )
@@ -18,6 +18,11 @@ type conversationFailure struct {
 	Reason  string    `json:"reason,omitempty"`
 	AtBytes int       `json:"at_bytes,omitempty"`
 	At      time.Time `json:"at"`
+	// FirstRefusalHash is the sha256 of the first payload this model refused.
+	// A byte-identical repeat is not new information and its notice is suppressed.
+	FirstRefusalHash string `json:"first_refusal_hash,omitempty"`
+	// FirstRefusalNotified records whether the switch notice for this hash was shown.
+	FirstRefusalNotified bool `json:"first_refusal_notified,omitempty"`
 }
 
 // conversationState is the routing state of exactly one conversation (one
@@ -33,15 +38,7 @@ type conversationState struct {
 	TipShown         bool                            `json:"tip_shown,omitempty"`
 	CacheWarm        bool                            `json:"cache_warm,omitempty"`
 	LastSeen         time.Time                       `json:"last_seen"`
-	IdleExpiresAt    time.Time                       `json:"idle_expires_at"`
-}
-
-// failure returns the model's failure entry, or nil.
-func (s *conversationState) failure(model string) *conversationFailure {
-	if s == nil {
-		return nil
-	}
-	return s.Failures[model]
+	BoundAt          time.Time                       `json:"bound_at"`
 }
 
 // skipReasonLocked returns why model should not be attempted for payload, or "".
@@ -73,9 +70,6 @@ func (s *conversationState) skipReasonLocked(model string, payload []byte, now t
 		// The refused content stays in the history until compaction resets this
 		// conversation. Growing the conversation does not call the refused
 		// model again.
-		if s.Current != "" {
-			return "sticky to " + s.Current + " (cache warm)"
-		}
 		return f.Reason
 	case "transient":
 		if s.Current != "" && s.Current != model && now.Sub(f.At) < transientErrorCooldown {
@@ -152,167 +146,160 @@ func logRoutingLocked(group modelGroup, key, event, detail string) {
 	recordDecision(decision{Time: time.Now(), Kind: "route", Model: group.ID, Session: key, AuthID: event, Reason: detail, Version: pluginVersion})
 }
 
-// planConversation computes the parallel probe list and sequential fallback
-// order for one group turn. Compaction resets the conversation before
-// planning; every reset is logged with its reason.
-func planConversation(cfg pluginConfig, session string, group modelGroup, payload []byte, now time.Time) groupRoutingPlan {
-	var plan groupRoutingPlan
-	if len(group.Models) == 0 {
-		return plan
-	}
-	strategy := group.effectiveStrategy()
-	stickyEnabled := cfg.IdleMinutes > 0
-	var activeModel string
-	cacheStickActive := false
+const (
+	modelScoreTolerance   = 3.0
+	modelScoreTemperature = 1.0
+)
 
-	if session != "" {
-		key := session + "\x00" + group.ID
-		stateMu.Lock()
-		state, ok := groupStates[key]
-		if ok && state != nil {
-			plan.PrevModel = state.Current
-			if state.conversationCompactedLocked(payload) {
-				plan.Compacted = true
-				state.Current = ""
-				state.Failures = make(map[string]*conversationFailure)
-				state.TipShown = false
-				state.CacheWarm = false
-				state.LastPayloadBytes = len(payload)
-				state.LastMessageCount = payloadMessageCount(payload)
-				savePersistedSessionsLocked()
-				logRoutingLocked(group, session, "compaction", fmt.Sprintf("payload %d to %d bytes, messages %d to %d", state.LastPayloadBytes, len(payload), state.LastMessageCount, payloadMessageCount(payload)))
-			}
-			if stickyEnabled && state.Current != "" {
-				activeModel = state.Current
-				cacheStickActive = state.CacheWarm || now.Before(state.IdleExpiresAt)
-			}
+type modelScore struct {
+	Model       string  `json:"model"`
+	Quality     float64 `json:"quality"`
+	Cost        float64 `json:"cost"`
+	Score       float64 `json:"score"`
+	Probability float64 `json:"probability"`
+	Excluded    string  `json:"excluded,omitempty"`
+}
+
+func scoreModels(group modelGroup) []modelScore {
+	scores := make([]modelScore, 0, len(group.Models))
+	for _, model := range group.Models {
+		var score float64
+		switch group.Mode {
+		case groupModeQuality:
+			score = 0.8*model.Quality - 0.2*model.Cost
+		case groupModeCost:
+			score = 0.2*model.Quality - 0.8*model.Cost
+		default:
+			panic(fmt.Errorf("group %s has invalid mode %q", group.ID, group.Mode))
 		}
-		stateMu.Unlock()
+		scores = append(scores, modelScore{Model: model.ID, Quality: model.Quality, Cost: model.Cost, Score: score})
 	}
+	return scores
+}
 
+// Selection only happens at conversation boundaries or when the pinned model is unusable.
+func planConversation(cfg pluginConfig, session string, group modelGroup, payload []byte, now time.Time) groupRoutingPlan {
+	plan := groupRoutingPlan{Scores: scoreModels(group)}
 	stateMu.Lock()
 	var state *conversationState
 	if session != "" {
 		state = groupStates[session+"\x00"+group.ID]
 	}
-	if strategy == groupStrategyRace {
-		if activeModel != "" && cacheStickActive && state.skipReasonLocked(activeModel, payload, now) == "" {
-			plan.Sequential = append(plan.Sequential, activeModel)
-			for _, m := range group.Models {
-				if m == activeModel {
-					continue
-				}
-				if reason := state.skipReasonLocked(m, payload, now); reason != "" {
-					plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-					continue
-				}
-				plan.Sequential = append(plan.Sequential, m)
-			}
-			stateMu.Unlock()
-			return plan
-		}
-		for _, m := range group.Models {
-			if reason := state.skipReasonLocked(m, payload, now); reason != "" {
-				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-				continue
-			}
-			plan.Parallel = append(plan.Parallel, m)
-		}
-		stateMu.Unlock()
-		return plan
-	}
-
-	activeIdx := -1
-	if activeModel != "" {
-		for i, m := range group.Models {
-			if m == activeModel {
-				activeIdx = i
-				break
-			}
+	if state != nil {
+		plan.PrevModel = state.Current
+		if state.conversationCompactedLocked(payload) {
+			beforeBytes, beforeMessages := state.LastPayloadBytes, state.LastMessageCount
+			plan.Compacted = true
+			state.Current = ""
+			state.Failures = make(map[string]*conversationFailure)
+			state.TipShown = false
+			state.CacheWarm = false
+			state.LastPayloadBytes = len(payload)
+			state.LastMessageCount = payloadMessageCount(payload)
+			savePersistedSessionsLocked()
+			logRoutingLocked(group, session, "compaction", fmt.Sprintf("payload %d to %d bytes, messages %d to %d", beforeBytes, len(payload), beforeMessages, state.LastMessageCount))
 		}
 	}
-
-	if activeIdx > 0 && (strategy == groupStrategyUpgrade || strategy == groupStrategyStick) {
-		var probeModels []string
-		for _, m := range group.Models[:activeIdx] {
-			if strategy == groupStrategyStick {
-				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: sticky to " + activeModel + " (cache warm)"})
-				continue
-			}
-			reason := state.skipReasonLocked(m, payload, now)
-			if reason != "" {
-				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-				continue
-			}
-			// If m has no recorded failure, only probe it once the active
-			// binding's idle window expires so normal consecutive turns stay
-			// pinned without racing.
-			if state.failure(m) == nil && cacheStickActive {
-				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: sticky to " + activeModel + " (cache warm)"})
-				continue
-			}
-			probeModels = append(probeModels, m)
-		}
-		if len(probeModels) > 0 {
-			plan.Parallel = append(plan.Parallel, probeModels...)
-			plan.Parallel = append(plan.Parallel, activeModel)
-			for _, m := range group.Models[activeIdx+1:] {
-				if reason := state.skipReasonLocked(m, payload, now); reason != "" {
-					plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-					continue
-				}
-				plan.Sequential = append(plan.Sequential, m)
-			}
-			stateMu.Unlock()
-			return plan
-		}
-		for _, m := range group.Models[activeIdx:] {
-			if reason := state.skipReasonLocked(m, payload, now); reason != "" {
-				plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-				continue
-			}
-			plan.Sequential = append(plan.Sequential, m)
-		}
-		// Keep earlier models at the tail only when nothing blocks retry.
-		for _, m := range group.Models[:activeIdx] {
-			if state.skipReasonLocked(m, payload, now) == "" {
-				plan.Sequential = append(plan.Sequential, m)
-			}
-		}
-		stateMu.Unlock()
-		return plan
+	active := ""
+	if state != nil {
+		active = state.Current
 	}
-
-	var eligible []string
-	for _, m := range group.Models {
-		if reason := state.skipReasonLocked(m, payload, now); reason != "" {
-			plan.Skipped = append(plan.Skipped, groupAttempt{Model: m, Result: "skipped: " + reason})
-			continue
-		}
-		eligible = append(eligible, m)
+	for i := range plan.Scores {
+		plan.Scores[i].Excluded = state.skipReasonLocked(plan.Scores[i].Model, payload, now)
 	}
 	stateMu.Unlock()
 
-	if activeIdx >= 0 && cacheStickActive && containsString(eligible, activeModel) && (strategy == groupStrategyQuota || strategy == groupStrategyRandom) {
-		var rest []string
-		for _, m := range eligible {
-			if m != activeModel {
-				rest = append(rest, m)
+	for i := range plan.Scores {
+		candidate := &plan.Scores[i]
+		if candidate.Excluded == "" {
+			reason, err := skipReason(cfg, candidate.Model, now)
+			if err != nil {
+				plan.Err = err
+				return plan
 			}
+			candidate.Excluded = reason
 		}
-		orderedRest := orderByStrategy(cfg, rest, strategy, now)
-		plan.Sequential = append(plan.Sequential, activeModel)
-		plan.Sequential = append(plan.Sequential, orderedRest...)
-		return plan
+		if candidate.Excluded != "" {
+			plan.Skipped = append(plan.Skipped, groupAttempt{Model: candidate.Model, Result: "skipped: " + candidate.Excluded})
+		} else if candidate.Model == active {
+			plan.Sticky = true
+		}
 	}
-
-	plan.Sequential = orderByStrategy(cfg, eligible, strategy, now)
+	setSelectionProbabilities(plan.Scores, active, plan.Sticky)
+	if session != "" {
+		stateMu.Lock()
+		reason := "weighted selection among close scores"
+		if plan.Sticky {
+			reason = "conversation pinned to " + active
+		}
+		recordDecision(decision{Time: now, Kind: "route", Model: group.ID, Session: session, AuthID: "selection", Reason: reason, Version: pluginVersion, Mode: group.Mode, ModelScores: append([]modelScore(nil), plan.Scores...)})
+		stateMu.Unlock()
+	}
 	return plan
+}
+
+func setSelectionProbabilities(scores []modelScore, active string, sticky bool) {
+	best := math.Inf(-1)
+	for i := range scores {
+		scores[i].Probability = 0
+		if scores[i].Excluded == "" && scores[i].Score > best {
+			best = scores[i].Score
+		}
+	}
+	total := 0.0
+	for i := range scores {
+		if scores[i].Excluded != "" {
+			continue
+		}
+		if sticky {
+			if scores[i].Model == active {
+				scores[i].Probability = 1
+			}
+		} else if best-scores[i].Score <= modelScoreTolerance {
+			scores[i].Probability = math.Exp((scores[i].Score-best)/modelScoreTemperature)
+			total += scores[i].Probability
+		}
+	}
+	if !sticky && total > 0 {
+		for i := range scores {
+			scores[i].Probability /= total
+		}
+	}
+}
+
+// Each unsuccessful attempt removes one candidate before recalculating the shortlist.
+func (p *groupRoutingPlan) nextModel(draw float64) (string, bool) {
+	if p.Err != nil {
+		return "", false
+	}
+	cumulative := 0.0
+	last := -1
+	for i := range p.Scores {
+		if p.Scores[i].Probability <= 0 {
+			continue
+		}
+		last = i
+		cumulative += p.Scores[i].Probability
+		if draw < cumulative {
+			last = i
+			break
+		}
+	}
+	if last < 0 {
+		return "", false
+	}
+	p.SelectedScores = append([]modelScore(nil), p.Scores...)
+	model := p.Scores[last].Model
+	p.Scores[last].Excluded = "attempted"
+	p.Sticky = false
+	setSelectionProbabilities(p.Scores, "", false)
+	return model, true
 }
 
 // recordConversationFailure records how a model failed within a conversation
 // so subsequent turns apply the right skip. Caller does not hold stateMu.
-func recordConversationFailure(session, groupID, model, rawDetail string, payloadBytes int, now time.Time) {
+func recordConversationFailure(session, groupID, model, rawDetail string, payload []byte, now time.Time) {
+	payloadBytes := len(payload)
 	if summarizeAttemptReason(rawDetail) == "insufficient quota" {
 		noteQuotaDenied(model, now)
 	}
@@ -327,6 +314,16 @@ func recordConversationFailure(session, groupID, model, rawDetail string, payloa
 		f = &conversationFailure{}
 		state.Failures[model] = f
 	}
+	if kind == "refusal" {
+		hash := refusalPayloadHash(payload)
+		switch {
+		case f.FirstRefusalHash == "" || f.FirstRefusalHash != hash:
+			f.FirstRefusalHash = hash
+			f.FirstRefusalNotified = true
+		default:
+			f.FirstRefusalNotified = false
+		}
+	}
 	f.Kind = kind
 	f.Reason = summarizeAttemptReason(rawDetail)
 	f.AtBytes = payloadBytes
@@ -336,22 +333,32 @@ func recordConversationFailure(session, groupID, model, rawDetail string, payloa
 	logRouting(modelGroup{ID: groupID}, session, "failure", model+" "+kind)
 }
 
-// promoteProbedModel promotes a probed higher-priority model that finished
-// prefetch without refusing after a faster fallback model won the parallel
-// race. Failure records are kept: a model that refused before stays refused.
-func promoteProbedModel(cfg pluginConfig, session, groupID, model string, now time.Time) {
-	if session == "" || groupID == "" || model == "" {
-		return
+// suppressedRefusals returns the set of models whose latest refusal is a
+// byte-identical repeat of an already-notified refusal. The flag is consumed:
+// a third identical refusal stays suppressed via the hash, a changed payload
+// re-notifies once.
+func suppressedRefusals(session, groupID string, models []string) map[string]bool {
+	out := make(map[string]bool)
+	if session == "" || groupID == "" {
+		return out
 	}
 	stateMu.Lock()
-	state := ensureConversationLocked(session, groupID, now)
-	prev := state.Current
-	state.Current = model
-	state.LastSeen = now
-	state.IdleExpiresAt = now.Add(time.Duration(cfg.IdleMinutes) * time.Minute)
-	savePersistedSessionsLocked()
-	stateMu.Unlock()
-	logRouting(modelGroup{ID: groupID}, session, "promote", prev+" -> "+model)
+	defer stateMu.Unlock()
+	state, ok := groupStates[session+"\x00"+groupID]
+	if !ok || state == nil {
+		return out
+	}
+	for _, model := range models {
+		f, ok := state.Failures[model]
+		if !ok || f == nil {
+			continue
+		}
+		if f.Kind == "refusal" && f.FirstRefusalHash != "" && !f.FirstRefusalNotified {
+			f.FirstRefusalNotified = true
+			out[model] = true
+		}
+	}
+	return out
 }
 
 // recordServed records the model that served a group request and returns the
@@ -366,9 +373,11 @@ func recordServed(cfg pluginConfig, session, groupID, served, prevFromLookup str
 	if prev == "" {
 		prev = state.Current
 	}
+	if state.Current != served || state.BoundAt.IsZero() {
+		state.BoundAt = now
+	}
 	state.Current = served
 	state.LastSeen = now
-	state.IdleExpiresAt = now.Add(time.Duration(cfg.IdleMinutes) * time.Minute)
 	state.Turns++
 	if len(payload) > 0 {
 		state.LastPayloadBytes = len(payload)
@@ -380,42 +389,18 @@ func recordServed(cfg pluginConfig, session, groupID, served, prevFromLookup str
 	return prev
 }
 
-// advanceConversationOnRefusal moves the conversation's current model to the
-// model after failedModel when a refusal happens mid-stream (after the
-// prefetch buffer was already flushed), so the client's immediate
-// continuation retry starts on the next model in the group. The failed model's
-// refusal record is kept.
+// A mid-stream refusal is already visible to the client; the continuation selects a fresh eligible model.
 func advanceConversationOnRefusal(session string, group modelGroup, failedModel string, now time.Time) {
-	if session == "" || len(group.Models) < 2 {
-		return
-	}
-	nextIdx := -1
-	for i, m := range group.Models {
-		if m == failedModel && i+1 < len(group.Models) {
-			nextIdx = i + 1
-			break
-		}
-	}
-	if nextIdx == -1 {
+	if session == "" {
 		return
 	}
 	stateMu.Lock()
 	state := ensureConversationLocked(session, group.ID, now)
-	f, ok := state.Failures[failedModel]
-	if !ok || f == nil {
-		f = &conversationFailure{}
-		state.Failures[failedModel] = f
-	}
-	f.Kind = "refusal"
-	f.Reason = "refusal: stream"
-	f.AtBytes = state.LastPayloadBytes
-	f.At = now
-	state.Current = group.Models[nextIdx]
+	state.Failures[failedModel] = &conversationFailure{Kind: "refusal", Reason: "refusal: stream", AtBytes: state.LastPayloadBytes, At: now}
 	state.LastSeen = now
-	state.IdleExpiresAt = now.Add(groupCacheTTL)
 	savePersistedSessionsLocked()
+	logRoutingLocked(group, session, "stream-refusal", failedModel+" refused; continuation reselects")
 	stateMu.Unlock()
-	logRouting(group, session, "stream-refusal", failedModel+" -> "+group.Models[nextIdx])
 }
 
 // observeConversationUsage updates cache telemetry from a streamed chunk.
@@ -467,18 +452,21 @@ func observeConversationUsage(session, groupID string, chunk []byte) {
 	stateMu.Unlock()
 }
 
-// compactionTipForSession returns one compaction tip when a large
-// conversation (>= 128 KB) first lands on a fallback because the primary
-// refused. Later turns stay quiet until compaction resets the tip state.
+// The tip appears once after a preferred model refuses a large conversation.
 func compactionTipForSession(cfg pluginConfig, session string, group modelGroup, attempts []groupAttempt, served string, payloadBytes int) string {
-	if !cfg.Features.ClientFallbackNotices || session == "" || len(group.Models) == 0 || served == group.Models[0] || payloadBytes < dilutionBaseBytes {
+	if !cfg.Features.ClientFallbackNotices || session == "" || payloadBytes < dilutionBaseBytes {
 		return ""
 	}
-	strategy := group.effectiveStrategy()
-	if strategy != groupStrategyUpgrade && strategy != groupStrategyStick {
+	bestScore := math.Inf(-1)
+	primary := ""
+	for _, candidate := range scoreModels(group) {
+		if candidate.Score > bestScore {
+			primary, bestScore = candidate.Model, candidate.Score
+		}
+	}
+	if primary == "" || primary == served {
 		return ""
 	}
-	primary := group.Models[0]
 	stateMu.Lock()
 	defer stateMu.Unlock()
 	state, ok := groupStates[session+"\x00"+group.ID]
@@ -502,8 +490,8 @@ func compactionTipForSession(cfg pluginConfig, session string, group modelGroup,
 	}
 	state.TipShown = true
 	savePersistedSessionsLocked()
-	logRoutingLocked(group, session, "tip", "primary "+primary+" refused; /compact retries")
-	return fmt.Sprintf("💡 Tip: compact history (`/compact`) if you want to retry this session with `%s`", primary)
+	logRoutingLocked(group, session, "tip", "preferred "+primary+" refused; /compact reselects")
+	return fmt.Sprintf("💡 Tip: compact history (`/compact`) to make `%s` eligible again", primary)
 }
 
 // conversationKey extracts the conversation identity for a group executor
@@ -596,13 +584,14 @@ func conversationKey(req executorRequest) string {
 	return key
 }
 
-// groupRoutingPlan describes which models to race in parallel and which to try sequentially.
 type groupRoutingPlan struct {
-	Parallel   []string
-	Sequential []string
-	Skipped    []groupAttempt
-	PrevModel  string
-	Compacted  bool
+	Scores         []modelScore
+	SelectedScores []modelScore
+	Skipped        []groupAttempt
+	PrevModel      string
+	Compacted      bool
+	Sticky         bool
+	Err            error
 }
 
 func payloadHasImage(payload []byte) bool {
@@ -648,21 +637,6 @@ func isAuxiliaryRequest(payload []byte) bool {
 		}
 	}
 	return false
-}
-func orderByStrategy(cfg pluginConfig, models []string, strategy string, now time.Time) []string {
-	if len(models) <= 1 {
-		return append([]string(nil), models...)
-	}
-	switch strategy {
-	case groupStrategyRandom:
-		out := append([]string(nil), models...)
-		rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
-		return out
-	case groupStrategyQuota:
-		return orderByQuotaWeightedRandom(cfg, models, now)
-	default:
-		return append([]string(nil), models...)
-	}
 }
 func extractUsageFromJSON(raw []byte) (inputTok, cacheReadTok, cacheCreateTok int, found bool) {
 	var env struct {
@@ -732,74 +706,6 @@ func extractUsageFromJSON(raw []byte) (inputTok, cacheReadTok, cacheCreateTok in
 	return 0, 0, 0, false
 }
 
-// hours_to_reset), so usage spreads across providers proportional to available quota per hour.
-func orderByQuotaWeightedRandom(cfg pluginConfig, models []string, now time.Time) []string {
-	weights := make([]float64, len(models))
-	var positiveRates []float64
-	snapshot, errHost := hostState(now)
-	if errHost == nil && cfg.ManagementKey != "" {
-		ensureQuotaFresh(cfg.ManagementKey, snapshot.auths)
-		for i, model := range models {
-			bestRate := 0.0
-			sawCred := false
-			allExhausted := true
-			for _, auth := range snapshot.auths {
-				if auth.Disabled || !containsString(snapshot.models[auth.ID], model) {
-					continue
-				}
-				sawCred = true
-				entry := rankEntry{AuthID: auth.ID, Provider: auth.Provider}
-				rateCredential(&entry, model, cfg.MinRemaining, now)
-				if entry.Excluded == "" && entry.Rate > bestRate {
-					bestRate = entry.Rate
-					allExhausted = false
-				} else if !strings.Contains(entry.Excluded, "% left") {
-					allExhausted = false
-				}
-			}
-			if bestRate > 0 {
-				weights[i] = bestRate
-				positiveRates = append(positiveRates, bestRate)
-			} else if sawCred && allExhausted {
-				weights[i] = 1e-9
-			}
-		}
-	}
-	fallbackWeight := 1.0
-	if len(positiveRates) > 0 {
-		sum := 0.0
-		for _, r := range positiveRates {
-			sum += r
-		}
-		fallbackWeight = sum / float64(len(positiveRates))
-	}
-	type scoredModel struct {
-		model string
-		score float64
-	}
-	scored := make([]scoredModel, len(models))
-	for i, m := range models {
-		w := weights[i]
-		if w <= 0 {
-			w = fallbackWeight
-		}
-		u := rand.Float64()
-		if u <= 1e-12 {
-			u = 1e-12
-		}
-		// Efraimidis-Spirakis key u^(1/w); higher key (log(u)/w closer to 0) wins.
-		scored[i] = scoredModel{model: m, score: math.Log(u) / w}
-	}
-	sort.SliceStable(scored, func(i, j int) bool {
-		return scored[i].score > scored[j].score
-	})
-	out := make([]string, len(models))
-	for i, s := range scored {
-		out[i] = s.model
-	}
-	return out
-}
-
 // conversationBindingView projects a conversationState for the sessionBinding
 // consumers (UI, persistence migration).
 func conversationBindingView(s *conversationState) sessionBinding {
@@ -811,7 +717,7 @@ func conversationBindingView(s *conversationState) sessionBinding {
 		AuthID:           s.Current,
 		Provider:         groupProvider,
 		LastSeen:         s.LastSeen,
-		IdleExpiresAt:    s.IdleExpiresAt,
+		BoundAt:          s.BoundAt,
 		Turns:            s.Turns,
 		LastPayloadBytes: s.LastPayloadBytes,
 		LastMessageCount: s.LastMessageCount,
@@ -831,12 +737,119 @@ func conversationBindingView(s *conversationState) sessionBinding {
 	return view
 }
 
-// conversationCandidateOrder returns the model order to try for a group request, any initial sticky-skip
-// attempt records, and the model that served the previous turn in this conversation (if any).
-func conversationCandidateOrder(cfg pluginConfig, session string, group modelGroup, now time.Time) (order []string, skipped []groupAttempt, prevModel string) {
-	plan := planConversation(cfg, session, group, nil, now)
-	order = make([]string, 0, len(plan.Parallel)+len(plan.Sequential))
-	order = append(order, plan.Parallel...)
-	order = append(order, plan.Sequential...)
-	return order, plan.Skipped, plan.PrevModel
+// trailEntry is one persisted routing event for a conversation.
+type trailEntry struct {
+	Time        time.Time    `json:"time"`
+	Version     string       `json:"version"`
+	Mode        string       `json:"mode,omitempty"`
+	ModelScores []modelScore `json:"model_scores,omitempty"`
+	Event       string       `json:"event"`
+	Model       string       `json:"model"`
+	Reason      string       `json:"reason"`
+}
+
+// buildConversationTrail returns the full decision trail for one conversation
+// key (as recorded in the decision ring buffer), newest first. Key is the
+// conversation key (optionally group-qualified with \x00groupID); the empty
+// key returns every decision.
+func buildConversationTrail(key string) []trailEntry {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	out := make([]trailEntry, 0, len(decisions))
+	for i := len(decisions) - 1; i >= 0; i-- {
+		d := decisions[i]
+		if key != "" && d.Session != key && !strings.HasPrefix(d.Session, key+"\x00") {
+			continue
+		}
+		out = append(out, trailEntry{Time: d.Time, Version: d.Version, Event: d.AuthID, Model: d.Model, Reason: d.Reason, Mode: d.Mode, ModelScores: d.ModelScores})
+	}
+	return out
+}
+
+// drainConversationState removes one conversation's routing state without
+// restarting the proxy. An empty groupID drains every group for the key.
+func drainConversationState(key, groupID string) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if key == "" {
+		return
+	}
+	if groupID != "" {
+		delete(groupStates, key+"\x00"+groupID)
+	} else {
+		prefix := key + "\x00"
+		for full := range groupStates {
+			if strings.HasPrefix(full, prefix) {
+				delete(groupStates, full)
+			}
+		}
+	}
+	savePersistedSessionsLocked()
+}
+
+// routingMetrics aggregates routing decisions for the UI chart row.
+type routingMetrics struct {
+	RefusalsByModelAndCategory map[string]int `json:"refusals_by_model_category"`
+	FallbackRate               float64        `json:"fallback_rate"`
+	CompactionResets           int            `json:"compaction_resets"`
+	SuppressedNotices          int            `json:"suppressed_notices"`
+	TurnsOnFallback            int            `json:"turns_on_fallback"`
+}
+
+// computeRoutingMetrics aggregates live failures and retained routing decisions.
+func computeRoutingMetrics() routingMetrics {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	m := routingMetrics{RefusalsByModelAndCategory: make(map[string]int)}
+	for _, state := range groupStates {
+		for model, f := range state.Failures {
+			if f == nil {
+				continue
+			}
+			if f.Kind == "refusal" {
+				category := f.Reason
+				if category == "" {
+					category = "refusal"
+				}
+				m.RefusalsByModelAndCategory[fmt.Sprintf("%s (%s)", model, category)]++
+			}
+		}
+	}
+	served, failed := 0, 0
+	for _, d := range decisions {
+		switch d.Kind {
+		case "route":
+			switch d.AuthID {
+			case "compaction":
+				m.CompactionResets++
+			case "failure":
+				failed++
+			case "tip":
+			}
+		case "group":
+			if d.AuthID != "" {
+				served++
+				for _, attempt := range d.Attempts {
+					if strings.HasPrefix(attempt.Result, "failed:") {
+						m.TurnsOnFallback++
+						break
+					}
+				}
+			}
+		}
+	}
+	if total := served + failed; total > 0 {
+		m.FallbackRate = float64(failed) / float64(total)
+	}
+	return m
+}
+
+// refusalPayloadHash returns a stable digest of the request payload, used to
+// detect a byte-identical repeat refusal.
+func refusalPayloadHash(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
 }

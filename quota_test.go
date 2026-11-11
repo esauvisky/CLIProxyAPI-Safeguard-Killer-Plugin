@@ -422,6 +422,13 @@ func TestQuotaParsePluginQuota(t *testing.T) {
 				{Name: "B: weekly", Remaining: 0, Period: quotaTestWeek},
 			},
 		},
+		{
+			name: "credit balance has no period or reset",
+			body: `{"groups": [{"displayName": "Experiential Labs Credits", "buckets": [{"window": "balance", "remainingFraction": 0.4, "description": "$4.0000 of $10.0000 credits remaining"}]}]}`,
+			want: []quotaWindow{
+				{Name: "balance", Remaining: 0.4},
+			},
+		},
 		{name: "missing remainingFraction", body: `{"groups": [{"displayName": "A", "buckets": [{"window": "5h"}]}]}`, wantErr: "remainingFraction missing"},
 		{name: "no buckets", body: `{"summary": [{"key": "balance", "label": "Balance", "value": 3}]}`, wantErr: "no buckets"},
 	}

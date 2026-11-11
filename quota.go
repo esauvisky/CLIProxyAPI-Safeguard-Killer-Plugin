@@ -387,6 +387,9 @@ func bucketPeriod(provider, window string) (time.Duration, error) {
 		return 7 * 24 * time.Hour, nil
 	case "monthly", "month":
 		return quotaMonth, nil
+	case "balance":
+		// A prepaid credit balance never refills on a schedule.
+		return 0, nil
 	}
 	return 0, fmt.Errorf("%s: unknown bucket window %q", provider, window)
 }

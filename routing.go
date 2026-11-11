@@ -42,7 +42,7 @@ type conversationState struct {
 
 // skipReasonLocked returns why model should not be attempted for payload, or "".
 // A nil receiver means the conversation has no state yet: nothing is skipped.
-func (s *conversationState) skipReasonLocked(model string, payload []byte, now time.Time) string {
+func (s *conversationState) skipReasonLocked(model string, payload []byte) string {
 	if s == nil || len(s.Failures) == 0 {
 		return ""
 	}
@@ -70,11 +70,6 @@ func (s *conversationState) skipReasonLocked(model string, payload []byte, now t
 		// conversation. Growing the conversation does not call the refused
 		// model again.
 		return f.Reason
-	case "transient":
-		if s.Current != "" && s.Current != model && now.Sub(f.At) < transientErrorCooldown {
-			return "sticky to " + s.Current + " (cache warm)"
-		}
-		return ""
 	}
 	return ""
 }
@@ -203,7 +198,7 @@ func planConversation(cfg pluginConfig, session string, group modelGroup, payloa
 		active = state.Current
 	}
 	for i := range plan.Scores {
-		plan.Scores[i].Excluded = state.skipReasonLocked(plan.Scores[i].Model, payload, now)
+		plan.Scores[i].Excluded = state.skipReasonLocked(plan.Scores[i].Model, payload)
 	}
 	stateMu.Unlock()
 

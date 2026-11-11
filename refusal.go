@@ -20,7 +20,6 @@ const (
 	compactionMinPrevBytes = 32 * 1024
 	compactionMinMessages  = 8
 	compactionShrinkRatio  = 0.70
-	transientErrorCooldown = 2 * time.Minute
 	// quotaDenialFallback is how long a model stays uncalled after upstream insufficient_quota when
 	// no quota window gives a reset time. The snapshot often still shows headroom (it tracks rate
 	// windows, not the credit balance that returns this error), so the rejection itself is the signal.
@@ -209,7 +208,7 @@ func summarizeAttemptReason(detail string) string {
 		return "rate limited"
 	case strings.Contains(lower, "largest context window") || strings.Contains(lower, "context_length_exceeded"):
 		return "context too long"
-	case strings.Contains(lower, "carries an image") || strings.Contains(lower, "accepts text only"):
+	case strings.Contains(lower, "carries an image") || strings.Contains(lower, "accepts text only") || strings.Contains(lower, "image input is not supported"):
 		return "no vision"
 	case strings.Contains(lower, "capability 'tools' is not supported"):
 		return "no tools"

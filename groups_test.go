@@ -918,6 +918,105 @@ func TestGroupPinnedModelQuotaTriggersReselection(t *testing.T) {
 	}
 }
 
+func TestGroupTransientFailuresDoNotBlockRecovery(t *testing.T) {
+	for _, failure := range []string{"", "empty response (no text or tool calls)", "no tools", "quota", "removed"} {
+		name := failure
+		if name == "" {
+			name = "pinned model fails during request"
+		}
+		t.Run(name, func(t *testing.T) {
+			resetHostState(t)
+			cfg := defaultPluginConfig()
+			group := modelGroup{ID: "g", Mode: groupModeQuality, Models: ratedGroupModels("claude-opus-5-5", "gemini-4-argon-high", "other")}
+			now := time.Now()
+			payload := []byte(`{"messages":[{"role":"user","content":"work"}]}`)
+			for _, model := range []string{"gemini-4-argon-high", "other"} {
+				recordConversationFailure("session", group.ID, model, "upstream 500", payload, now)
+			}
+			recordServed(cfg, "session", group.ID, "claude-opus-5-5", "", payload, now)
+			switch failure {
+			case "":
+			case "quota":
+				quotaMu.Lock()
+				quotaDenials["claude-opus-5-5"] = now.Add(time.Hour)
+				quotaMu.Unlock()
+				t.Cleanup(func() {
+					quotaMu.Lock()
+					delete(quotaDenials, "claude-opus-5-5")
+					quotaMu.Unlock()
+				})
+			case "removed":
+				group.Models = group.Models[1:]
+			default:
+				recordConversationFailure("session", group.ID, "claude-opus-5-5", failure, payload, now)
+			}
+			plan := planConversation(cfg, "session", group, payload, now)
+			if plan.Err != nil || plan.Sticky != (failure == "") {
+				t.Fatalf("recovery plan = %+v", plan)
+			}
+			for _, score := range plan.Scores {
+				if score.Model != "claude-opus-5-5" && score.Excluded != "" {
+					t.Fatalf("alternative blocked by failed pinned model: %+v", score)
+				}
+			}
+			if failure == "" {
+				for _, score := range plan.Scores {
+					if score.Model != "claude-opus-5-5" && score.Probability != 0 {
+						t.Fatalf("healthy pin lost stickiness: %+v", score)
+					}
+				}
+				if model, ok := plan.nextModel(0); !ok || model != "claude-opus-5-5" {
+					t.Fatalf("sticky draw = %q, %v", model, ok)
+				}
+				recordConversationFailure("session", group.ID, "claude-opus-5-5", "empty response (no text or tool calls)", payload, now)
+			}
+			for _, want := range []string{"gemini-4-argon-high", "other"} {
+				if model, ok := plan.nextModel(0); !ok || model != want {
+					t.Fatalf("recovery draw = %q, %v, want %q", model, ok, want)
+				}
+			}
+			if model, ok := plan.nextModel(0); ok || model != "" {
+				t.Fatalf("exhausted draw = %q, %v", model, ok)
+			}
+		})
+	}
+}
+
+func TestGroupImageInputUnsupportedIsRemembered(t *testing.T) {
+	resetHostState(t)
+	cfg := defaultPluginConfig()
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: ratedGroupModels("dsv41-flash", "vision")}
+	now := time.Now()
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aW1hZ2U="}}]}]}`)
+	detail := `host callback host.model.execute_stream: {"error":{"code":500,"message":"image input is not supported - hint: if this is unexpected, you may need to provide the mmproj","type":"server_error"}}`
+	if got := classifyAttemptFailure(detail); got != "no_vision" {
+		t.Fatalf("image rejection classified as %q, want no_vision", got)
+	}
+	recordConversationFailure("session", group.ID, "dsv41-flash", detail, payload, now)
+	recordServed(cfg, "session", group.ID, "vision", "", payload, now)
+	plan := planConversation(cfg, "session", group, payload, now.Add(time.Hour))
+	if plan.Err != nil || len(plan.Skipped) != 1 || plan.Scores[0].Excluded != "no vision" {
+		t.Fatalf("image rejection was not remembered: %+v", plan)
+	}
+	if model, ok := plan.nextModel(0); !ok || model != "vision" {
+		t.Fatalf("vision draw = %q, %v", model, ok)
+	}
+	if model, ok := plan.nextModel(0); ok || model != "" {
+		t.Fatalf("image-incompatible model retried: %q, %v", model, ok)
+	}
+	textPayload := []byte(`{"messages":[{"role":"user","content":"text only"}]}`)
+	plan = planConversation(cfg, "session", group, textPayload, now.Add(time.Hour))
+	if plan.Err != nil || len(plan.Skipped) != 0 || !plan.Sticky {
+		t.Fatalf("text-only plan = %+v", plan)
+	}
+	if model, ok := plan.nextModel(0); !ok || model != "vision" {
+		t.Fatalf("text-only sticky draw = %q, %v", model, ok)
+	}
+	if model, ok := plan.nextModel(0); !ok || model != "dsv41-flash" {
+		t.Fatalf("text-only recovery draw = %q, %v", model, ok)
+	}
+}
+
 func TestGroupPlanPropagatesHostFailure(t *testing.T) {
 	resetHostState(t)
 	want := errors.New("host metadata unavailable")

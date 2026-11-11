@@ -52,15 +52,21 @@ type hostAuthListResponse struct {
 
 type hostAuthModelsResponse struct {
 	Credentials []struct {
-		ID     string   `json:"id"`
-		Models []string `json:"models"`
+		ID        string   `json:"id"`
+		AuthIndex string   `json:"auth_index"`
+		Provider  string   `json:"provider"`
+		Models    []string `json:"models"`
 	} `json:"credentials"`
 }
 
 type hostSnapshot struct {
-	auths     []hostAuth
-	models    map[string][]string
-	fetchedAt time.Time
+	auths  []hostAuth
+	models map[string][]string
+	// synthesized holds the IDs of credentials with no backing auth file, reported only by
+	// host.auth.models (config-synthesized openai-compatibility providers). They carry no
+	// management record, so their weight and quota are defaulted rather than required.
+	synthesized map[string]struct{}
+	fetchedAt   time.Time
 }
 
 var (
@@ -102,7 +108,25 @@ func hostState(now time.Time) (hostSnapshot, error) {
 	for _, credential := range modelsResp.Credentials {
 		models[credential.ID] = credential.Models
 	}
-	hostCache = hostSnapshot{auths: list.Files, models: models, fetchedAt: now}
+	// host.auth.list omits credentials with no backing auth file (config-synthesized
+	// openai-compatibility providers), but host.auth.models reports them from the full
+	// auth manager. Take the union so a candidate the host offers is never rejected as
+	// absent; the models response is authoritative for "this credential exists".
+	auths := make([]hostAuth, 0, len(list.Files)+len(modelsResp.Credentials))
+	seen := make(map[string]struct{}, len(list.Files))
+	for _, auth := range list.Files {
+		auths = append(auths, auth)
+		seen[auth.ID] = struct{}{}
+	}
+	synthesized := make(map[string]struct{}, len(modelsResp.Credentials))
+	for _, credential := range modelsResp.Credentials {
+		if _, ok := seen[credential.ID]; ok {
+			continue
+		}
+		auths = append(auths, hostAuth{ID: credential.ID, AuthIndex: credential.AuthIndex, Provider: credential.Provider})
+		synthesized[credential.ID] = struct{}{}
+	}
+	hostCache = hostSnapshot{auths: auths, models: models, synthesized: synthesized, fetchedAt: now}
 	return hostCache, nil
 }
 
@@ -152,7 +176,7 @@ func pick(req schedulerPickRequest, cfg pluginConfig, now time.Time) (schedulerP
 		return schedulerPickResponse{}, errAuths
 	}
 	ensureQuotaFresh(cfg.ManagementKey, auths)
-	if errWeights := loadAuthWeights(cfg.ManagementKey, ids, now); errWeights != nil {
+	if errWeights := loadAuthWeights(cfg.ManagementKey, ids, snapshot.synthesized, now); errWeights != nil {
 		return schedulerPickResponse{}, errWeights
 	}
 	session := sessionKey(req.Options.Metadata)

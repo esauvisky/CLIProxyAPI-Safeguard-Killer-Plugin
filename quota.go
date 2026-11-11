@@ -1274,8 +1274,10 @@ const authWeightTTL = 5 * time.Minute
 // loadAuthWeights reads the per-credential weight from the management auth-files list when the
 // cache is older than authWeightTTL or lacks one of ids. It holds authWeightMu across the fetch
 // so concurrent picks share one management call. Any failure (management unavailable, an
-// invalid weight, a credential missing from the list) is returned.
-func loadAuthWeights(key string, ids []string, now time.Time) error {
+// invalid weight, a credential with a backing file missing from the list) is returned.
+// synthesized names credentials with no backing auth file, whose weight the management list
+// cannot carry; they default to 1 (the same weight an unset value gets).
+func loadAuthWeights(key string, ids []string, synthesized map[string]struct{}, now time.Time) error {
 	authWeightMu.Lock()
 	defer authWeightMu.Unlock()
 	if !authWeightsAt.IsZero() && now.Sub(authWeightsAt) < authWeightTTL && hasAuthWeights(ids) {
@@ -1302,9 +1304,15 @@ func loadAuthWeights(key string, ids []string, now time.Time) error {
 		weights[file.ID] = weight
 	}
 	for _, id := range ids {
-		if _, ok := weights[id]; !ok {
-			return fmt.Errorf("load account weights: credential %s is not in the management auth-files list", id)
+		if _, ok := weights[id]; ok {
+			continue
 		}
+		if _, ok := synthesized[id]; ok {
+			// No backing auth file, so the management list cannot carry its weight.
+			weights[id] = 1
+			continue
+		}
+		return fmt.Errorf("load account weights: credential %s is not in the management auth-files list", id)
 	}
 	authWeights = weights
 	authWeightsAt = now

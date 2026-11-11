@@ -32,21 +32,31 @@ func weekly(remaining float64, resetIn time.Duration) quotaWindow {
 // and delegates every other method to other.
 func fakeHost(t *testing.T, models []string, other func(method string, payload any) (json.RawMessage, error), ids ...string) {
 	t.Helper()
+	fakeHostSplit(t, models, other, ids, ids)
+}
+
+// fakeHostSplit answers the two host callbacks with independent ID sets, so a test can reproduce
+// a credential the host offers as a candidate (present in host.auth.models) but omits from
+// host.auth.list, as config-synthesized openai-compatibility providers are.
+func fakeHostSplit(t *testing.T, models []string, other func(method string, payload any) (json.RawMessage, error), listIDs, modelIDs []string) {
+	t.Helper()
 	hostCall = func(method string, payload any) (json.RawMessage, error) {
 		switch method {
 		case methodHostAuthList:
-			files := make([]hostAuth, 0, len(ids))
-			for index, id := range ids {
+			files := make([]hostAuth, 0, len(listIDs))
+			for index, id := range listIDs {
 				files = append(files, hostAuth{ID: id, AuthIndex: string(rune('a' + index)), Provider: "claude"})
 			}
 			return json.Marshal(hostAuthListResponse{Files: files})
 		case methodHostAuthModels:
 			var resp hostAuthModelsResponse
-			for _, id := range ids {
+			for _, id := range modelIDs {
 				resp.Credentials = append(resp.Credentials, struct {
-					ID     string   `json:"id"`
-					Models []string `json:"models"`
-				}{ID: id, Models: models})
+					ID        string   `json:"id"`
+					AuthIndex string   `json:"auth_index"`
+					Provider  string   `json:"provider"`
+					Models    []string `json:"models"`
+				}{ID: id, Provider: "claude", Models: models})
 			}
 			return json.Marshal(resp)
 		}
@@ -362,6 +372,23 @@ func TestPickFailsWhenWeightsUnavailable(t *testing.T) {
 	setQuota(t, "b", weekly(0.5, 24*time.Hour))
 	if _, errPick := pick(pickReq("", "a", "b"), balanceConfig(), testNow); errPick == nil || !strings.Contains(errPick.Error(), "credential b is not in") {
 		t.Fatalf("pick() error = %v, want missing credential error", errPick)
+	}
+}
+
+// A config-synthesized openai-compatibility provider has no backing auth file: it is reported by
+// host.auth.models but omitted from host.auth.list and the management weight list. The picker must
+// still consider it instead of rejecting it as absent from the host credential list.
+func TestPickIncludesSynthesizedCredentialMissingFromHostList(t *testing.T) {
+	fakeHostSplit(t, []string{"claude-opus-4-8"}, noOther(t), []string{"a"}, []string{"a", "modal"})
+	fakeWeights(t, `{"files":[{"id":"a"}]}`)
+	setQuota(t, "a", weekly(0.1, 144*time.Hour))
+	setQuota(t, "modal", weekly(0.9, 24*time.Hour))
+	resp, errPick := pick(pickReq("", "a", "modal"), balanceConfig(), testNow)
+	if errPick != nil {
+		t.Fatalf("pick() error = %v, want success", errPick)
+	}
+	if resp.AuthID != "modal" {
+		t.Fatalf("pick() = %+v, want modal (higher remaining quota)", resp)
 	}
 }
 

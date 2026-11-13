@@ -443,10 +443,11 @@ const uiHTML = `<!doctype html>
   .group-head { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
   .group-head .field { flex: 1; min-width: 180px; }
   .model-list { list-style: none; margin: 10px 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-  .model-row { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 6px; }
-  .model-row .model-id { flex: 1; min-width: 160px; }
-  .model-row .model-rating { width: 100px; }
-  .model-row .model-score { min-width: 200px; align-self: center; padding-bottom: 2px; }
+  .model-row { display: grid; grid-template-columns: minmax(160px, 1fr) 100px 100px 270px 72px auto; align-items: end; gap: 6px; }
+  .model-row .model-score { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-bottom: 7px; }
+  .model-row .btn { padding: 7px 10px; font-size: 13px; justify-content: center; }
+  .model-row .model-toggle { width: 100%; }
+  .model-row.disabled .field { opacity: 0.45; }
   .add-row { display: flex; gap: 6px; align-items: center; }
   .attempts { margin: 6px 0 0; padding-left: 20px; font-size: 12px; }
   .attempts li { padding: 1px 4px; border-radius: 4px; }
@@ -902,7 +903,7 @@ function canonConfig(cfg) {
     min_remaining: cfg.min_remaining,
     idle_minutes: cfg.idle_minutes,
     stream_prefetch_bytes: cfg.stream_prefetch_bytes,
-    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: m.quality, cost: m.cost })) })),
+    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: m.quality, cost: m.cost, disabled: m.disabled === true })) })),
     features: featuresOf(cfg),
   });
 }
@@ -920,7 +921,7 @@ function loadDraft(cfg) {
       key: '',
     },
     features: featuresOf(cfg),
-    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: String(m.quality), cost: String(m.cost) })), pending: '' })),
+    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: String(m.quality), cost: String(m.cost), disabled: m.disabled === true })), pending: '' })),
   };
   draftSourceCanon = canonConfig(cfg);
   for (const el of document.querySelectorAll('[data-setting]')) el.value = draft.settings[el.dataset.setting];
@@ -962,7 +963,11 @@ function validateDraft() {
 
   const groups = draft.groups.map(g => ({
     id: g.id.trim(), name: g.name.trim(), mode: g.mode,
-    models: g.models.map(m => ({ id: m.id.trim(), quality: parseNum(m.quality), cost: parseNum(m.cost) })),
+    models: g.models.map(m => {
+      const out = { id: m.id.trim(), quality: parseNum(m.quality), cost: parseNum(m.cost) };
+      if (m.disabled) out.disabled = true;
+      return out;
+    }),
   }));
   const ids = new Set();
   groups.forEach((g, i) => {
@@ -972,6 +977,7 @@ function validateDraft() {
     ids.add(g.id);
     if (g.name === '') errors.push(['groups.' + i + '.name', label + ' needs a name']);
     if (g.models.length === 0) errors.push(['groups.' + i + '.add', label + ' needs at least one model']);
+    else if (g.models.every(m => m.disabled)) errors.push(['groups.' + i + '.add', label + ' needs at least one enabled model']);
     if (g.mode !== 'quality' && g.mode !== 'cost') errors.push(['groups.' + i + '.mode', label + ': select Quality first or Lower cost first']);
     const modelIDs = new Set();
     g.models.forEach((m, j) => {
@@ -1130,7 +1136,7 @@ const MODE_HINTS = {
 };
 
 // Mirrors scoreModels and setSelectionProbabilities in routing.go for a new conversation in which
-// every model is eligible.
+// every enabled model is eligible.
 const SCORE_TOLERANCE = 3;
 const SCORE_TEMPERATURE = 1;
 
@@ -1139,15 +1145,16 @@ function draftModelScores(g) {
     const q = parseNum(String(m.quality));
     const c = parseNum(String(m.cost));
     const valid = Number.isFinite(q) && Number.isFinite(c) && q >= 0 && q <= 100 && c >= 0 && c <= 100;
+    if (m.disabled) return { valid: true, disabled: true };
     if (!valid || (g.mode !== 'quality' && g.mode !== 'cost')) return { valid: false };
     const score = g.mode === 'quality' ? 0.8 * q - 0.2 * c : 0.2 * q - 0.8 * c;
-    return { valid: true, score: score, probability: 0, gap: 0, inPool: false };
+    return { valid: true, disabled: false, score: score, probability: 0, gap: 0, inPool: false };
   });
   let best = -Infinity;
-  for (const e of out) if (e.valid && e.score > best) best = e.score;
+  for (const e of out) if (e.valid && !e.disabled && e.score > best) best = e.score;
   let total = 0;
   for (const e of out) {
-    if (!e.valid) continue;
+    if (!e.valid || e.disabled) continue;
     e.gap = best - e.score;
     e.inPool = e.gap <= SCORE_TOLERANCE;
     if (e.inPool) {
@@ -1161,6 +1168,7 @@ function draftModelScores(g) {
 
 function renderScoreCell(e) {
   if (!e.valid) return '<span class="subtle">score: needs valid ratings</span>';
+  if (e.disabled) return '<span class="badge bad">disabled</span> <span class="subtle">not routed</span>';
   const score = 'score <span class="mono">' + e.score.toFixed(1) + '</span>';
   if (e.inPool) {
     return '<span class="badge ok">in pool</span> ' + score + ' · <span class="mono">' + (e.probability * 100).toFixed(1) + '%</span>';
@@ -1186,7 +1194,7 @@ function renderGroups() {
   root.innerHTML = draft.groups.map((g, i) => {
     const scores = draftModelScores(g);
     const models = g.models.map((m, j) =>
-      '<li class="model-row">' +
+      '<li class="model-row' + (m.disabled ? ' disabled' : '') + '">' +
         '<label class="field model-id"><span class="cfg-key">Model ID</span>' +
           '<input class="input mono" list="modelList" value="' + esc(m.id) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="id"' + groupFieldAttr(i, 'models.' + j + '.id') + '></label>' +
         '<label class="field model-rating"><span class="cfg-key">Quality</span>' +
@@ -1194,6 +1202,7 @@ function renderGroups() {
         '<label class="field model-rating"><span class="cfg-key">Cost</span>' +
           '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.cost) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="cost"' + groupFieldAttr(i, 'models.' + j + '.cost') + '></label>' +
         '<div class="model-score small" data-score-cell="' + i + '.' + j + '">' + renderScoreCell(scores[j]) + '</div>' +
+        '<button class="btn sm model-toggle" data-action="model-toggle" data-group="' + i + '" data-model="' + j + '">' + (m.disabled ? 'Enable' : 'Disable') + '</button>' +
         '<button class="btn sm danger" data-action="model-remove" data-group="' + i + '" data-model="' + j + '" title="Remove">&times;</button>' +
       '</li>'
     ).join('');
@@ -1224,7 +1233,7 @@ function addPendingModel(gi) {
   const g = draft.groups[gi];
   const m = g.pending.trim();
   if (m === '') return;
-  g.models.push({ id: m, quality: '50', cost: '50' });
+  g.models.push({ id: m, quality: '50', cost: '50', disabled: false });
   g.pending = '';
   setDirty(true);
   renderGroups();
@@ -1244,6 +1253,7 @@ function onEditorClick(ev) {
     if (action === 'group-remove') draft.groups.splice(gi, 1);
     else if (action === 'model-add') { addPendingModel(gi); return; }
     else if (action === 'model-remove') g.models.splice(mi, 1);
+    else if (action === 'model-toggle') g.models[mi].disabled = !g.models[mi].disabled;
     else throw new Error('unknown editor action ' + action);
   }
   setDirty(true);

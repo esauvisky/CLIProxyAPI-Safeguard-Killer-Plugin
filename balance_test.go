@@ -294,6 +294,7 @@ func TestValidateConfigGroups(t *testing.T) {
 		"used twice":    {{ID: "g", Name: "G", Mode: groupModeQuality, Models: m}, {ID: "g", Name: "H", Mode: groupModeQuality, Models: m}},
 		"groups cannot": {{ID: "g", Name: "G", Mode: groupModeQuality, Models: []groupModel{{ID: "h"}}}, {ID: "h", Name: "H", Mode: groupModeQuality, Models: m}},
 		"needs an id":   {{Name: "G", Mode: groupModeQuality, Models: m}},
+		"one enabled":   {{ID: "g", Name: "G", Mode: groupModeQuality, Models: []groupModel{{ID: "m", Disabled: true}}}},
 	}
 	for want, groups := range cases {
 		cfg := defaultPluginConfig()

@@ -1145,3 +1145,15 @@ func TestWeightedCredentialRanking(t *testing.T) {
 		t.Fatalf("weights/scores wrong: %+v", ranking)
 	}
 }
+
+func TestDisabledGroupModelIsNotScored(t *testing.T) {
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: []groupModel{{ID: "off", Quality: 100, Disabled: true}, {ID: "on", Quality: 50}}}
+	scores := scoreModels(group)
+	if len(scores) != 1 || scores[0].Model != "on" {
+		t.Fatalf("scores = %+v, want only the enabled model", scores)
+	}
+	var parsed groupModel
+	if err := yaml.Unmarshal([]byte("{id: off, quality: 1, cost: 2, disabled: true}"), &parsed); err != nil || !parsed.Disabled {
+		t.Fatalf("yaml disabled = %+v, %v", parsed, err)
+	}
+}

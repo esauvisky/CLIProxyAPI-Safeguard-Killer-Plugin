@@ -157,6 +157,9 @@ type modelScore struct {
 func scoreModels(group modelGroup) []modelScore {
 	scores := make([]modelScore, 0, len(group.Models))
 	for _, model := range group.Models {
+		if model.Disabled {
+			continue
+		}
 		var score float64
 		switch group.Mode {
 		case groupModeQuality:

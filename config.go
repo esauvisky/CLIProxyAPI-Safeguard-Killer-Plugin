@@ -113,6 +113,8 @@ type groupModel struct {
 	ID      string  `yaml:"id" json:"id"`
 	Quality float64 `yaml:"quality" json:"quality"`
 	Cost    float64 `yaml:"cost" json:"cost"`
+	// Disabled keeps the entry and its ratings in the config but takes it out of routing.
+	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
 func (g *modelGroup) UnmarshalJSON(raw []byte) error {
@@ -152,6 +154,7 @@ func (m *groupModel) UnmarshalJSON(raw []byte) error {
 		ID string `json:"id"`
 		Quality *float64 `json:"quality"`
 		Cost *float64 `json:"cost"`
+		Disabled bool `json:"disabled"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -161,17 +164,17 @@ func (m *groupModel) UnmarshalJSON(raw []byte) error {
 	if decoded.Quality == nil || decoded.Cost == nil {
 		return fmt.Errorf("model %q needs explicit quality and cost ratings (0–100)", decoded.ID)
 	}
-	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost}
+	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost, Disabled: decoded.Disabled}
 	return nil
 }
 
 func (m *groupModel) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("model must be {id, quality, cost}; string model lists are no longer supported")
+		return fmt.Errorf("model must be {id, quality, cost, disabled?}; string model lists are no longer supported")
 	}
 	for i := 0; i < len(node.Content); i += 2 {
 		switch node.Content[i].Value {
-		case "id", "quality", "cost":
+		case "id", "quality", "cost", "disabled":
 		default:
 			return fmt.Errorf("unknown model field %q", node.Content[i].Value)
 		}
@@ -180,6 +183,7 @@ func (m *groupModel) UnmarshalYAML(node *yaml.Node) error {
 		ID string `yaml:"id"`
 		Quality *float64 `yaml:"quality"`
 		Cost *float64 `yaml:"cost"`
+		Disabled bool `yaml:"disabled"`
 	}
 	if err := node.Decode(&decoded); err != nil {
 		return err
@@ -187,7 +191,7 @@ func (m *groupModel) UnmarshalYAML(node *yaml.Node) error {
 	if decoded.Quality == nil || decoded.Cost == nil {
 		return fmt.Errorf("model %q needs explicit quality and cost ratings (0–100)", decoded.ID)
 	}
-	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost}
+	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost, Disabled: decoded.Disabled}
 	return nil
 }
 
@@ -273,7 +277,11 @@ func validateConfig(cfg pluginConfig) error {
 			return fmt.Errorf("group %s needs mode quality or cost, got %q", group.ID, group.Mode)
 		}
 		models := make(map[string]bool, len(group.Models))
+		enabled := 0
 		for _, model := range group.Models {
+			if !model.Disabled {
+				enabled++
+			}
 			if model.ID == "" || models[model.ID] {
 				return fmt.Errorf("group %s has an empty or duplicate model id %q", group.ID, model.ID)
 			}
@@ -282,6 +290,9 @@ func validateConfig(cfg pluginConfig) error {
 				math.IsNaN(model.Cost) || math.IsInf(model.Cost, 0) || model.Cost < 0 || model.Cost > 100 {
 				return fmt.Errorf("group %s model %s: quality and cost must be finite ratings in [0, 100]", group.ID, model.ID)
 			}
+		}
+		if enabled == 0 {
+			return fmt.Errorf("group %s needs at least one enabled model", group.ID)
 		}
 	}
 	for _, group := range cfg.Groups {

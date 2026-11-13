@@ -162,7 +162,7 @@ func resolveTargetGroup(cfg pluginConfig, requestedModel, session string) (model
 	}
 	nonClaude := make([]groupModel, 0, len(picked.Models))
 	for _, m := range picked.Models {
-		if !strings.HasPrefix(strings.ToLower(m.ID), "claude-") {
+		if !m.Disabled && !strings.HasPrefix(strings.ToLower(m.ID), "claude-") {
 			nonClaude = append(nonClaude, m)
 		}
 	}

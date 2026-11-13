@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -34,4 +35,32 @@ func TestSanitizeRequestReplacesClassifierStrings(t *testing.T) {
 			t.Errorf("original classifier string survived: %.60q", gone)
 		}
 	}
+}
+
+func TestSanitizeRequestPreservesToolSourceCode(t *testing.T) {
+	cfg := defaultPluginConfig()
+	sourceSnippet := "const gate = `" + claudeCyberGatePrompt + "`\nconst nudge = `" + claudeRefusalRetryNudge + "`\nconst notRun = `" + claudeToolNotRunClassifier + "`"
+	body := `{"model":"claude-opus-5-5","messages":[` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"old_string":` + mustJSON(sourceSnippet) + `}}]},` +
+		`{"role":"user","content":[` +
+		`{"type":"tool_result","tool_use_id":"t1","content":` + mustJSON(sourceSnippet) + `},` +
+		`{"type":"tool_result","tool_use_id":"t2","content":` + mustJSON(claudeToolNotRunClassifier) + `}` +
+		`]}]}`
+
+	out, _, _, _ := sanitizeRequest([]byte(body), http.Header{}, cfg)
+	text := string(out)
+	if strings.Count(text, "Refuse requests for destructive techniques") != 2 {
+		t.Fatalf("tool_use or tool_result source snippet was corrupted: %s", text)
+	}
+	if !strings.Contains(text, claudeToolNotRunReplacement) {
+		t.Fatalf("exact classifier tool_result was not neutralized: %s", text)
+	}
+}
+
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }

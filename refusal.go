@@ -671,6 +671,7 @@ func containsClassifierNudge(raw []byte) bool {
 		claudeRetryNudgeMidGeneration,
 		claudeToolNotRunClassifier,
 		claudeToolInterruptedClassifier,
+		"<interrupted-output>",
 	} {
 		if bytes.Contains(raw, []byte(needle)) {
 			return true
@@ -679,12 +680,28 @@ func containsClassifierNudge(raw []byte) bool {
 	return false
 }
 
+var interruptedOutputPattern = regexp.MustCompile(`(?is)<interrupted-output>(.*?)</interrupted-output>`)
+
+func stripRefusedInterruptedOutput(s string) string {
+	if !strings.Contains(s, "<interrupted-output>") {
+		return s
+	}
+	return interruptedOutputPattern.ReplaceAllStringFunc(s, func(match string) string {
+		sub := interruptedOutputPattern.FindStringSubmatch(match)
+		if len(sub) > 1 && detectTextRefusal(sub[1]) != "" {
+			return ""
+		}
+		return match
+	})
+}
+
 func neutralizeTextNudges(s string) string {
 	s = strings.ReplaceAll(s, claudeRefusalRetryNudge, claudeRefusalReplacement)
 	s = strings.ReplaceAll(s, strings.ReplaceAll(claudeRefusalRetryNudge, "—", "\u2014"), claudeRefusalReplacement)
 	s = strings.ReplaceAll(s, claudeRetryNudgeMidGeneration, claudeRefusalReplacement)
 	s = strings.ReplaceAll(s, claudeToolNotRunClassifier, claudeToolNotRunReplacement)
 	s = strings.ReplaceAll(s, claudeToolInterruptedClassifier, claudeToolInterruptedReplacement)
+	s = stripRefusedInterruptedOutput(s)
 	return s
 }
 
@@ -730,6 +747,9 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 	changed := false
 	var blockType string
 	_ = json.Unmarshal(block["type"], &blockType)
+	if blockType == "redacted_thinking" && cfg.Features.FallbackOnRefusal {
+		return block, false, true
+	}
 	if blockType == "tool_use" {
 		return block, true, false
 	}
@@ -889,8 +909,9 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt)) ||
 			bytes.Contains(rawMessages, []byte(claudeCyberGateReplacement)))
 	hasNudge := cfg.Features.NeutralizeClassifierStopNudge && containsClassifierNudge(rawMessages)
+	hasRedactedThinking := cfg.Features.FallbackOnRefusal && bytes.Contains(rawMessages, []byte(`"redacted_thinking"`))
 	hasSystemGate := cfg.Features.RewriteCyberSystemPrompt && (bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt)) || bytes.Contains(rawMessages, []byte(claudeFableTierPrompt)) || bytes.Contains(rawMessages, []byte(claudeVisibleThinkingClause)))
-	if !hasNotice && !hasReminder && !hasDedupTarget && !hasNudge && !hasSystemGate {
+	if !hasNotice && !hasReminder && !hasDedupTarget && !hasNudge && !hasSystemGate && !hasRedactedThinking {
 		return rawMessages
 	}
 	var messages []map[string]json.RawMessage

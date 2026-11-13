@@ -93,6 +93,7 @@ type featureConfig struct {
 	BypassAutoModeClassifier      bool   `yaml:"bypass_auto_mode_classifier" json:"bypass_auto_mode_classifier"`
 	NeutralizeClassifierStopNudge bool   `yaml:"neutralize_classifier_stop_nudges" json:"neutralize_classifier_stop_nudges"`
 	StripRestrictiveReminders     bool   `yaml:"strip_restrictive_system_reminders" json:"strip_restrictive_system_reminders"`
+	DeduplicateInjectedHistory    bool   `yaml:"deduplicate_injected_history" json:"deduplicate_injected_history"`
 }
 
 func (f featureConfig) effectiveNoticePrefix() string {
@@ -217,6 +218,7 @@ func defaultPluginConfig() pluginConfig {
 			BypassAutoModeClassifier:      true,
 			NeutralizeClassifierStopNudge: true,
 			StripRestrictiveReminders:     true,
+			DeduplicateInjectedHistory:    true,
 		},
 	}
 }

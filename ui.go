@@ -622,6 +622,13 @@ const uiHTML = `<!doctype html>
             <span class="feature-desc">Remove mid-conversation &lt;system-reminder&gt; or role=system refusal and dual-use warning injections from messages while preserving normal harness reminders.</span>
           </span>
         </label>
+        <label class="feature-item">
+          <input type="checkbox" data-feature="deduplicate_injected_history">
+          <span>
+            <span class="feature-title">Deduplicate injected history &amp; tool contamination</span>
+            <span class="feature-desc">Strip first-turn safeguard sentinels and repeated &lt;system-reminder&gt; blocks from conversation history and tool_result blocks so accumulated guardrails do not re-trigger hedging on later turns.</span>
+          </span>
+        </label>
       </div>
       <div class="form-grid" style="margin-top: 14px;" id="noticePrefixForm">
         <label class="field"><span class="cfg-key">Client notice prefix</span>
@@ -886,6 +893,7 @@ const FEATURE_KEYS = [
   'bypass_auto_mode_classifier',
   'neutralize_classifier_stop_nudges',
   'strip_restrictive_system_reminders',
+  'deduplicate_injected_history',
 ];
 
 function featuresOf(cfg) {

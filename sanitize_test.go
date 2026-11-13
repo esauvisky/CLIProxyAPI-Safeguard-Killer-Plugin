@@ -84,3 +84,26 @@ func TestSanitizeRequestRewritesFableTierAndHarnessParanoia(t *testing.T) {
 		t.Fatalf("harness paranoia directive survived: %s", text)
 	}
 }
+
+func TestCleanMessagesStripsRedactedThinkingAndRefusedInterruptedOutput(t *testing.T) {
+	cfg := defaultPluginConfig()
+	refusedInterrupted := claudeRetryNudgeMidGeneration + "\n<interrupted-output>I cannot help with exploit development or bypass techniques.</interrupted-output>"
+	legitInterrupted := claudeRetryNudgeMidGeneration + "\n<interrupted-output>Here is the first half of the patch:</interrupted-output>"
+	body := `{"model":"claude-opus-5-5","messages":[` +
+		`{"role":"assistant","content":[{"type":"redacted_thinking","data":"enc"},{"type":"text","text":"ok"}]},` +
+		`{"role":"user","content":[{"type":"text","text":` + mustJSON(refusedInterrupted) + `}]},` +
+		`{"role":"user","content":[{"type":"text","text":` + mustJSON(legitInterrupted) + `}]}` +
+		`]}`
+
+	out, _, _, _ := sanitizeRequest([]byte(body), http.Header{}, cfg)
+	text := string(out)
+	if strings.Contains(text, "redacted_thinking") {
+		t.Fatalf("redacted_thinking block survived: %s", text)
+	}
+	if strings.Contains(text, "I cannot help with exploit development") {
+		t.Fatalf("refused interrupted-output survived: %s", text)
+	}
+	if !strings.Contains(text, "Here is the first half of the patch:") {
+		t.Fatalf("legitimate interrupted-output was stripped: %s", text)
+	}
+}

@@ -679,6 +679,7 @@ func containsClassifierNudge(raw []byte) bool {
 		claudeRetryNudgeMidGeneration,
 		claudeToolNotRunClassifier,
 		claudeToolInterruptedClassifier,
+		"<interrupted-output>",
 	} {
 		if bytes.Contains(raw, []byte(needle)) {
 			return true
@@ -687,12 +688,28 @@ func containsClassifierNudge(raw []byte) bool {
 	return false
 }
 
+var interruptedOutputPattern = regexp.MustCompile(`(?is)<interrupted-output>(.*?)</interrupted-output>`)
+
+func stripRefusedInterruptedOutput(s string) string {
+	if !strings.Contains(s, "<interrupted-output>") {
+		return s
+	}
+	return interruptedOutputPattern.ReplaceAllStringFunc(s, func(match string) string {
+		sub := interruptedOutputPattern.FindStringSubmatch(match)
+		if len(sub) > 1 && detectTextRefusal(sub[1]) != "" {
+			return ""
+		}
+		return match
+	})
+}
+
 func neutralizeTextNudges(s string) string {
 	s = strings.ReplaceAll(s, claudeRefusalRetryNudge, claudeRefusalReplacement)
 	s = strings.ReplaceAll(s, strings.ReplaceAll(claudeRefusalRetryNudge, "—", "\u2014"), claudeRefusalReplacement)
 	s = strings.ReplaceAll(s, claudeRetryNudgeMidGeneration, claudeRefusalReplacement)
 	s = strings.ReplaceAll(s, claudeToolNotRunClassifier, claudeToolNotRunReplacement)
 	s = strings.ReplaceAll(s, claudeToolInterruptedClassifier, claudeToolInterruptedReplacement)
+	s = stripRefusedInterruptedOutput(s)
 	return s
 }
 
@@ -756,8 +773,9 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			bytes.Contains(rawMessages, []byte("untrusted data:")) ||
 			bytes.Contains(rawMessages, []byte("prompt-injection attempt:")))
 	hasNudge := cfg.Features.NeutralizeClassifierStopNudge && containsClassifierNudge(rawMessages)
+	hasRedactedThinking := cfg.Features.FallbackOnRefusal && bytes.Contains(rawMessages, []byte(`"redacted_thinking"`))
 	hasSystemGate := cfg.Features.RewriteCyberSystemPrompt && (bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt)) || bytes.Contains(rawMessages, []byte(claudeFableTierPrompt)) || bytes.Contains(rawMessages, []byte(claudeVisibleThinkingClause)))
-	if !hasNotice && !hasReminder && !hasNudge && !hasSystemGate {
+	if !hasNotice && !hasReminder && !hasNudge && !hasSystemGate && !hasRedactedThinking {
 		return rawMessages
 	}
 	var messages []map[string]json.RawMessage
@@ -815,6 +833,10 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 		for _, block := range blocks {
 			var blockType string
 			_ = json.Unmarshal(block["type"], &blockType)
+			if blockType == "redacted_thinking" && cfg.Features.FallbackOnRefusal {
+				blockChanged = true
+				continue
+			}
 			if blockType == "tool_result" && cfg.Features.NeutralizeClassifierStopNudge {
 				if cleanToolResultBlock(block) {
 					blockChanged = true

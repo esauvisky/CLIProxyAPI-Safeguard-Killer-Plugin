@@ -254,9 +254,19 @@ func summarizeAttemptReason(detail string) string {
 // A session that stayed on its model is silent when every other attempt was only a transient
 // cooldown (quota, rate limit, upstream): those retries are not news. A refusal, an empty
 // response, or a capability rejection still prints.
-func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttempt, served, prevModel string, started bool, suppressedRefusalNotices map[string]bool) string {
+// A skipped model only prints when its score would have put it in the pool that picked served;
+// selectedScores is that pool's snapshot.
+func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttempt, served, prevModel string, started bool, suppressedRefusalNotices map[string]bool, selectedScores []modelScore) string {
 	if !cfg.Features.ClientFallbackNotices {
 		return ""
+	}
+	best := math.Inf(-1)
+	scoreOf := make(map[string]float64, len(selectedScores))
+	for _, score := range selectedScores {
+		scoreOf[score.Model] = score.Score
+		if score.Excluded == "" && score.Score > best {
+			best = score.Score
+		}
 	}
 	prefix := cfg.Features.effectiveNoticePrefix()
 	hadActiveFailure := false
@@ -282,6 +292,9 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 			}
 			failedChain = append(failedChain, fmt.Sprintf("`%s` (%s, %s)", attempt.Model, secs, reason))
 		} else if !strings.Contains(attempt.Result, "(cache warm)") {
+			if best-scoreOf[attempt.Model] > modelScoreTolerance {
+				continue
+			}
 			rawDetail := strings.TrimPrefix(attempt.Result, "skipped: ")
 			if classifyAttemptFailure(summarizeAttemptReason(rawDetail)) != "transient" {
 				onlyCooldown = false

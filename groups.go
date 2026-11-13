@@ -230,7 +230,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if !aux {
 			// Without a session identity every turn looks new, so only identified conversations announce a start.
 			started := session != "" && prevModel == ""
-			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)))
+			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)), plan.SelectedScores)
 			bodyOut = injectNonStreamNotice(resp.Body, effectiveFormat(req.Format, req.SourceFormat), notice)
 		}
 		return okEnvelope(executorResponse{Payload: bodyOut, Headers: cleanResponseHeaders(resp.Headers)})
@@ -307,7 +307,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if !aux {
 			// Without a session identity every turn looks new, so only identified conversations announce a start.
 			started := session != "" && prevModel == ""
-			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)))
+			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)), plan.SelectedScores)
 			prefetched, shiftIndices = injectStreamNotice(prefetched, effectiveFormat(req.Format, req.SourceFormat), notice)
 		}
 		go forwardStream(resp.StreamID, req.StreamID, req.HostCallbackID, prefetched, done, shiftIndices, stampSafeguards, cfg.Features.FallbackOnRefusal, session, group, model)

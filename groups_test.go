@@ -596,7 +596,7 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 		{Model: "kimi-k3.1-pro", Result: "served", Duration: 2 * time.Second},
 	}
 
-	gotConcise := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5", false, nil)
+	gotConcise := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5", false, nil, nil)
 	wantConcise := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal: cyber) → `gemini-4-argon-high` (4s, refusal: regex) → `kimi-k3.1-pro`"
 	if gotConcise != wantConcise {
 		t.Fatalf("concise notice = %q, want %q", gotConcise, wantConcise)
@@ -605,7 +605,7 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 	gotSameModelQuota := buildGroupNotice(cfg, group, []groupAttempt{
 		{Model: "gpt-6.1-sol", Result: "failed: insufficient_quota", Duration: 0},
 		{Model: "grok-4.7", Result: "served", Duration: time.Second},
-	}, "grok-4.7", "grok-4.7", false, nil)
+	}, "grok-4.7", "grok-4.7", false, nil, nil)
 	if gotSameModelQuota != "" {
 		t.Fatalf("unchanged model with only a quota failure printed %q", gotSameModelQuota)
 	}
@@ -613,22 +613,35 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 		{Model: "claude-opus-5-5", Result: "failed: refusal (cyber)", Duration: 6 * time.Second},
 		{Model: "gpt-6.1-sol", Result: "failed: insufficient_quota", Duration: 0},
 		{Model: "grok-4.7", Result: "served", Duration: time.Second},
-	}, "grok-4.7", "grok-4.7", false, nil)
+	}, "grok-4.7", "grok-4.7", false, nil, nil)
 	if gotSameModelRefusal == "" {
 		t.Fatal("unchanged model with a refusal was silenced")
 	}
 
-	gotSwitchConcise := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high", false, nil)
+	gotSwitchConcise := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high", false, nil, nil)
 	wantSwitchConcise := "⚡ [Safeguard Killer] `gemini-4-argon-high` → `claude-opus-5-5`"
 	if gotSwitchConcise != wantSwitchConcise {
 		t.Fatalf("concise switch notice = %q, want %q", gotSwitchConcise, wantSwitchConcise)
 	}
 
-	gotStarted := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "", true, nil)
+	gotStarted := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "", true, nil, nil)
 	if want := "⚡ [Safeguard Killer] using `claude-opus-5-5` from here onwards"; gotStarted != want {
 		t.Fatalf("started notice = %q, want %q", gotStarted, want)
 	}
-	gotStartedAfterRefusal := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "", true, nil)
+	poolScores := []modelScore{
+		{Model: "claude-opus-5-5", Score: 38},
+		{Model: "gemini-4-argon-high", Score: 36, Excluded: "no usable credentials: a.json"},
+		{Model: "gpt-6.1-sol", Score: 29, Excluded: "no usable credentials: b.json"},
+	}
+	gotStartedSkips := buildGroupNotice(cfg, group, []groupAttempt{
+		{Model: "gemini-4-argon-high", Result: "skipped: no usable credentials: a.json"},
+		{Model: "gpt-6.1-sol", Result: "skipped: no usable credentials: b.json"},
+		{Model: "claude-opus-5-5", Result: "served"},
+	}, "claude-opus-5-5", "", true, nil, poolScores)
+	if strings.Contains(gotStartedSkips, "gpt-6.1-sol") || !strings.Contains(gotStartedSkips, "gemini-4-argon-high") {
+		t.Fatalf("started notice with skips = %q, want only the in-pool skip", gotStartedSkips)
+	}
+	gotStartedAfterRefusal := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "", true, nil, nil)
 	if want := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal: cyber) → `gemini-4-argon-high` (4s, refusal: regex) → using `kimi-k3.1-pro` from here onwards"; gotStartedAfterRefusal != want {
 		t.Fatalf("started-after-refusal notice = %q, want %q", gotStartedAfterRefusal, want)
 	}
@@ -640,13 +653,13 @@ func TestBuildGroupNoticeConciseAndVerbose(t *testing.T) {
 	}
 
 	cfg.Features.VerboseNotices = true
-	gotVerbose := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5", false, nil)
+	gotVerbose := buildGroupNotice(cfg, group, attempts, "kimi-k3.1-pro", "claude-opus-5-5", false, nil, nil)
 	wantVerbose := "⚡ [Safeguard Killer] `claude-opus-5-5` (16s, refusal (cyber)) → `gemini-4-argon-high` (4s, refusal (text)) → switched to `kimi-k3.1-pro`"
 	if gotVerbose != wantVerbose {
 		t.Fatalf("verbose notice = %q, want %q", gotVerbose, wantVerbose)
 	}
 
-	gotSwitchVerbose := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high", false, nil)
+	gotSwitchVerbose := buildGroupNotice(cfg, group, []groupAttempt{{Model: "claude-opus-5-5", Result: "served"}}, "claude-opus-5-5", "gemini-4-argon-high", false, nil, nil)
 	wantSwitchVerbose := "⚡ [Safeguard Killer] switched from `gemini-4-argon-high` → `claude-opus-5-5`"
 	if gotSwitchVerbose != wantSwitchVerbose {
 		t.Fatalf("verbose switch notice = %q, want %q", gotSwitchVerbose, wantSwitchVerbose)

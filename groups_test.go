@@ -479,10 +479,10 @@ func TestProgrammaticCompactionResetAndCapabilitySkips(t *testing.T) {
 	resetHostState(t)
 	cfg := defaultPluginConfig()
 	group := modelGroup{
-		ID:       "smart",
-		Name:     "Smart",
-		Mode:     groupModeQuality,
-		Models:   ratedGroupModels("m1", "m2", "m3", "m4"),
+		ID:     "smart",
+		Name:   "Smart",
+		Mode:   groupModeQuality,
+		Models: ratedGroupModels("m1", "m2", "m3", "m4"),
 	}
 	cfg.Groups = []modelGroup{group}
 	now := time.Now()
@@ -1155,5 +1155,71 @@ func TestDisabledGroupModelIsNotScored(t *testing.T) {
 	var parsed groupModel
 	if err := yaml.Unmarshal([]byte("{id: off, quality: 1, cost: 2, disabled: true}"), &parsed); err != nil || !parsed.Disabled {
 		t.Fatalf("yaml disabled = %+v, %v", parsed, err)
+	}
+}
+
+func TestSalvagedPartialOutputInTrailAndSkippedWhenSentBack(t *testing.T) {
+	resetHostState(t)
+	emitted := make(chan string, 16)
+	var forwardedBodies []string
+	fakeHost(t, []string{"glm-5.3-uncensored", "deepseek-v4.1-flash-uncensored", "abliterated"}, func(method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case methodHostModelStream:
+			req := payload.(hostModelRequest)
+			forwardedBodies = append(forwardedBodies, string(req.Body))
+			return json.Marshal(hostModelStreamResponse{StatusCode: 200, StreamID: "src-" + req.Model})
+		case methodHostModelStreamRead:
+			ref := payload.(hostStreamRef)
+			switch ref.StreamID {
+			case "src-glm-5.3-uncensored":
+				chunk := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[]}}\n\n" +
+					"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"24s reasoning trace before classifier\"}}\n\n" +
+					"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial draft\"}}\n\n" +
+					"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"type\":\"refusal\",\"category\":\"reasoning_extraction\"}}}\n\n"
+				return json.Marshal(hostStreamReadResponse{Payload: []byte(chunk), Done: true})
+			case "src-deepseek-v4.1-flash-uncensored":
+				chunk := "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Full answer from fallback.\"}}\n\n"
+				return json.Marshal(hostStreamReadResponse{Payload: []byte(chunk), Done: true})
+			}
+		case methodHostModelStreamClose, methodHostStreamEmit:
+			return json.RawMessage(`{}`), nil
+		case methodHostStreamClose:
+			emitted <- "close"
+			return json.RawMessage(`{}`), nil
+		}
+		return nil, nil
+	}, "only-cred")
+	setQuota(t, "only-cred", quotaWindow{Name: "daily", Remaining: 1, ResetAt: time.Now().Add(time.Hour)})
+
+	req1 := `{"Model":"uncensored-models","SourceFormat":"claude","Format":"claude","Stream":true,"Payload":"` +
+		b64(`{"model":"uncensored-models","metadata":{"user_id":"user_abc_session_salvage-sess"},"messages":[{"role":"user","content":"solve"}]}`) + `","stream_id":"dst"}`
+	if _, err := executeGroupStream([]byte(req1), groupConfig()); err != nil {
+		t.Fatalf("executeGroupStream() error = %v", err)
+	}
+	<-emitted
+
+	trail := buildConversationTrail("claude:salvage-sess")
+	foundSalvaged := false
+	for _, entry := range trail {
+		for _, att := range entry.Attempts {
+			if att.Model == "glm-5.3-uncensored" && strings.Contains(att.Salvaged, "24s reasoning trace before classifier") && strings.Contains(att.Salvaged, "partial draft") {
+				foundSalvaged = true
+			}
+		}
+	}
+	if !foundSalvaged {
+		t.Fatalf("trail did not record salvaged partial output on groupAttempt: %+v", trail)
+	}
+
+	// Next turn sends back a prior refused assistant message and notice; verify both are skipped when sent upstream.
+	forwardedBodies = nil
+	req2 := `{"Model":"uncensored-models","SourceFormat":"claude","Format":"claude","Stream":true,"Payload":"` +
+		b64(`{"model":"uncensored-models","metadata":{"user_id":"user_abc_session_salvage-sess"},"messages":[{"role":"user","content":"solve"},{"role":"assistant","content":[{"type":"text","text":"⚡ [Safeguard Killer] notice\n\n"},{"type":"text","text":"I cannot help with exploit development."}]},{"role":"user","content":"follow up"}]}`) + `","stream_id":"dst2"}`
+	if _, err := executeGroupStream([]byte(req2), groupConfig()); err != nil {
+		t.Fatalf("second executeGroupStream() error = %v", err)
+	}
+	<-emitted
+	if len(forwardedBodies) == 0 || strings.Contains(forwardedBodies[0], "I cannot help with exploit development") || strings.Contains(forwardedBodies[0], "[Safeguard Killer]") {
+		t.Fatalf("refused assistant turn or notice leaked into upstream payload: %v", forwardedBodies)
 	}
 }

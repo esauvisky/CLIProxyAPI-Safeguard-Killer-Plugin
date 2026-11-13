@@ -120,55 +120,69 @@ func savePersistedSessions() {
 }
 
 // so the caller can switch to the next model in the group before emitting anything to the client.
-func prefetchStream(sourceStreamID, callbackID string, checkRefusal bool, prefetchBytes int) ([][]byte, bool, error) {
+func formatSalvagedOutput(thinking, visible string) string {
+	t := strings.TrimSpace(thinking)
+	v := strings.TrimSpace(visible)
+	if t != "" && v != "" {
+		return "[thinking]\n" + t + "\n\n" + v
+	}
+	if t != "" {
+		return "[thinking]\n" + t
+	}
+	return v
+}
+
+func prefetchStream(sourceStreamID, callbackID string, checkRefusal bool, prefetchBytes int) ([][]byte, bool, string, error) {
 	var prefetched [][]byte
 	var visibleBuf strings.Builder
+	var thinkingBuf strings.Builder
 	sawTool := false
 	sawEnvelope := false
 	for {
 		rawRead, errRead := hostCall(methodHostModelStreamRead, hostStreamRef{StreamID: sourceStreamID, HostCallbackID: callbackID})
 		if errRead != nil {
 			_, _ = hostCall(methodHostModelStreamClose, hostStreamRef{StreamID: sourceStreamID, HostCallbackID: callbackID})
-			return nil, false, errRead
+			return nil, false, formatSalvagedOutput(thinkingBuf.String(), visibleBuf.String()), errRead
 		}
 		var chunk hostStreamReadResponse
 		if errDecode := json.Unmarshal(rawRead, &chunk); errDecode != nil {
 			_, _ = hostCall(methodHostModelStreamClose, hostStreamRef{StreamID: sourceStreamID, HostCallbackID: callbackID})
-			return nil, false, fmt.Errorf("decode host.model.stream_read response: %w", errDecode)
+			return nil, false, formatSalvagedOutput(thinkingBuf.String(), visibleBuf.String()), fmt.Errorf("decode host.model.stream_read response: %w", errDecode)
 		}
 		if len(chunk.Payload) > 0 {
 			if !checkRefusal {
-				return [][]byte{chunk.Payload}, chunk.Done, nil
+				return [][]byte{chunk.Payload}, chunk.Done, "", nil
 			}
-			refusal, vis, tool, env := inspectStreamChunk(chunk.Payload)
+			refusal, vis, think, tool, env := inspectStreamChunk(chunk.Payload)
+			visibleBuf.WriteString(vis)
+			thinkingBuf.WriteString(think)
 			if refusal != "" {
 				_, _ = hostCall(methodHostModelStreamClose, hostStreamRef{StreamID: sourceStreamID, HostCallbackID: callbackID})
-				return nil, false, fmt.Errorf("%s", refusal)
+				return nil, false, formatSalvagedOutput(thinkingBuf.String(), visibleBuf.String()), fmt.Errorf("%s", refusal)
 			}
-			visibleBuf.WriteString(vis)
 			sawTool = sawTool || tool
 			sawEnvelope = sawEnvelope || env
 			if !sawTool {
 				if textRefusal := detectTextRefusal(visibleBuf.String()); textRefusal != "" {
 					_, _ = hostCall(methodHostModelStreamClose, hostStreamRef{StreamID: sourceStreamID, HostCallbackID: callbackID})
-					return nil, false, fmt.Errorf("%s", textRefusal)
+					return nil, false, formatSalvagedOutput(thinkingBuf.String(), visibleBuf.String()), fmt.Errorf("%s", textRefusal)
 				}
 			}
 			prefetched = append(prefetched, chunk.Payload)
 		}
 		if chunk.Error != "" {
 			_, _ = hostCall(methodHostModelStreamClose, hostStreamRef{StreamID: sourceStreamID, HostCallbackID: callbackID})
-			return nil, false, fmt.Errorf("%s", chunk.Error)
+			return nil, false, formatSalvagedOutput(thinkingBuf.String(), visibleBuf.String()), fmt.Errorf("%s", chunk.Error)
 		}
 		if chunk.Done {
 			if checkRefusal && sawEnvelope && len(strings.TrimSpace(visibleBuf.String())) == 0 && !sawTool {
 				_, _ = hostCall(methodHostModelStreamClose, hostStreamRef{StreamID: sourceStreamID, HostCallbackID: callbackID})
-				return nil, false, fmt.Errorf("empty response (no text or tool calls)")
+				return nil, false, formatSalvagedOutput(thinkingBuf.String(), visibleBuf.String()), fmt.Errorf("empty response (no text or tool calls)")
 			}
-			return prefetched, true, nil
+			return prefetched, true, "", nil
 		}
 		if sawTool || visibleBuf.Len() >= prefetchBytes {
-			return prefetched, false, nil
+			return prefetched, false, "", nil
 		}
 	}
 }
@@ -857,6 +871,9 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 			changed = true
 		}
 	}
+	if !inToolResult && cfg.Features.FallbackOnRefusal && role == "assistant" && detectTextRefusal(updatedText) != "" {
+		return block, false, true
+	}
 	if changed {
 		if strings.TrimSpace(updatedText) == "" {
 			return block, false, true
@@ -910,8 +927,9 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			bytes.Contains(rawMessages, []byte(claudeCyberGateReplacement)))
 	hasNudge := cfg.Features.NeutralizeClassifierStopNudge && containsClassifierNudge(rawMessages)
 	hasRedactedThinking := cfg.Features.FallbackOnRefusal && bytes.Contains(rawMessages, []byte(`"redacted_thinking"`))
+	hasAssistantRefusal := cfg.Features.FallbackOnRefusal && bytes.Contains(rawMessages, []byte(`"assistant"`)) && detectTextRefusal(string(rawMessages)) != ""
 	hasSystemGate := cfg.Features.RewriteCyberSystemPrompt && (bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt)) || bytes.Contains(rawMessages, []byte(claudeFableTierPrompt)) || bytes.Contains(rawMessages, []byte(claudeVisibleThinkingClause)))
-	if !hasNotice && !hasReminder && !hasDedupTarget && !hasNudge && !hasSystemGate && !hasRedactedThinking {
+	if !hasNotice && !hasReminder && !hasDedupTarget && !hasNudge && !hasSystemGate && !hasRedactedThinking && !hasAssistantRefusal {
 		return rawMessages
 	}
 	var messages []map[string]json.RawMessage
@@ -956,6 +974,10 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			if cfg.Features.DeduplicateInjectedHistory {
 				updatedText = cleanContaminatedText(updatedText, true, seenDigests)
 			}
+			if cfg.Features.FallbackOnRefusal && role == "assistant" && detectTextRefusal(updatedText) != "" {
+				changed = true
+				continue
+			}
 			if updatedText != text {
 				trimmed := strings.TrimSpace(updatedText)
 				if trimmed == "" && role == "system" {
@@ -986,9 +1008,12 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 				blockChanged = true
 			}
 		}
-		if blockChanged && len(filtered) > 0 {
-			msg["content"], _ = json.Marshal(filtered)
+		if blockChanged {
 			changed = true
+			if len(filtered) == 0 {
+				continue
+			}
+			msg["content"], _ = json.Marshal(filtered)
 		}
 		outMessages = append(outMessages, msg)
 	}
@@ -1231,32 +1256,34 @@ func detectAutoModeClassifierKind(payload []byte, stream bool) string {
 }
 
 // visible text or tool calls.
-func checkNonStreamResponse(body []byte) error {
-	refusal, visible, sawTool, sawEnvelope := inspectPayload(bytes.TrimSpace(body))
+func checkNonStreamResponse(body []byte) (error, string) {
+	refusal, visible, thinking, sawTool, sawEnvelope := inspectPayload(bytes.TrimSpace(body))
+	salvaged := formatSalvagedOutput(thinking, visible)
 	if refusal != "" {
-		return fmt.Errorf("%s", refusal)
+		return fmt.Errorf("%s", refusal), salvaged
 	}
 	if !sawTool {
 		if textRefusal := detectTextRefusal(visible); textRefusal != "" {
-			return fmt.Errorf("%s", textRefusal)
+			return fmt.Errorf("%s", textRefusal), salvaged
 		}
 	}
 	if sawEnvelope && len(strings.TrimSpace(visible)) == 0 && !sawTool {
-		return fmt.Errorf("empty response (no text or tool calls)")
+		return fmt.Errorf("empty response (no text or tool calls)"), salvaged
 	}
-	return nil
+	return nil, ""
 }
 
 // inspectStreamChunk inspects all JSON objects in an SSE or raw-JSON stream chunk.
-func inspectStreamChunk(payload []byte) (refusal string, visibleText string, sawToolUse bool, sawEnvelope bool) {
+func inspectStreamChunk(payload []byte) (refusal string, visibleText string, thinkingText string, sawToolUse bool, sawEnvelope bool) {
 	trimmed := bytes.TrimSpace(payload)
 	if len(trimmed) == 0 {
-		return "", "", false, false
+		return "", "", "", false, false
 	}
 	if trimmed[0] == '{' {
 		return inspectPayload(trimmed)
 	}
 	var textBuf strings.Builder
+	var thinkBuf strings.Builder
 	for _, line := range bytes.Split(payload, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -1266,15 +1293,16 @@ func inspectStreamChunk(payload []byte) (refusal string, visibleText string, saw
 		if len(data) == 0 || data[0] != '{' {
 			continue
 		}
-		ref, vis, tool, env := inspectPayload(data)
-		if ref != "" {
-			return ref, "", false, true
-		}
+		ref, vis, think, tool, env := inspectPayload(data)
 		textBuf.WriteString(vis)
+		thinkBuf.WriteString(think)
+		if ref != "" {
+			return ref, textBuf.String(), thinkBuf.String(), false, true
+		}
 		sawToolUse = sawToolUse || tool
 		sawEnvelope = sawEnvelope || env
 	}
-	return "", textBuf.String(), sawToolUse, sawEnvelope
+	return "", textBuf.String(), thinkBuf.String(), sawToolUse, sawEnvelope
 }
 
 // "I can't confirm it yet" must not match, so every branch requires refusal-specific content.
@@ -1317,7 +1345,7 @@ func detectTextRefusal(text string) string {
 }
 
 // the JSON matches a known model response envelope.
-func inspectPayload(raw []byte) (refusal string, visibleText string, sawToolUse bool, sawEnvelope bool) {
+func inspectPayload(raw []byte) (refusal string, visibleText string, thinkingText string, sawToolUse bool, sawEnvelope bool) {
 	var msg struct {
 		Type  string `json:"type"`
 		Error *struct {
@@ -1331,6 +1359,7 @@ func inspectPayload(raw []byte) (refusal string, visibleText string, sawToolUse 
 		Delta *struct {
 			Type        string `json:"type"`
 			Text        string `json:"text"`
+			Thinking    string `json:"thinking"`
 			PartialJSON string `json:"partial_json"`
 			Refusal     string `json:"refusal"`
 			StopReason  string `json:"stop_reason"`
@@ -1339,23 +1368,28 @@ func inspectPayload(raw []byte) (refusal string, visibleText string, sawToolUse 
 			} `json:"stop_details"`
 		} `json:"delta"`
 		ContentBlock *struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking"`
 		} `json:"content_block"`
 		Content json.RawMessage `json:"content"`
 		Choices []struct {
 			FinishReason string `json:"finish_reason"`
 			Message      *struct {
-				Content      json.RawMessage `json:"content"`
-				Refusal      string          `json:"refusal"`
-				ToolCalls    []any           `json:"tool_calls"`
-				FunctionCall any             `json:"function_call"`
+				Content          json.RawMessage `json:"content"`
+				ReasoningContent string          `json:"reasoning_content"`
+				Reasoning        string          `json:"reasoning"`
+				Refusal          string          `json:"refusal"`
+				ToolCalls        []any           `json:"tool_calls"`
+				FunctionCall     any             `json:"function_call"`
 			} `json:"message"`
 			Delta *struct {
-				Content      string `json:"content"`
-				Refusal      string `json:"refusal"`
-				ToolCalls    []any  `json:"tool_calls"`
-				FunctionCall any    `json:"function_call"`
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				Reasoning        string `json:"reasoning"`
+				Refusal          string `json:"refusal"`
+				ToolCalls        []any  `json:"tool_calls"`
+				FunctionCall     any    `json:"function_call"`
 			} `json:"delta"`
 		} `json:"choices"`
 		IncompleteDetails *struct {
@@ -1387,7 +1421,7 @@ func inspectPayload(raw []byte) (refusal string, visibleText string, sawToolUse 
 		Candidates []geminiCandidate `json:"candidates"`
 	}
 	if errUnmarshal := json.Unmarshal(raw, &msg); errUnmarshal != nil {
-		return "", "", false, false
+		return "", "", "", false, false
 	}
 	sawEnvelope = msg.StopReason != "" || msg.Delta != nil || msg.ContentBlock != nil ||
 		len(msg.Content) > 0 || len(msg.Choices) > 0 || len(msg.Candidates) > 0 ||
@@ -1396,24 +1430,27 @@ func inspectPayload(raw []byte) (refusal string, visibleText string, sawToolUse 
 
 	if msg.Type == "error" || (msg.Error != nil && (msg.Error.Message != "" || msg.Error.Type != "")) {
 		if msg.Error != nil && msg.Error.Message != "" {
-			return "upstream error: " + msg.Error.Message, "", false, true
+			return "upstream error: " + msg.Error.Message, "", "", false, true
 		}
-		return "upstream error", "", false, true
+		return "upstream error", "", "", false, true
 	}
-	if reason := claudeStopRefusal(msg.StopReason, msg.StopDetails); reason != "" {
-		return reason, "", false, true
-	}
+
 	var textBuf strings.Builder
+	var thinkBuf strings.Builder
+	refusalReason := claudeStopRefusal(msg.StopReason, msg.StopDetails)
+
 	if msg.Delta != nil {
-		if reason := claudeStopRefusal(msg.Delta.StopReason, msg.Delta.StopDetails); reason != "" {
-			return reason, "", false, true
+		if reason := claudeStopRefusal(msg.Delta.StopReason, msg.Delta.StopDetails); reason != "" && refusalReason == "" {
+			refusalReason = reason
 		}
-		if msg.Delta.Refusal != "" {
-			return "refusal", "", false, true
+		if msg.Delta.Refusal != "" && refusalReason == "" {
+			refusalReason = "refusal"
 		}
 		switch msg.Delta.Type {
 		case "text_delta":
 			textBuf.WriteString(msg.Delta.Text)
+		case "thinking_delta":
+			thinkBuf.WriteString(msg.Delta.Thinking)
 		case "input_json_delta":
 			if msg.Delta.PartialJSON != "" {
 				sawToolUse = true
@@ -1426,28 +1463,39 @@ func inspectPayload(raw []byte) (refusal string, visibleText string, sawToolUse 
 			sawToolUse = true
 		case "text":
 			textBuf.WriteString(msg.ContentBlock.Text)
+		case "thinking":
+			thinkBuf.WriteString(msg.ContentBlock.Thinking)
 		}
 	}
 	if len(msg.Content) > 0 {
-		ref, vis, tool := inspectClaudeContent(msg.Content)
-		if ref != "" {
-			return ref, "", false, true
-		}
+		ref, vis, think, tool := inspectClaudeContent(msg.Content)
 		textBuf.WriteString(vis)
+		thinkBuf.WriteString(think)
+		if ref != "" && refusalReason == "" {
+			refusalReason = ref
+		}
 		sawToolUse = sawToolUse || tool
 	}
-	if msg.IncompleteDetails != nil && msg.IncompleteDetails.Reason == "content_filter" {
-		return "refusal (content_filter)", "", false, true
+	if refusalReason == "" && msg.IncompleteDetails != nil && msg.IncompleteDetails.Reason == "content_filter" {
+		refusalReason = "refusal (content_filter)"
 	}
-	if msg.Response != nil && msg.Response.IncompleteDetails != nil && msg.Response.IncompleteDetails.Reason == "content_filter" {
-		return "refusal (content_filter)", "", false, true
+	if refusalReason == "" && msg.Response != nil && msg.Response.IncompleteDetails != nil && msg.Response.IncompleteDetails.Reason == "content_filter" {
+		refusalReason = "refusal (content_filter)"
 	}
-	if msg.Type == "response.output_text.delta" {
+	switch msg.Type {
+	case "response.output_text.delta":
 		var deltaEvt struct {
 			Delta string `json:"delta"`
 		}
 		if json.Unmarshal(raw, &deltaEvt) == nil {
 			textBuf.WriteString(deltaEvt.Delta)
+		}
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		var deltaEvt struct {
+			Delta string `json:"delta"`
+		}
+		if json.Unmarshal(raw, &deltaEvt) == nil {
+			thinkBuf.WriteString(deltaEvt.Delta)
 		}
 	}
 	if msg.Type == "response.function_call_arguments.delta" || (msg.Item != nil && msg.Item.Type == "function_call") {
@@ -1459,58 +1507,76 @@ func inspectPayload(raw []byte) (refusal string, visibleText string, sawToolUse 
 		}
 		for _, part := range item.Content {
 			if part.Type == "refusal" || part.Refusal != "" {
-				return "refusal", "", false, true
+				if refusalReason == "" {
+					refusalReason = "refusal"
+				}
+				continue
 			}
-			textBuf.WriteString(part.Text)
+			if item.Type == "reasoning" || part.Type == "reasoning_text" || part.Type == "summary_text" {
+				thinkBuf.WriteString(part.Text)
+			} else {
+				textBuf.WriteString(part.Text)
+			}
 		}
 	}
 	for _, choice := range msg.Choices {
-		if choice.FinishReason == "content_filter" {
-			return "refusal (content_filter)", "", false, true
+		if choice.FinishReason == "content_filter" && refusalReason == "" {
+			refusalReason = "refusal (content_filter)"
 		}
 		if choice.Message != nil {
-			if choice.Message.Refusal != "" {
-				return "refusal", "", false, true
+			if choice.Message.Refusal != "" && refusalReason == "" {
+				refusalReason = "refusal"
 			}
 			if len(choice.Message.ToolCalls) > 0 || choice.Message.FunctionCall != nil {
 				sawToolUse = true
 			}
-			textBuf.WriteString(inspectOpenAIMessageContent(choice.Message.Content))
+			thinkBuf.WriteString(choice.Message.ReasoningContent)
+			thinkBuf.WriteString(choice.Message.Reasoning)
+			vis, think := inspectOpenAIMessageContent(choice.Message.Content)
+			textBuf.WriteString(vis)
+			thinkBuf.WriteString(think)
 		}
 		if choice.Delta != nil {
-			if choice.Delta.Refusal != "" {
-				return "refusal", "", false, true
+			if choice.Delta.Refusal != "" && refusalReason == "" {
+				refusalReason = "refusal"
 			}
 			if len(choice.Delta.ToolCalls) > 0 || choice.Delta.FunctionCall != nil {
 				sawToolUse = true
 			}
+			thinkBuf.WriteString(choice.Delta.ReasoningContent)
+			thinkBuf.WriteString(choice.Delta.Reasoning)
 			textBuf.WriteString(choice.Delta.Content)
 		}
 	}
-	if msg.PromptFeedback != nil && msg.PromptFeedback.BlockReason != "" {
-		return "refusal (" + msg.PromptFeedback.BlockReason + ")", "", false, true
+	if refusalReason == "" && msg.PromptFeedback != nil && msg.PromptFeedback.BlockReason != "" {
+		refusalReason = "refusal (" + msg.PromptFeedback.BlockReason + ")"
 	}
-	if msg.Response != nil && msg.Response.PromptFeedback != nil && msg.Response.PromptFeedback.BlockReason != "" {
-		return "refusal (" + msg.Response.PromptFeedback.BlockReason + ")", "", false, true
+	if refusalReason == "" && msg.Response != nil && msg.Response.PromptFeedback != nil && msg.Response.PromptFeedback.BlockReason != "" {
+		refusalReason = "refusal (" + msg.Response.PromptFeedback.BlockReason + ")"
 	}
 	candidates := msg.Candidates
 	if msg.Response != nil && len(msg.Response.Candidates) > 0 {
 		candidates = append(candidates, msg.Response.Candidates...)
 	}
 	for _, cand := range candidates {
-		if isGeminiRefusalFinishReason(cand.FinishReason) {
-			return "refusal (" + cand.FinishReason + ")", "", false, true
+		if isGeminiRefusalFinishReason(cand.FinishReason) && refusalReason == "" {
+			refusalReason = "refusal (" + cand.FinishReason + ")"
 		}
 		for _, part := range cand.Content.Parts {
 			if part.FunctionCall != nil {
 				sawToolUse = true
 			}
-			if !part.Thought {
+			if part.Thought {
+				thinkBuf.WriteString(part.Text)
+			} else {
 				textBuf.WriteString(part.Text)
 			}
 		}
 	}
-	return "", textBuf.String(), sawToolUse, sawEnvelope
+	if refusalReason != "" {
+		return refusalReason, textBuf.String(), thinkBuf.String(), false, true
+	}
+	return "", textBuf.String(), thinkBuf.String(), sawToolUse, sawEnvelope
 }
 
 type geminiCandidate struct {
@@ -1536,53 +1602,63 @@ func claudeStopRefusal(stopReason string, details *struct {
 	return "refusal"
 }
 
-func inspectClaudeContent(raw json.RawMessage) (string, string, bool) {
+func inspectClaudeContent(raw json.RawMessage) (string, string, string, bool) {
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
-		return "", strings.TrimSpace(text), false
+		return "", strings.TrimSpace(text), "", false
 	}
 	var blocks []struct {
-		Type    string `json:"type"`
-		Text    string `json:"text"`
-		Refusal string `json:"refusal"`
+		Type     string `json:"type"`
+		Text     string `json:"text"`
+		Thinking string `json:"thinking"`
+		Refusal  string `json:"refusal"`
 	}
 	if json.Unmarshal(raw, &blocks) != nil {
-		return "", "", false
+		return "", "", "", false
 	}
 	var visible strings.Builder
+	var thinking strings.Builder
+	var refusal string
 	tool := false
 	for _, block := range blocks {
 		switch block.Type {
 		case "refusal":
-			return "refusal", "", false
+			if refusal == "" {
+				refusal = "refusal"
+			}
 		case "tool_use", "server_tool_use":
 			tool = true
+		case "thinking":
+			thinking.WriteString(block.Thinking)
 		case "text":
 			visible.WriteString(block.Text)
 		}
 	}
-	return "", strings.TrimSpace(visible.String()), tool
+	return refusal, strings.TrimSpace(visible.String()), strings.TrimSpace(thinking.String()), tool
 }
 
-func inspectOpenAIMessageContent(raw json.RawMessage) string {
+func inspectOpenAIMessageContent(raw json.RawMessage) (string, string) {
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
-		return strings.TrimSpace(text)
+		return strings.TrimSpace(text), ""
 	}
 	var parts []struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	}
 	if json.Unmarshal(raw, &parts) != nil {
-		return ""
+		return "", ""
 	}
 	var total strings.Builder
+	var thinking strings.Builder
 	for _, part := range parts {
-		if part.Type != "thinking" && part.Type != "reasoning" {
+		if part.Type == "thinking" || part.Type == "reasoning" {
+			thinking.WriteString(part.Text)
+		} else {
 			total.WriteString(part.Text)
 		}
 	}
-	return strings.TrimSpace(total.String())
+	return strings.TrimSpace(total.String()), strings.TrimSpace(thinking.String())
 }
 
 func isGeminiRefusalFinishReason(reason string) bool {

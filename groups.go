@@ -112,6 +112,7 @@ type groupAttempt struct {
 	Model    string        `json:"model"`
 	Result   string        `json:"result"`
 	Duration time.Duration `json:"duration,omitempty"`
+	Salvaged string        `json:"salvaged,omitempty"`
 }
 
 func groupModelRegistration(cfg pluginConfig) modelRegistrationResponse {
@@ -215,8 +216,8 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 			return nil, fmt.Errorf("decode host.model.execute response: %w", errDecode)
 		}
 		if cfg.Features.FallbackOnRefusal {
-			if errRefusal := checkNonStreamResponse(resp.Body); errRefusal != nil {
-				attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errRefusal.Error(), Duration: time.Since(attemptStart)})
+			if errRefusal, salvaged := checkNonStreamResponse(resp.Body); errRefusal != nil {
+				attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errRefusal.Error(), Duration: time.Since(attemptStart), Salvaged: salvaged})
 				recordConversationFailure(session, group.ID, model, errRefusal.Error(), req.Payload, time.Now())
 				lastErr = errRefusal
 				continue
@@ -290,9 +291,9 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if errDecode := json.Unmarshal(rawResp, &resp); errDecode != nil {
 			return nil, fmt.Errorf("decode host.model.execute_stream response: %w", errDecode)
 		}
-		prefetched, done, errPrefetch := prefetchStream(resp.StreamID, req.HostCallbackID, cfg.Features.FallbackOnRefusal, cfg.StreamPrefetchBytes)
+		prefetched, done, salvaged, errPrefetch := prefetchStream(resp.StreamID, req.HostCallbackID, cfg.Features.FallbackOnRefusal, cfg.StreamPrefetchBytes)
 		if errPrefetch != nil {
-			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errPrefetch.Error(), Duration: time.Since(attemptStart)})
+			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errPrefetch.Error(), Duration: time.Since(attemptStart), Salvaged: salvaged})
 			recordConversationFailure(session, group.ID, model, errPrefetch.Error(), req.Payload, time.Now())
 			lastErr = errPrefetch
 			continue
@@ -352,7 +353,7 @@ func forwardStream(source, target, callbackID string, prefetched [][]byte, sourc
 		if len(chunk.Payload) > 0 {
 			observeConversationUsage(session, group.ID, chunk.Payload)
 			if checkRefusal {
-				if refusal, _, _, _ := inspectStreamChunk(chunk.Payload); refusal != "" {
+				if refusal, _, _, _, _ := inspectStreamChunk(chunk.Payload); refusal != "" {
 					advanceConversationOnRefusal(session, group, model, time.Now())
 				}
 			}

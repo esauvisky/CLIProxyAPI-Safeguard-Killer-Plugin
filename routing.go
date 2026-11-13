@@ -252,7 +252,7 @@ func setSelectionProbabilities(scores []modelScore, active string, sticky bool) 
 				scores[i].Probability = 1
 			}
 		} else if best-scores[i].Score <= modelScoreTolerance {
-			scores[i].Probability = math.Exp((scores[i].Score-best)/modelScoreTemperature)
+			scores[i].Probability = math.Exp((scores[i].Score - best) / modelScoreTemperature)
 			total += scores[i].Probability
 		}
 	}
@@ -693,13 +693,14 @@ func conversationBindingView(s *conversationState) sessionBinding {
 
 // trailEntry is one persisted routing event for a conversation.
 type trailEntry struct {
-	Time        time.Time    `json:"time"`
-	Version     string       `json:"version"`
-	Mode        string       `json:"mode,omitempty"`
-	ModelScores []modelScore `json:"model_scores,omitempty"`
-	Event       string       `json:"event"`
-	Model       string       `json:"model"`
-	Reason      string       `json:"reason"`
+	Time        time.Time      `json:"time"`
+	Version     string         `json:"version"`
+	Mode        string         `json:"mode,omitempty"`
+	ModelScores []modelScore   `json:"model_scores,omitempty"`
+	Attempts    []groupAttempt `json:"attempts,omitempty"`
+	Event       string         `json:"event"`
+	Model       string         `json:"model"`
+	Reason      string         `json:"reason"`
 }
 
 // buildConversationTrail returns the full decision trail for one conversation
@@ -715,7 +716,7 @@ func buildConversationTrail(key string) []trailEntry {
 		if key != "" && d.Session != key && !strings.HasPrefix(d.Session, key+"\x00") {
 			continue
 		}
-		out = append(out, trailEntry{Time: d.Time, Version: d.Version, Event: d.AuthID, Model: d.Model, Reason: d.Reason, Mode: d.Mode, ModelScores: d.ModelScores})
+		out = append(out, trailEntry{Time: d.Time, Version: d.Version, Event: d.AuthID, Model: d.Model, Reason: d.Reason, Mode: d.Mode, ModelScores: d.ModelScores, Attempts: d.Attempts})
 	}
 	return out
 }

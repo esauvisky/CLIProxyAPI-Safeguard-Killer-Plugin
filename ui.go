@@ -1409,9 +1409,10 @@ function renderRanking(d) {
 }
 
 function renderAttempts(d) {
-  return '<ol class="attempts">' + d.attempts.map(at =>
+  return '<ol class="attempts">' + d.attempts.map((at, idx) =>
     '<li class="' + (at.result === 'served' && at.model === d.auth_id ? 'served' : '') + '">' +
       '<span class="mono">' + esc(at.model) + '</span> &rarr; ' + esc(at.result) +
+      (at.salvaged ? '<div style="margin-top:4px">' + details('salvaged:' + d.time + ':' + d.model + ':' + idx, 'Salvaged partial output (' + at.salvaged.length + ' chars)', '<pre class="small mono" style="white-space:pre-wrap;margin:4px 0 0;padding:6px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:4px;">' + esc(at.salvaged) + '</pre>') + '</div>' : '') +
     '</li>'
   ).join('') + '</ol>';
 }
@@ -1496,7 +1497,7 @@ function loadTrail() {
       if (!Array.isArray(data) || data.length === 0) { table.style.display = 'none'; return; }
       table.style.display = '';
       body.innerHTML = data.map(e =>
-        '<tr><td class="nowrap">' + esc(e.time) + '</td><td>' + esc(e.version) + '</td><td>' + esc(e.event) + '</td><td class="mono">' + esc(e.model) + '</td><td>' + esc(e.reason) + renderModelScores({ mode: e.mode, model_scores: e.model_scores, auth_id: e.event }) + '</td></tr>'
+        '<tr><td class="nowrap">' + esc(e.time) + '</td><td>' + esc(e.version) + '</td><td>' + esc(e.event) + '</td><td class="mono">' + esc(e.model) + '</td><td>' + esc(e.reason) + (e.attempts && e.attempts.length > 0 ? renderAttempts({ time: e.time, model: e.model, auth_id: e.event, attempts: e.attempts }) : '') + renderModelScores({ mode: e.mode, model_scores: e.model_scores, auth_id: e.event }) + '</td></tr>'
       ).join('');
     });
 }

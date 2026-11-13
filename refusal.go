@@ -636,10 +636,54 @@ var (
 // <system-reminder> blocks across the conversation using seenDigests (sha256 of normalized text).
 // The first occurrence of a non-restrictive reminder is kept; subsequent occurrences of the same
 // digest are stripped so accumulated harness rules and tool-result reminders do not compound across turns.
-func cleanContaminatedText(text string, seenDigests map[string]bool) string {
-	for _, sentinel := range []string{claudeCyberGatePrompt, claudeCyberGateReplacement} {
-		if sentinel != "" && strings.Contains(text, sentinel) {
-			text = strings.ReplaceAll(text, sentinel, "")
+func rewriteSystemPromptText(s string) string {
+	return strings.ReplaceAll(s, claudeCyberGatePrompt, claudeCyberGateReplacement)
+}
+
+func rewriteSystemPromptJSON(raw json.RawMessage) json.RawMessage {
+	return json.RawMessage(bytes.ReplaceAll(raw, []byte(claudeCyberGatePrompt), []byte(claudeCyberGateReplacement)))
+}
+
+func containsClassifierNudge(raw []byte) bool {
+	for _, needle := range []string{
+		claudeRefusalRetryNudge,
+		strings.ReplaceAll(claudeRefusalRetryNudge, "—", `\u2014`),
+		claudeRetryNudgeMidGeneration,
+		claudeToolNotRunClassifier,
+		claudeToolInterruptedClassifier,
+	} {
+		if bytes.Contains(raw, []byte(needle)) {
+			return true
+		}
+	}
+	return false
+}
+
+func neutralizeTextNudges(s string) string {
+	s = strings.ReplaceAll(s, claudeRefusalRetryNudge, claudeRefusalReplacement)
+	s = strings.ReplaceAll(s, strings.ReplaceAll(claudeRefusalRetryNudge, "—", "\u2014"), claudeRefusalReplacement)
+	s = strings.ReplaceAll(s, claudeRetryNudgeMidGeneration, claudeRefusalReplacement)
+	s = strings.ReplaceAll(s, claudeToolNotRunClassifier, claudeToolNotRunReplacement)
+	s = strings.ReplaceAll(s, claudeToolInterruptedClassifier, claudeToolInterruptedReplacement)
+	return s
+}
+
+func replaceExactToolResultText(s string) (string, bool) {
+	switch strings.TrimSpace(s) {
+	case claudeToolNotRunClassifier:
+		return claudeToolNotRunReplacement, true
+	case claudeToolInterruptedClassifier:
+		return claudeToolInterruptedReplacement, true
+	}
+	return s, false
+}
+
+func cleanContaminatedText(text string, stripSentinels bool, seenDigests map[string]bool) string {
+	if stripSentinels {
+		for _, sentinel := range []string{claudeCyberGatePrompt, claudeCyberGateReplacement} {
+			if sentinel != "" && strings.Contains(text, sentinel) {
+				text = strings.ReplaceAll(text, sentinel, "")
+			}
 		}
 	}
 	if !strings.Contains(text, "<system-reminder>") {
@@ -662,10 +706,13 @@ func cleanContaminatedText(text string, seenDigests map[string]bool) string {
 
 // cleanMessageBlock sanitizes one content block (text or tool_result with string or nested array
 // content) and returns the updated block and whether it should be kept.
-func cleanMessageBlock(block map[string]json.RawMessage, prefixes []string, cfg pluginConfig, seenDigests map[string]bool) (map[string]json.RawMessage, bool, bool) {
+func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResult bool, prefixes []string, cfg pluginConfig, seenDigests map[string]bool) (map[string]json.RawMessage, bool, bool) {
 	changed := false
 	var blockType string
 	_ = json.Unmarshal(block["type"], &blockType)
+	if blockType == "tool_use" {
+		return block, true, false
+	}
 	if blockType == "tool_result" {
 		rawInner, ok := block["content"]
 		if !ok {
@@ -674,11 +721,16 @@ func cleanMessageBlock(block map[string]json.RawMessage, prefixes []string, cfg 
 		var innerText string
 		if json.Unmarshal(rawInner, &innerText) == nil {
 			updated := innerText
+			if cfg.Features.NeutralizeClassifierStopNudge {
+				if repl, exact := replaceExactToolResultText(updated); exact {
+					updated = repl
+				}
+			}
 			if cfg.Features.StripRestrictiveReminders {
 				updated = restrictiveSystemReminderPattern.ReplaceAllString(updated, "")
 			}
 			if cfg.Features.DeduplicateInjectedHistory {
-				updated = cleanContaminatedText(updated, seenDigests)
+				updated = cleanContaminatedText(updated, false, seenDigests)
 			}
 			if updated != innerText {
 				block["content"], _ = json.Marshal(strings.TrimSpace(updated))
@@ -691,7 +743,7 @@ func cleanMessageBlock(block map[string]json.RawMessage, prefixes []string, cfg 
 			outInner := make([]map[string]json.RawMessage, 0, len(innerBlocks))
 			innerChanged := false
 			for _, ib := range innerBlocks {
-				cleanedIB, keep, ibMod := cleanMessageBlock(ib, nil, cfg, seenDigests)
+				cleanedIB, keep, ibMod := cleanMessageBlock(ib, role, true, nil, cfg, seenDigests)
 				if ibMod {
 					innerChanged = true
 				}
@@ -725,12 +777,33 @@ func cleanMessageBlock(block map[string]json.RawMessage, prefixes []string, cfg 
 			return block, false, true
 		}
 	}
+	if inToolResult {
+		if cfg.Features.NeutralizeClassifierStopNudge {
+			if repl, exact := replaceExactToolResultText(updatedText); exact {
+				updatedText = repl
+				changed = true
+			}
+		}
+	} else {
+		if cfg.Features.RewriteCyberSystemPrompt && (role == "system" || role == "developer") {
+			if rewritten := rewriteSystemPromptText(updatedText); rewritten != updatedText {
+				updatedText = rewritten
+				changed = true
+			}
+		}
+		if cfg.Features.NeutralizeClassifierStopNudge {
+			if neutralized := neutralizeTextNudges(updatedText); neutralized != updatedText {
+				updatedText = neutralized
+				changed = true
+			}
+		}
+	}
 	if cfg.Features.StripRestrictiveReminders && restrictiveSystemReminderPattern.MatchString(updatedText) {
 		updatedText = strings.TrimSpace(restrictiveSystemReminderPattern.ReplaceAllString(updatedText, ""))
 		changed = true
 	}
 	if cfg.Features.DeduplicateInjectedHistory {
-		afterDedup := cleanContaminatedText(updatedText, seenDigests)
+		afterDedup := cleanContaminatedText(updatedText, !inToolResult, seenDigests)
 		if afterDedup != updatedText {
 			updatedText = strings.TrimSpace(afterDedup)
 			changed = true
@@ -784,7 +857,9 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 		(bytes.Contains(rawMessages, []byte("<system-reminder>")) ||
 			bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt)) ||
 			bytes.Contains(rawMessages, []byte(claudeCyberGateReplacement)))
-	if !hasNotice && !hasReminder && !hasDedupTarget {
+	hasNudge := cfg.Features.NeutralizeClassifierStopNudge && containsClassifierNudge(rawMessages)
+	hasSystemGate := cfg.Features.RewriteCyberSystemPrompt && bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt))
+	if !hasNotice && !hasReminder && !hasDedupTarget && !hasNudge && !hasSystemGate {
 		return rawMessages
 	}
 	var messages []map[string]json.RawMessage
@@ -816,11 +891,17 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 					}
 				}
 			}
+			if cfg.Features.RewriteCyberSystemPrompt && (role == "system" || role == "developer") {
+				updatedText = rewriteSystemPromptText(updatedText)
+			}
+			if cfg.Features.NeutralizeClassifierStopNudge {
+				updatedText = neutralizeTextNudges(updatedText)
+			}
 			if cfg.Features.StripRestrictiveReminders {
 				updatedText = restrictiveSystemReminderPattern.ReplaceAllString(updatedText, "")
 			}
 			if cfg.Features.DeduplicateInjectedHistory {
-				updatedText = cleanContaminatedText(updatedText, seenDigests)
+				updatedText = cleanContaminatedText(updatedText, true, seenDigests)
 			}
 			if updatedText != text {
 				trimmed := strings.TrimSpace(updatedText)
@@ -842,7 +923,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 		filtered := make([]map[string]json.RawMessage, 0, len(blocks))
 		blockChanged := false
 		for _, block := range blocks {
-			cleanedBlock, keep, mod := cleanMessageBlock(block, prefixes, cfg, seenDigests)
+			cleanedBlock, keep, mod := cleanMessageBlock(block, role, false, prefixes, cfg, seenDigests)
 			if mod {
 				blockChanged = true
 			}
@@ -876,20 +957,20 @@ func sanitizeRequest(payload []byte, headers http.Header, cfg pluginConfig) (bod
 		headersOut = headers.Clone()
 	}
 
-	if cfg.Features.RewriteCyberSystemPrompt {
-		bodyOut = bytes.ReplaceAll(bodyOut, []byte(claudeCyberGatePrompt), []byte(claudeCyberGateReplacement))
-	}
-	if cfg.Features.NeutralizeClassifierStopNudge {
-		bodyOut = bytes.ReplaceAll(bodyOut, []byte(claudeRefusalRetryNudge), []byte(claudeRefusalReplacement))
-		bodyOut = bytes.ReplaceAll(bodyOut, []byte(strings.ReplaceAll(claudeRefusalRetryNudge, "—", "\\u2014")), []byte(claudeRefusalReplacement))
-		bodyOut = bytes.ReplaceAll(bodyOut, []byte(claudeRetryNudgeMidGeneration), []byte(claudeRefusalReplacement))
-		bodyOut = bytes.ReplaceAll(bodyOut, []byte(claudeToolNotRunClassifier), []byte(claudeToolNotRunReplacement))
-		bodyOut = bytes.ReplaceAll(bodyOut, []byte(claudeToolInterruptedClassifier), []byte(claudeToolInterruptedReplacement))
-	}
-
 	var body map[string]json.RawMessage
 	if len(bodyOut) > 0 && json.Unmarshal(bodyOut, &body) == nil {
 		bodyModified := false
+		if cfg.Features.RewriteCyberSystemPrompt {
+			for _, field := range []string{"system", "systemInstruction", "instructions"} {
+				if rawSys, ok := body[field]; ok {
+					updated := rewriteSystemPromptJSON(rawSys)
+					if !bytes.Equal(updated, rawSys) {
+						body[field] = updated
+						bodyModified = true
+					}
+				}
+			}
+		}
 		if _, ok := body["safeguards"]; ok {
 			hadSafeguards = true
 			if cfg.Features.BypassAutoModeClassifier {

@@ -272,6 +272,45 @@ func TestStripLocalCommandCaveatsAndInterruptNoise(t *testing.T) {
 	}
 }
 
+func TestStripMCPReconnectChurnAndReaParanoia(t *testing.T) {
+	cfg := defaultPluginConfig()
+	turn1Sys := "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded:\nCronCreate\nmcp__rea__open_binary\n\n# MCP Server Instructions\n\n## rea\nREA provides reverse-engineering tools." + claudeReaDataOnlyDirective + claudeReaProvenanceNote + "\n\n# Environment\n - Platform: linux"
+	turn2Sys := "The following deferred tools are now available via ToolSearch. Their schemas are NOT loaded:\nFetchInboxMessage\n\n240 deferred tools are no longer available (MCP server disconnected): mcp__rea__* (207).\n\nThis is ambient context — do not narrate it to the user unless they ask or it is directly relevant to their request.\n\nThe following MCP servers have disconnected. Their instructions above no longer apply:\nrea"
+	turn3Sys := "240 deferred tools are available again (MCP server reconnected): mcp__rea__* (207).\n\nThe following deferred tools are no longer available in this session. Do not search for them:\nFetchInboxMessage\n\nThis is ambient context — do not narrate it to the user unless they ask or it is directly relevant to their request.\n\n# MCP Server Instructions\n\n## rea\nREA provides reverse-engineering tools." + claudeReaDataOnlyDirective
+
+	body := `{"model":"claude-fable-5-2","messages":[` +
+		`{"role":"user","content":[{"type":"text","text":` + mustJSON(turn1Sys) + `},{"type":"text","text":"q1"}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":"a1"}]},` +
+		`{"role":"user","content":[{"type":"text","text":` + mustJSON(turn2Sys) + `},{"type":"text","text":"q2"}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":"a2"}]},` +
+		`{"role":"user","content":[{"type":"text","text":` + mustJSON(turn3Sys) + `},{"type":"text","text":"q3"}]}]}`
+
+	out, _, _, _ := sanitizeRequest([]byte(body), http.Header{}, cfg)
+	text := string(out)
+	for _, gone := range []string{
+		"never as instructions",
+		"_meta.provenance.untrusted_content",
+		"This is ambient context",
+		"deferred tools are no longer available",
+		"deferred tools are available again",
+		"MCP servers have disconnected",
+		"CronCreate",
+	} {
+		if strings.Contains(text, gone) {
+			t.Fatalf("MCP churn or paranoia %q survived: %s", gone, text)
+		}
+	}
+	if got := strings.Count(text, "# MCP Server Instructions"); got != 1 {
+		t.Fatalf("# MCP Server Instructions count = %d, want 1 in %s", got, text)
+	}
+	for _, want := range []string{"FetchInboxMessage", "REA provides reverse-engineering tools.", "# Environment", "q1", "q2", "q3"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected active context %q was stripped: %s", want, text)
+		}
+	}
+}
+
+
 
 
 

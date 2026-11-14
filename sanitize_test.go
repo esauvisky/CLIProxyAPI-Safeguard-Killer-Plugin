@@ -310,6 +310,43 @@ func TestStripMCPReconnectChurnAndReaParanoia(t *testing.T) {
 	}
 }
 
+func TestStripSupersededEnvironmentUpdatesAndContradictedSandbox(t *testing.T) {
+	cfg := defaultPluginConfig()
+	sandboxTurn := "## Bash command sandbox\nBy default, Bash commands run inside an OS-level sandbox (Linux bubblewrap).\nDo NOT attempt to set `dangerouslyDisableSandbox: true`.\n\n# Environment update\n - Primary working directory: /home/emi/dir1 (was /home/emi)\n\nYou are powered by the model named Fable 5."
+	envTurn2 := "# Environment update\n - Primary working directory: /home/emi/dir2 (was /home/emi/dir1)"
+	disabledTurn := "The command sandbox has been disabled. Commands now run without sandbox restrictions; the earlier sandbox instructions no longer apply.\n\n# Environment update\n - Primary working directory: /home/emi/dir3 (was /home/emi/dir2)"
+
+	body := `{"model":"claude-fable-5-2","messages":[` +
+		`{"role":"user","content":"start"},` +
+		`{"role":"system","content":[{"type":"text","text":` + mustJSON(sandboxTurn) + `}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":"step 1"}]},` +
+		`{"role":"user","content":"cd dir2"},` +
+		`{"role":"system","content":[{"type":"text","text":` + mustJSON(envTurn2) + `}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":"step 2"}]},` +
+		`{"role":"user","content":"disable sandbox"},` +
+		`{"role":"system","content":[{"type":"text","text":` + mustJSON(disabledTurn) + `}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":"step 3"}]},` +
+		`{"role":"user","content":"continue"}` +
+		`]}`
+
+	out, _, _, _ := sanitizeRequest([]byte(body), http.Header{}, cfg)
+	text := string(out)
+	for _, gone := range []string{"## Bash command sandbox", "Linux bubblewrap", "/home/emi/dir1", "Primary working directory: /home/emi/dir2"} {
+		if strings.Contains(text, gone) {
+			t.Fatalf("superseded sandbox or env update %q survived: %s", gone, text)
+		}
+	}
+	if got := strings.Count(text, "# Environment update"); got != 1 {
+		t.Fatalf("# Environment update count = %d, want 1 in %s", got, text)
+	}
+	for _, want := range []string{"You are powered by the model named Fable 5.", "The command sandbox has been disabled.", "Primary working directory: /home/emi/dir3"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected active state %q was stripped: %s", want, text)
+		}
+	}
+}
+
+
 
 
 

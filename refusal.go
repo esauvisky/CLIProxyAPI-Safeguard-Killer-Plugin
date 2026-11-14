@@ -723,6 +723,7 @@ var (
 	deferredToolsUnavailableBlockPattern = regexp.MustCompile(`(?m)^The following deferred tools are no longer available in this session\.[^\n]*\r?\n(?:[A-Za-z0-9_:*.-]+[ \t]*\r?\n?)*`)
 	mcpServersDisconnectedBlockPattern   = regexp.MustCompile(`(?m)^The following MCP servers have disconnected\.[^\n]*\r?\n(?:[A-Za-z0-9_:*.-]+[ \t]*\r?\n?)*`)
 	deferredToolsAvailableBlockPattern   = regexp.MustCompile(`(?m)^The following deferred tools are now available via ToolSearch\.[^\n]*\r?\n(?:[A-Za-z0-9_:*.-]+[ \t]*\r?\n?)+`)
+	envUpdateBlockPattern                = regexp.MustCompile(`(?m)^# Environment update\r?\n(?:[ \t]*-[ \t]*[^\n]+\r?\n?)+[ \t\r\n]*`)
 	systemNotificationPreamblePattern    = regexp.MustCompile(
 		`(?is)\[SYSTEM NOTIFICATION\s*-\s*NOT USER INPUT\]\s*This is an automated background-task event[^\n]*\n(?:Do NOT interpret[^\n]*\n)?(?:No human input has been received[^\n]*\n?)?[ \t\r\n]*`,
 	)
@@ -734,6 +735,37 @@ type cleanTurnMeta struct {
 	origIdx                int
 	lastDeferredToolsIdx   int
 	lastMCPInstructionsIdx int
+	lastEnvUpdateIdx       int
+	supersededSandboxUntil int
+}
+
+func stripBashSandboxSection(s string) string {
+	const header = "## Bash command sandbox"
+	for {
+		idx := strings.Index(s, header)
+		if idx == -1 {
+			return s
+		}
+		rest := s[idx+len(header):]
+		end := len(rest)
+		for _, stop := range []string{"\n# ", "\nYou are powered by the model named ", "</system-reminder>", "<total_tokens>"} {
+			if pos := strings.Index(rest, stop); pos != -1 && pos < end {
+				end = pos
+			}
+		}
+		s = s[:idx] + strings.TrimLeft(rest[end:], "\r\n")
+	}
+}
+
+func stripSupersededEnvAndSandbox(s string, meta cleanTurnMeta) string {
+	if meta.origIdx < meta.supersededSandboxUntil && strings.Contains(s, "## Bash command sandbox") {
+		s = stripBashSandboxSection(s)
+	}
+	if meta.origIdx < meta.lastEnvUpdateIdx && strings.Contains(s, "# Environment update") {
+		s = envUpdateBlockPattern.ReplaceAllString(s, "")
+	}
+	s = emptySystemReminderPattern.ReplaceAllString(s, "")
+	return s
 }
 
 func stripMCPServerInstructionsSection(s string) string {
@@ -1014,6 +1046,7 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, meta clean
 		afterDedup := cleanContaminatedText(updatedText, !meta.inToolResult, seenDigests)
 		if !meta.inToolResult {
 			afterDedup = stripMCPAndDeferredToolChurn(afterDedup, meta)
+			afterDedup = stripSupersededEnvAndSandbox(afterDedup, meta)
 			if role == "user" {
 				afterDedup = stripLocalCommandAndInterruptNoise(afterDedup)
 			}
@@ -1094,6 +1127,8 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			bytes.Contains(rawMessages, []byte("MCP Server Instructions")) ||
 			bytes.Contains(rawMessages, []byte("MCP servers have disconnected")) ||
 			bytes.Contains(rawMessages, []byte("ambient context")) ||
+			bytes.Contains(rawMessages, []byte("# Environment update")) ||
+			bytes.Contains(rawMessages, []byte("## Bash command sandbox")) ||
 			bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt)) ||
 			bytes.Contains(rawMessages, []byte(claudeCyberGateReplacement)))
 	hasNudge := cfg.Features.NeutralizeClassifierStopNudge && containsClassifierNudge(rawMessages)
@@ -1112,6 +1147,8 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 	lastDeferredToolsIdx := -1
 	lastMCPInstructionsIdx := -1
 	lastMCPDisconnectedIdx := -1
+	lastEnvUpdateIdx := -1
+	supersededSandboxUntil := -1
 	if cfg.Features.DeduplicateInjectedHistory {
 		for idx, msg := range messages {
 			txt := extractMessageText(msg["content"])
@@ -1123,6 +1160,15 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			}
 			if strings.Contains(txt, "The following MCP servers have disconnected.") {
 				lastMCPDisconnectedIdx = idx
+			}
+			if strings.Contains(txt, "# Environment update") {
+				lastEnvUpdateIdx = idx
+			}
+			if strings.Contains(txt, "## Bash command sandbox") {
+				supersededSandboxUntil = idx
+			}
+			if strings.Contains(txt, "The command sandbox has been disabled.") {
+				supersededSandboxUntil = idx + 1
 			}
 		}
 		if lastMCPDisconnectedIdx > lastMCPInstructionsIdx {
@@ -1138,6 +1184,8 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			origIdx:                origIdx,
 			lastDeferredToolsIdx:   lastDeferredToolsIdx,
 			lastMCPInstructionsIdx: lastMCPInstructionsIdx,
+			lastEnvUpdateIdx:       lastEnvUpdateIdx,
+			supersededSandboxUntil: supersededSandboxUntil,
 		}
 		var role string
 		_ = json.Unmarshal(msg["role"], &role)
@@ -1175,6 +1223,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			if cfg.Features.DeduplicateInjectedHistory {
 				updatedText = cleanContaminatedText(updatedText, true, seenDigests)
 				updatedText = stripMCPAndDeferredToolChurn(updatedText, meta)
+				updatedText = stripSupersededEnvAndSandbox(updatedText, meta)
 				if role == "user" {
 					updatedText = stripLocalCommandAndInterruptNoise(updatedText)
 				}

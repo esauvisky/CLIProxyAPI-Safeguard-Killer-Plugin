@@ -694,7 +694,63 @@ func containsClassifierNudge(raw []byte) bool {
 	return false
 }
 
-var interruptedOutputPattern = regexp.MustCompile(`(?is)<interrupted-output>(.*?)</interrupted-output>`)
+var (
+	interruptedOutputPattern = regexp.MustCompile(`(?is)<interrupted-output>(.*?)</interrupted-output>`)
+	leakedCoTHeaderPattern   = regexp.MustCompile(`(?is)^\s*(?:Thinking Process:\s*\n+|thought\r?\n+)`)
+	leakedCoTSelfTalkPattern = regexp.MustCompile(`(?im)^\s*\*?\*?(?:WAIT A SECOND!?[^\n]*|STOP AND LOOK AT[^\n]*|Hold on\s*[—–-][^\n]*|Wait\s*[—–:-]\s*(?:hold on|I made|let's|why|did)[^\n]*)\*?\*?\s*\n?`)
+	leakedCoTRhetoricalLine  = regexp.MustCompile(`(?m)^[^\n]*\?!\s*\n?`)
+)
+
+func isNonClaudeToolUseID(id string) bool {
+	for _, prefix := range []string{"cpa_gemini_", "tool_", "call_", "fc_"} {
+		if strings.HasPrefix(id, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNonClaudeToolUse(blocks []map[string]json.RawMessage) bool {
+	for _, b := range blocks {
+		var blockType string
+		if json.Unmarshal(b["type"], &blockType) != nil || blockType != "tool_use" {
+			continue
+		}
+		var id string
+		if json.Unmarshal(b["id"], &id) == nil && isNonClaudeToolUseID(strings.TrimSpace(id)) {
+			return true
+		}
+	}
+	return false
+}
+
+func stripLeakedAssistantCoT(s string) string {
+	updated := leakedCoTHeaderPattern.ReplaceAllString(s, "")
+	updated = leakedCoTSelfTalkPattern.ReplaceAllString(updated, "")
+	if updated != s || strings.Contains(s, "?!\n") || strings.HasSuffix(strings.TrimSpace(s), "?!") {
+		updated = leakedCoTRhetoricalLine.ReplaceAllString(updated, "")
+	}
+	return updated
+}
+
+func containsCrossModelCoT(raw []byte) bool {
+	for _, needle := range []string{
+		"cpa_gemini_",
+		`"id":"tool_`, `"id": "tool_`,
+		`"id":"call_`, `"id": "call_`,
+		`"id":"fc_`, `"id": "fc_`,
+		"Thinking Process:",
+		"thought\n", `thought\n`,
+		"WAIT A SECOND",
+		"STOP AND LOOK AT",
+		"?!",
+	} {
+		if bytes.Contains(raw, []byte(needle)) {
+			return true
+		}
+	}
+	return false
+}
 
 func stripRefusedInterruptedOutput(s string) string {
 	if !strings.Contains(s, "<interrupted-output>") {
@@ -871,8 +927,14 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 			changed = true
 		}
 	}
-	if !inToolResult && cfg.Features.FallbackOnRefusal && role == "assistant" && detectTextRefusal(updatedText) != "" {
-		return block, false, true
+	if !inToolResult && cfg.Features.FallbackOnRefusal && role == "assistant" {
+		if detectTextRefusal(updatedText) != "" {
+			return block, false, true
+		}
+		if stripped := stripLeakedAssistantCoT(updatedText); stripped != updatedText {
+			updatedText = strings.TrimSpace(stripped)
+			changed = true
+		}
 	}
 	if changed {
 		if strings.TrimSpace(updatedText) == "" {
@@ -927,9 +989,10 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			bytes.Contains(rawMessages, []byte(claudeCyberGateReplacement)))
 	hasNudge := cfg.Features.NeutralizeClassifierStopNudge && containsClassifierNudge(rawMessages)
 	hasRedactedThinking := cfg.Features.FallbackOnRefusal && bytes.Contains(rawMessages, []byte(`"redacted_thinking"`))
+	hasCrossModelCoT := cfg.Features.FallbackOnRefusal && containsCrossModelCoT(rawMessages)
 	hasAssistantRefusal := cfg.Features.FallbackOnRefusal && bytes.Contains(rawMessages, []byte(`"assistant"`)) && detectTextRefusal(string(rawMessages)) != ""
 	hasSystemGate := cfg.Features.RewriteCyberSystemPrompt && (bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt)) || bytes.Contains(rawMessages, []byte(claudeFableTierPrompt)) || bytes.Contains(rawMessages, []byte(claudeVisibleThinkingClause)))
-	if !hasNotice && !hasReminder && !hasDedupTarget && !hasNudge && !hasSystemGate && !hasRedactedThinking && !hasAssistantRefusal {
+	if !hasNotice && !hasReminder && !hasDedupTarget && !hasNudge && !hasSystemGate && !hasRedactedThinking && !hasCrossModelCoT && !hasAssistantRefusal {
 		return rawMessages
 	}
 	var messages []map[string]json.RawMessage
@@ -937,9 +1000,9 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 		return rawMessages
 	}
 	seenDigests := make(map[string]bool)
-	outMessages := make([]map[string]json.RawMessage, 0, len(messages))
+	outMessages := make([]cleanIndexedMessage, 0, len(messages))
 	changed := false
-	for _, msg := range messages {
+	for origIdx, msg := range messages {
 		var role string
 		_ = json.Unmarshal(msg["role"], &role)
 		if cfg.Features.StripRestrictiveReminders && role == "system" && restrictiveSystemReminderPattern.Match(msg["content"]) {
@@ -948,7 +1011,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 		}
 		rawContent, ok := msg["content"]
 		if !ok {
-			outMessages = append(outMessages, msg)
+			outMessages = append(outMessages, cleanIndexedMessage{msg: msg, origIdx: origIdx})
 			continue
 		}
 		var text string
@@ -958,6 +1021,8 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 				if strings.HasPrefix(strings.TrimSpace(updatedText), p) {
 					if idx := strings.Index(updatedText, "\n\n"); idx != -1 {
 						updatedText = updatedText[idx+2:]
+					} else {
+						updatedText = ""
 					}
 				}
 			}
@@ -974,30 +1039,42 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			if cfg.Features.DeduplicateInjectedHistory {
 				updatedText = cleanContaminatedText(updatedText, true, seenDigests)
 			}
-			if cfg.Features.FallbackOnRefusal && role == "assistant" && detectTextRefusal(updatedText) != "" {
-				changed = true
-				continue
+			if cfg.Features.FallbackOnRefusal && role == "assistant" {
+				if detectTextRefusal(updatedText) != "" {
+					changed = true
+					continue
+				}
+				updatedText = stripLeakedAssistantCoT(updatedText)
 			}
 			if updatedText != text {
 				trimmed := strings.TrimSpace(updatedText)
-				if trimmed == "" && role == "system" {
+				if trimmed == "" && (role == "system" || role == "assistant") {
 					changed = true
 					continue
 				}
 				msg["content"], _ = json.Marshal(updatedText)
 				changed = true
 			}
-			outMessages = append(outMessages, msg)
+			outMessages = append(outMessages, cleanIndexedMessage{msg: msg, origIdx: origIdx})
 			continue
 		}
 		var blocks []map[string]json.RawMessage
 		if json.Unmarshal(rawContent, &blocks) != nil {
-			outMessages = append(outMessages, msg)
+			outMessages = append(outMessages, cleanIndexedMessage{msg: msg, origIdx: origIdx})
 			continue
 		}
+		dropPreToolNarration := cfg.Features.FallbackOnRefusal && role == "assistant" && hasNonClaudeToolUse(blocks)
 		filtered := make([]map[string]json.RawMessage, 0, len(blocks))
 		blockChanged := false
 		for _, block := range blocks {
+			if dropPreToolNarration {
+				var bt string
+				_ = json.Unmarshal(block["type"], &bt)
+				if bt == "text" {
+					blockChanged = true
+					continue
+				}
+			}
 			cleanedBlock, keep, mod := cleanMessageBlock(block, role, false, prefixes, cfg, seenDigests)
 			if mod {
 				blockChanged = true
@@ -1015,16 +1092,126 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			}
 			msg["content"], _ = json.Marshal(filtered)
 		}
-		outMessages = append(outMessages, msg)
+		outMessages = append(outMessages, cleanIndexedMessage{msg: msg, origIdx: origIdx})
+	}
+	normalized, normChanged := normalizeCleanedIndexedMessages(outMessages)
+	if normChanged {
+		changed = true
 	}
 	if !changed {
 		return rawMessages
 	}
-	out, errMarshal := json.Marshal(outMessages)
+	out, errMarshal := json.Marshal(normalized)
 	if errMarshal != nil {
 		return rawMessages
 	}
 	return out
+}
+
+type cleanIndexedMessage struct {
+	msg     map[string]json.RawMessage
+	origIdx int
+}
+
+// normalizeCleanedIndexedMessages ensures mid-conversation role="system" turns never precede a
+// role="user" turn (Anthropic HTTP 400) after an intervening assistant turn is dropped, and merges
+// adjacent same-role turns separated by a dropped turn while keeping leading tool_result blocks first.
+func normalizeCleanedIndexedMessages(items []cleanIndexedMessage) ([]map[string]json.RawMessage, bool) {
+	if len(items) == 0 {
+		return []map[string]json.RawMessage{}, false
+	}
+	changed := false
+	roleOf := func(m map[string]json.RawMessage) string {
+		var r string
+		_ = json.Unmarshal(m["role"], &r)
+		return r
+	}
+	// Pass 1: resolve mid-conversation system turns whose next non-system turn is "user".
+	pass1 := make([]cleanIndexedMessage, 0, len(items))
+	var pendingTaskReminders []map[string]json.RawMessage
+	for i := 0; i < len(items); i++ {
+		role := roleOf(items[i].msg)
+		if role == "system" {
+			nextNonSys := ""
+			for j := i + 1; j < len(items); j++ {
+				if r := roleOf(items[j].msg); r != "system" {
+					nextNonSys = r
+					break
+				}
+			}
+			if nextNonSys == "user" {
+				changed = true
+				sysText := extractMessageText(items[i].msg["content"])
+				if strings.Contains(sysText, "<task-notification>") {
+					rawText, _ := json.Marshal("<system-reminder>\n" + strings.TrimSpace(sysText) + "\n</system-reminder>")
+					pendingTaskReminders = append(pendingTaskReminders, map[string]json.RawMessage{
+						"type": json.RawMessage(`"text"`),
+						"text": rawText,
+					})
+				}
+				continue
+			}
+		}
+		if role == "user" && len(pendingTaskReminders) > 0 {
+			blocks := contentToBlocks(items[i].msg["content"])
+			blocks = append(blocks, pendingTaskReminders...)
+			items[i].msg["content"], _ = json.Marshal(blocks)
+			pendingTaskReminders = nil
+			changed = true
+		}
+		pass1 = append(pass1, items[i])
+	}
+	// Pass 2: merge adjacent user or assistant messages when a turn originally between them was dropped.
+	out := make([]map[string]json.RawMessage, 0, len(pass1))
+	prevOrig := -1
+	for _, it := range pass1 {
+		role := roleOf(it.msg)
+		if len(out) > 0 && (role == "user" || role == "assistant") && roleOf(out[len(out)-1]) == role && it.origIdx > prevOrig+1 {
+			merged := append(contentToBlocks(out[len(out)-1]["content"]), contentToBlocks(it.msg["content"])...)
+			out[len(out)-1]["content"], _ = json.Marshal(merged)
+			prevOrig = it.origIdx
+			changed = true
+			continue
+		}
+		out = append(out, it.msg)
+		prevOrig = it.origIdx
+	}
+	return out, changed
+}
+
+func extractMessageText(raw json.RawMessage) string {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var blocks []map[string]json.RawMessage
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
+	}
+	var parts []string
+	for _, b := range blocks {
+		var t string
+		if json.Unmarshal(b["text"], &t) == nil && t != "" {
+			parts = append(parts, t)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func contentToBlocks(raw json.RawMessage) []map[string]json.RawMessage {
+	var blocks []map[string]json.RawMessage
+	if json.Unmarshal(raw, &blocks) == nil {
+		return blocks
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		rawText, _ := json.Marshal(s)
+		return []map[string]json.RawMessage{{
+			"type": json.RawMessage(`"text"`),
+			"text": rawText,
+		}}
+	}
+	return nil
 }
 
 // sanitizeRequest applies the enabled wire adaptations to a request body and headers, returning

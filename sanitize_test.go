@@ -136,3 +136,58 @@ func TestCleanMessagesStripsRedactedThinkingAndRefusedInterruptedOutput(t *testi
 		t.Fatalf("legitimate interrupted-output was stripped: %s", text)
 	}
 }
+
+func TestCleanMessagesAblatesCrossModelCoTAndHealsOrphanedSystem(t *testing.T) {
+	cfg := defaultPluginConfig()
+	geminiCoT := "STOP AND LOOK AT THAT `strace` OUTPUT!\nWhy is `s_start` STILL `153740`?!\nLet's verify that in 2 seconds!"
+	leakedTextOnly := "Thinking Process:\n\nWAIT A SECOND!\nWhy did it fail?!\nThe SSD controller is in hardware read-only mode."
+	taskSys := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n<task-notification><task-id>t1</task-id><status>completed</status></task-notification>"
+	exhaustedNotice := "⚡ [Safeguard Killer] every model in Quality First failed: `claude-opus-5-5` (refusal: reasoning_extraction)"
+
+	body := `{"model":"claude-fable-5-2","messages":[` +
+		`{"role":"user","content":"check the disk"},` +
+		`{"role":"assistant","content":[{"type":"text","text":` + mustJSON(geminiCoT) + `},{"type":"tool_use","id":"cpa_gemini_b2dbd0f067dc67aa75e1a939a7ccbe93","name":"Bash","input":{"command":"dd if=/dev/sda"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"cpa_gemini_b2dbd0f067dc67aa75e1a939a7ccbe93","content":"0000: 02c0"}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":` + mustJSON(leakedTextOnly) + `}]},` +
+		`{"role":"user","content":"try trim"},` +
+		`{"role":"assistant","content":[{"type":"text","text":"Wait — I made an arithmetic error!"},{"type":"tool_use","id":"tool_1dSvnnXcZA9ahSoBloJYFIml","name":"Bash","input":{"command":"hdparm"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1dSvnnXcZA9ahSoBloJYFIml","content":"trim ok"}]},` +
+		`{"role":"system","content":[{"type":"text","text":` + mustJSON(taskSys) + `}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":` + mustJSON(exhaustedNotice) + `}]},` +
+		`{"role":"user","content":[{"type":"text","text":"continue"}]},` +
+		`{"role":"system","content":[{"type":"text","text":"You are powered by Fable 5."}]}` +
+		`]}`
+
+	out, _, _, _ := sanitizeRequest([]byte(body), http.Header{}, cfg)
+	text := string(out)
+
+	for _, gone := range []string{"STOP AND LOOK AT", "Thinking Process:", "WAIT A SECOND", "arithmetic error", "every model in Quality First failed"} {
+		if strings.Contains(text, gone) {
+			t.Fatalf("cross-model CoT or notice %q survived: %s", gone, text)
+		}
+	}
+	for _, want := range []string{"The SSD controller is in hardware read-only mode.", "cpa_gemini_b2dbd0f067dc67aa75e1a939a7ccbe93", "<task-notification>", "continue", "You are powered by Fable 5."} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected content %q missing: %s", want, text)
+		}
+	}
+
+	var parsed struct {
+		Messages []struct {
+			Role    string            `json:"role"`
+			Content []json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("unmarshal sanitized payload: %v", err)
+	}
+	for i, m := range parsed.Messages {
+		if m.Role == "system" && i < len(parsed.Messages)-1 && parsed.Messages[i+1].Role != "assistant" {
+			t.Fatalf("messages[%d] role=system precedes role=%s", i, parsed.Messages[i+1].Role)
+		}
+		if i > 0 && (m.Role == "user" || m.Role == "assistant") && parsed.Messages[i-1].Role == m.Role {
+			t.Fatalf("adjacent %s messages at %d and %d", m.Role, i-1, i)
+		}
+	}
+}
+

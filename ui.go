@@ -6,13 +6,16 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const (
-	uiResourcePath     = "/ui"
-	mgmtStateRoutePath = "/plugins/safeguard-killer/state"
-	mgmtTrailRoutePath = "/plugins/safeguard-killer/trail"
-	mgmtDrainRoutePath = "/plugins/safeguard-killer/drain"
+	uiResourcePath        = "/ui"
+	mgmtStateRoutePath    = "/plugins/safeguard-killer/state"
+	mgmtTrailRoutePath    = "/plugins/safeguard-killer/trail"
+	mgmtDrainRoutePath    = "/plugins/safeguard-killer/drain"
+	mgmtPayloadsRoutePath = "/plugins/safeguard-killer/payloads"
+	mgmtPreviewRoutePath  = "/plugins/safeguard-killer/preview"
 )
 
 type managementRegistration struct {
@@ -64,6 +67,16 @@ func managementRegistrationPayload() managementRegistration {
 				Method:      http.MethodPost,
 				Path:        mgmtDrainRoutePath,
 				Description: "Drain one conversation's routing state ({key, group_id}) without restarting.",
+			},
+			{
+				Method:      http.MethodGet,
+				Path:        mgmtPayloadsRoutePath,
+				Description: "Returns captured client request payloads (?id=<capture id>) with raw incoming and sanitized outgoing JSON.",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        mgmtPreviewRoutePath,
+				Description: "Dry-runs Safeguard Killer request sanitization on a raw JSON request body without sending upstream.",
 			},
 		},
 		Resources: []managementResource{
@@ -132,6 +145,58 @@ func handleManagement(request []byte) ([]byte, error) {
 		body, errMarshal := json.Marshal(struct{ Drained bool }{Drained: true})
 		if errMarshal != nil {
 			return nil, fmt.Errorf("marshal drain response: %w", errMarshal)
+		}
+		return okEnvelope(managementResponse{
+			StatusCode: http.StatusOK,
+			Headers: http.Header{
+				"Content-Type":  []string{"application/json; charset=utf-8"},
+				"Cache-Control": []string{"no-store"},
+			},
+			Body: body,
+		})
+	case strings.HasSuffix(path, mgmtPayloadsRoutePath):
+		if req.Method != http.MethodGet {
+			return nil, fmt.Errorf("management route %s: unsupported method %q", path, req.Method)
+		}
+		id := req.Query.Get("id")
+		entry, ok := lookupCapturedPayload(id)
+		if !ok {
+			errBody, _ := json.Marshal(struct {
+				Error string `json:"error"`
+			}{Error: "captured payload not found"})
+			return okEnvelope(managementResponse{
+				StatusCode: http.StatusNotFound,
+				Headers: http.Header{
+					"Content-Type":  []string{"application/json; charset=utf-8"},
+					"Cache-Control": []string{"no-store"},
+				},
+				Body: errBody,
+			})
+		}
+		body, errMarshal := json.Marshal(entry)
+		if errMarshal != nil {
+			return nil, fmt.Errorf("marshal captured payload: %w", errMarshal)
+		}
+		return okEnvelope(managementResponse{
+			StatusCode: http.StatusOK,
+			Headers: http.Header{
+				"Content-Type":  []string{"application/json; charset=utf-8"},
+				"Cache-Control": []string{"no-store"},
+			},
+			Body: body,
+		})
+	case strings.HasSuffix(path, mgmtPreviewRoutePath):
+		if req.Method != http.MethodPost {
+			return nil, fmt.Errorf("management route %s: unsupported method %q", path, req.Method)
+		}
+		sanitized, _, _, _ := sanitizeRequest(req.Body, req.Headers, currentConfig())
+		entry, ok := inspectPayloadMeta(req.Body, sanitized, req.Headers, "preview", time.Now())
+		if !ok {
+			return nil, fmt.Errorf("preview body must be a valid JSON object")
+		}
+		body, errMarshal := json.Marshal(entry)
+		if errMarshal != nil {
+			return nil, fmt.Errorf("marshal preview payload: %w", errMarshal)
 		}
 		return okEnvelope(managementResponse{
 			StatusCode: http.StatusOK,
@@ -497,6 +562,17 @@ const uiHTML = `<!doctype html>
   .feature-item input[type="checkbox"] { margin-top: 3px; accent-color: var(--success-color); cursor: pointer; }
   .feature-title { font-weight: 650; font-size: 13px; color: var(--text-primary); display: block; }
   .feature-desc { font-size: 12px; color: var(--text-secondary); display: block; margin-top: 2px; }
+
+  .insp-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .insp-stats { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .insp-msg { border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 10px 12px; background: var(--bg-secondary); margin-bottom: 8px; }
+  .insp-msg.dropped { border-color: var(--failure-badge-border); background: var(--failure-badge-bg); }
+  .insp-msg.modified { border-color: color-mix(in srgb, var(--quota-medium-color) 55%, var(--border-color)); }
+  .insp-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+  .insp-block { margin-top: 6px; padding: 8px 10px; border-radius: 6px; background: var(--bg-tertiary); border: 1px solid color-mix(in srgb, var(--border-color) 70%, transparent); }
+  .insp-pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', 'JetBrains Mono', Menlo, Consolas, monospace; font-size: 12px; line-height: 1.45; max-height: 420px; overflow: auto; }
+  .insp-diff-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 8px; margin-top: 6px; }
+  .insp-dry { width: 100%; min-height: 150px; font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; font-size: 12px; resize: vertical; }
 </style>
 </head>
 <body>
@@ -533,6 +609,7 @@ const uiHTML = `<!doctype html>
     <button class="tab-btn" data-tab="groups">Smart Groups <span class="badge" id="tabGroupCount">0</span></button>
     <button class="tab-btn" data-tab="sessions">Sessions <span class="badge" id="tabSessCount">0</span></button>
     <button class="tab-btn" data-tab="decisions">Recent Decisions <span class="badge" id="tabDecCount">0</span></button>
+    <button class="tab-btn" data-tab="inspector">Payload Inspector <span class="badge" id="tabPayCount">0</span></button>
     <button class="tab-btn" data-tab="credentials">Credentials <span class="badge" id="tabCredCount">0</span></button>
   </nav>
 
@@ -688,6 +765,52 @@ const uiHTML = `<!doctype html>
     </section>
   </div>
 
+  <div class="tab-pane" id="pane-inspector">
+    <section class="card">
+      <div class="card-header">
+        <h2 class="card-title">Raw Payload Visualizer &amp; Sanitizer Inspector</h2>
+      </div>
+      <p class="card-desc">Inspect the exact wire JSON and structured conversation blocks entering Safeguard Killer versus what is forwarded upstream after stripping CoT leaks, distrust preambles, stale token counters, MCP churn, and superseded reminders.</p>
+      <div class="insp-bar">
+        <select class="input grow mono" id="paySelect"></select>
+        <button class="btn" id="payLoadBtn" onclick="loadSelectedPayload()">Load capture</button>
+        <button class="btn" id="payCopyRawBtn" onclick="copyCurrentPayloadToDryRun()">Edit in Dry-Run</button>
+      </div>
+      <details data-key="insp:dryrun" style="margin-bottom:12px;">
+        <summary>Dry-Run Sandbox (paste or edit raw request JSON)</summary>
+        <div style="margin-top:8px; display:flex; flex-direction:column; gap:8px;">
+          <textarea class="input insp-dry" id="payDryInput" placeholder='{"model":"claude-fable-5-2","messages":[{"role":"user","content":"hello"}]}'></textarea>
+          <div style="display:flex; gap:8px;">
+            <button class="btn primary" onclick="runDryPreview()">Preview Sanitization</button>
+          </div>
+        </div>
+      </details>
+      <div class="insp-bar">
+        <select class="input" id="payViewMode" style="width:210px;" onchange="renderLoadedPayload()">
+          <option value="diff">View: Diff (Raw vs Sanitized)</option>
+          <option value="sanitized">View: Sanitized (Upstream)</option>
+          <option value="raw">View: Raw Incoming</option>
+        </select>
+        <select class="input" id="payFormat" style="width:180px;" onchange="renderLoadedPayload()">
+          <option value="structured">Format: Structured Blocks</option>
+          <option value="json">Format: Raw JSON</option>
+        </select>
+        <select class="input" id="payRoleFilter" style="width:150px;" onchange="renderLoadedPayload()">
+          <option value="all">Role: All</option>
+          <option value="system">Role: system</option>
+          <option value="user">Role: user</option>
+          <option value="assistant">Role: assistant</option>
+        </select>
+        <label style="display:inline-flex; align-items:center; gap:6px; font-size:12px; cursor:pointer;">
+          <input type="checkbox" id="payChangedOnly" onchange="renderLoadedPayload()"> Only stripped / modified
+        </label>
+        <input class="input grow" type="search" id="paySearch" placeholder="Filter blocks by text, tool name, or tag..." oninput="renderLoadedPayload()">
+      </div>
+      <div class="insp-stats" id="payStats"></div>
+      <div id="payViewer"><div class="empty">No request captured yet. Send a prompt or run a dry-run preview above.</div></div>
+    </section>
+  </div>
+
   <div class="tab-pane" id="pane-credentials">
     <section class="card">
       <div class="card-header"><h2 class="card-title">Credentials</h2></div>
@@ -705,6 +828,8 @@ const uiHTML = `<!doctype html>
 const STATE_API_URL = '/v0/management/plugins/safeguard-killer/state';
 const TRAIL_API_URL = '/v0/management/plugins/safeguard-killer/trail';
 const DRAIN_API_URL = '/v0/management/plugins/safeguard-killer/drain';
+const PAYLOADS_API_URL = '/v0/management/plugins/safeguard-killer/payloads';
+const PREVIEW_API_URL = '/v0/management/plugins/safeguard-killer/preview';
 const CONFIG_API_URL = '/v8/management/config/plugins/configs/safeguard-killer';
 const REFRESH_MS = 10000;
 const APPLY_WAIT_MS = 1500;
@@ -1515,6 +1640,281 @@ function drainKey() {
   fetch(DRAIN_API_URL, { method: 'POST', headers: authHeaders(), body: JSON.stringify({ key: key }) })
     .then(() => { loadTrail(); location.reload(); });
 }
+
+// ---- payload inspector ----
+
+let loadedPayload = null;
+let selectedCaptureID = '';
+
+function fmtKB(bytes) {
+  return (bytes / 1024).toFixed(1) + ' KB';
+}
+
+function renderPayloadSelector() {
+  const sel = document.getElementById('paySelect');
+  if (state.payloads.length === 0) {
+    sel.innerHTML = '<option value="">No captured requests yet</option>';
+    return;
+  }
+  const hasSelected = state.payloads.some(p => p.id === selectedCaptureID);
+  if (!hasSelected) selectedCaptureID = state.payloads[0].id;
+  sel.innerHTML = state.payloads.map(p => {
+    const deltaKB = ((p.sanitized_bytes - p.raw_bytes) / 1024).toFixed(1);
+    const deltaSign = p.sanitized_bytes <= p.raw_bytes ? deltaKB : '+' + deltaKB;
+    // session is omitempty on unauthenticated or sessionless requests.
+    const sess = 'session' in p && p.session !== '' ? ' · ' + truncate(p.session, 22) : '';
+    const label = '#' + p.id + ' · ' + relText(p.time) + ' · ' + p.model + sess +
+      ' · ' + p.raw_messages + '→' + p.sanitized_messages + ' msgs · ' +
+      fmtKB(p.raw_bytes) + '→' + fmtKB(p.sanitized_bytes) + ' (' + deltaSign + ' KB)';
+    return '<option value="' + esc(p.id) + '"' + (p.id === selectedCaptureID ? ' selected' : '') + '>' + esc(label) + '</option>';
+  }).join('');
+  if (loadedPayload === null) void fetchCaptureByID(selectedCaptureID);
+}
+
+async function fetchCaptureByID(id) {
+  if (id === '') return;
+  const resp = await fetch(PAYLOADS_API_URL + '?id=' + encodeURIComponent(id), { method: 'GET', headers: authHeaders(), cache: 'no-store' });
+  const text = await resp.text();
+  if (!resp.ok) {
+    showError('HTTP ' + resp.status + ' loading captured payload ' + id, text);
+    return;
+  }
+  loadedPayload = JSON.parse(text);
+  renderLoadedPayload();
+}
+
+function loadSelectedPayload() {
+  const sel = document.getElementById('paySelect');
+  selectedCaptureID = sel.value;
+  void fetchCaptureByID(selectedCaptureID);
+}
+
+document.getElementById('paySelect').addEventListener('change', loadSelectedPayload);
+
+function copyCurrentPayloadToDryRun() {
+  if (loadedPayload === null) return;
+  document.getElementById('payDryInput').value = JSON.stringify(loadedPayload.raw_body, null, 2);
+  const det = document.querySelector('details[data-key="insp:dryrun"]');
+  det.open = true;
+  openDetails.add('insp:dryrun');
+}
+
+async function runDryPreview() {
+  const rawText = document.getElementById('payDryInput').value.trim();
+  if (rawText === '') return;
+  const headers = authHeaders();
+  headers['Content-Type'] = 'application/json';
+  const resp = await fetch(PREVIEW_API_URL, { method: 'POST', headers: headers, body: rawText, cache: 'no-store' });
+  const text = await resp.text();
+  if (!resp.ok) {
+    showError('Dry-run preview failed (HTTP ' + resp.status + ')', text);
+    return;
+  }
+  loadedPayload = JSON.parse(text);
+  renderLoadedPayload();
+}
+
+function extractBodyMessages(body) {
+  // Wire payloads carry messages (Anthropic/OpenAI chat), input (OpenAI responses), or contents (Gemini).
+  if (Array.isArray(body.messages)) return body.messages;
+  if (Array.isArray(body.input)) return body.input;
+  if (Array.isArray(body.contents)) return body.contents;
+  return [];
+}
+
+function extractSystemBlocks(body) {
+  // Top-level system prompt is optional across protocols and may be string or array.
+  if (typeof body.system === 'string') return [{ type: 'text', text: body.system }];
+  if (Array.isArray(body.system)) return body.system;
+  if (typeof body.instructions === 'string') return [{ type: 'text', text: body.instructions }];
+  return [];
+}
+
+function normalizeMsgBlocks(msg) {
+  // Message content may be a plain string or an array of typed blocks per Anthropic/OpenAI wire specs.
+  if (typeof msg.content === 'string') return [{ type: 'text', text: msg.content }];
+  if (Array.isArray(msg.content)) return msg.content;
+  if (Array.isArray(msg.parts)) return msg.parts.map(p => ('text' in p ? { type: 'text', text: p.text } : p));
+  return [{ type: 'raw', raw: JSON.stringify(msg) }];
+}
+
+function renderSingleBlock(b) {
+  const t = typeof b.type === 'string' ? b.type : 'raw';
+  if (t === 'text') {
+    const txt = typeof b.text === 'string' ? b.text : JSON.stringify(b);
+    return '<div class="insp-block"><span class="badge">text</span> <span class="subtle mono">' + txt.length + ' chars</span><pre class="insp-pre">' + esc(txt) + '</pre></div>';
+  }
+  if (t === 'thinking') {
+    const th = typeof b.thinking === 'string' ? b.thinking : '';
+    const sig = typeof b.signature === 'string' ? truncate(b.signature, 40) : '';
+    return '<div class="insp-block"><span class="badge warn">thinking</span> <span class="subtle mono">' + th.length + ' chars' + (sig !== '' ? ' · sig=' + esc(sig) : '') + '</span>' + (th !== '' ? '<pre class="insp-pre">' + esc(th) + '</pre>' : '') + '</div>';
+  }
+  if (t === 'redacted_thinking') {
+    const d = typeof b.data === 'string' ? b.data : '';
+    return '<div class="insp-block"><span class="badge bad">redacted_thinking</span> <span class="subtle mono">' + d.length + ' bytes</span></div>';
+  }
+  if (t === 'tool_use') {
+    const name = typeof b.name === 'string' ? b.name : '';
+    const id = typeof b.id === 'string' ? b.id : '';
+    const inp = 'input' in b ? JSON.stringify(b.input, null, 2) : '';
+    return '<div class="insp-block"><span class="badge ok">tool_use</span> <span class="mono">' + esc(name) + '</span> <span class="subtle mono">' + esc(id) + '</span><pre class="insp-pre">' + esc(inp) + '</pre></div>';
+  }
+  if (t === 'tool_result') {
+    const id = typeof b.tool_use_id === 'string' ? b.tool_use_id : '';
+    const inner = typeof b.content === 'string' ? b.content : JSON.stringify(b.content, null, 2);
+    return '<div class="insp-block"><span class="badge">tool_result</span> <span class="subtle mono">' + esc(id) + ' · ' + inner.length + ' chars</span><pre class="insp-pre">' + esc(inner) + '</pre></div>';
+  }
+  return '<div class="insp-block"><span class="badge">' + esc(t) + '</span><pre class="insp-pre">' + esc(JSON.stringify(b, null, 2)) + '</pre></div>';
+}
+
+function roleBadgeClass(role) {
+  if (role === 'assistant') return 'ok';
+  if (role === 'system' || role === 'developer') return 'warn';
+  return '';
+}
+
+function alignDiffRows(rawMsgs, sanMsgs) {
+  const rows = [];
+  const rawCanon = rawMsgs.map(m => JSON.stringify(m));
+  const sanCanon = sanMsgs.map(m => JSON.stringify(m));
+  let r = 0;
+  let s = 0;
+  while (r < rawMsgs.length && s < sanMsgs.length) {
+    if (rawCanon[r] === sanCanon[s]) {
+      rows.push({ status: 'kept', role: String(rawMsgs[r].role), rawIdx: r, sanIdx: s, raw: rawMsgs[r], san: sanMsgs[s] });
+      r++;
+      s++;
+      continue;
+    }
+    let futureExact = -1;
+    const limit = Math.min(rawMsgs.length, r + 64);
+    for (let k = r + 1; k < limit; k++) {
+      if (rawCanon[k] === sanCanon[s]) { futureExact = k; break; }
+    }
+    if (futureExact !== -1 || rawMsgs[r].role !== sanMsgs[s].role) {
+      rows.push({ status: 'dropped', role: String(rawMsgs[r].role), rawIdx: r, sanIdx: -1, raw: rawMsgs[r], san: null });
+      r++;
+      continue;
+    }
+    rows.push({ status: 'modified', role: String(rawMsgs[r].role), rawIdx: r, sanIdx: s, raw: rawMsgs[r], san: sanMsgs[s] });
+    r++;
+    s++;
+  }
+  while (r < rawMsgs.length) {
+    rows.push({ status: 'dropped', role: String(rawMsgs[r].role), rawIdx: r, sanIdx: -1, raw: rawMsgs[r], san: null });
+    r++;
+  }
+  while (s < sanMsgs.length) {
+    rows.push({ status: 'modified', role: String(sanMsgs[s].role), rawIdx: -1, sanIdx: s, raw: null, san: sanMsgs[s] });
+    s++;
+  }
+  return rows;
+}
+
+function renderLoadedPayload() {
+  const viewer = document.getElementById('payViewer');
+  const stats = document.getElementById('payStats');
+  if (loadedPayload === null) {
+    stats.innerHTML = '';
+    viewer.innerHTML = '<div class="empty">No request captured yet.</div>';
+    return;
+  }
+  const p = loadedPayload;
+  const rawBody = p.raw_body;
+  const sanBody = p.sanitized_body;
+  const rawSys = extractSystemBlocks(rawBody);
+  const sanSys = extractSystemBlocks(sanBody);
+  const rawTools = Array.isArray(rawBody.tools) ? rawBody.tools.length : 0;
+  const msgDelta = p.sanitized_messages - p.raw_messages;
+  const byteDelta = p.sanitized_bytes - p.raw_bytes;
+
+  stats.innerHTML =
+    '<span class="status-pill"><span class="status-label">ID</span><span class="status-value mono">#' + esc(p.id) + '</span></span>' +
+    '<span class="status-pill"><span class="status-label">Model</span><span class="status-value mono">' + esc(p.model) + '</span></span>' +
+    '<span class="status-pill"><span class="status-label">Messages</span><span class="status-value mono">' + p.raw_messages + ' → ' + p.sanitized_messages + ' (' + (msgDelta <= 0 ? msgDelta : '+' + msgDelta) + ')</span></span>' +
+    '<span class="status-pill"><span class="status-label">Bytes</span><span class="status-value mono">' + fmtKB(p.raw_bytes) + ' → ' + fmtKB(p.sanitized_bytes) + ' (' + (byteDelta <= 0 ? (byteDelta / 1024).toFixed(1) : '+' + (byteDelta / 1024).toFixed(1)) + ' KB)</span></span>' +
+    '<span class="status-pill"><span class="status-label">System blocks</span><span class="status-value mono">' + sanSys.length + '</span></span>' +
+    '<span class="status-pill"><span class="status-label">Tools</span><span class="status-value mono">' + rawTools + '</span></span>';
+
+  const mode = document.getElementById('payViewMode').value;
+  const format = document.getElementById('payFormat').value;
+  const roleFilter = document.getElementById('payRoleFilter').value;
+  const changedOnly = document.getElementById('payChangedOnly').checked;
+  const query = document.getElementById('paySearch').value.trim().toLowerCase();
+
+  if (format === 'json') {
+    const target = mode === 'raw' ? rawBody : sanBody;
+    viewer.innerHTML = '<div class="insp-msg"><div class="insp-head"><span class="badge">' + esc(mode === 'raw' ? 'Raw Incoming JSON' : 'Sanitized Outgoing JSON') + '</span></div><pre class="insp-pre" style="max-height:720px;">' + esc(JSON.stringify(target, null, 2)) + '</pre></div>';
+    return;
+  }
+
+  const htmlParts = [];
+  const rawSysJSON = JSON.stringify(rawSys);
+  const sanSysJSON = JSON.stringify(sanSys);
+  const sysModified = rawSysJSON !== sanSysJSON;
+  if ((roleFilter === 'all' || roleFilter === 'system') && (!changedOnly || sysModified)) {
+    const activeSys = mode === 'raw' ? rawSys : sanSys;
+    if (activeSys.length > 0 && (query === '' || JSON.stringify(activeSys).toLowerCase().includes(query))) {
+      let sysBody = '';
+      if (mode === 'diff' && sysModified) {
+        sysBody = '<div class="insp-diff-grid">' +
+          '<div><div class="cfg-key">Before (Raw)</div>' + rawSys.map(renderSingleBlock).join('') + '</div>' +
+          '<div><div class="cfg-key">After (Sanitized)</div>' + sanSys.map(renderSingleBlock).join('') + '</div>' +
+        '</div>';
+      } else {
+        sysBody = activeSys.map(renderSingleBlock).join('');
+      }
+      htmlParts.push('<div class="insp-msg' + (sysModified ? ' modified' : '') + '">' +
+        '<div class="insp-head"><span><span class="badge warn">top-level system</span> <span class="badge ' + (sysModified ? 'warn' : '') + '">' + (sysModified ? 'modified' : 'kept') + '</span></span></div>' +
+        details('insp:sys:' + p.id, 'System prompt (' + activeSys.length + ' block' + (activeSys.length === 1 ? '' : 's') + ')', sysBody) +
+      '</div>');
+    }
+  }
+
+  const rawMsgs = extractBodyMessages(rawBody);
+  const sanMsgs = extractBodyMessages(sanBody);
+
+  if (mode === 'diff') {
+    const rows = alignDiffRows(rawMsgs, sanMsgs);
+    for (const row of rows) {
+      if (roleFilter !== 'all' && row.role !== roleFilter) continue;
+      if (changedOnly && row.status === 'kept') continue;
+      const blob = JSON.stringify(row.raw !== null ? row.raw : row.san).toLowerCase() +
+        (row.san !== null && row.status === 'modified' ? JSON.stringify(row.san).toLowerCase() : '');
+      if (query !== '' && !blob.includes(query)) continue;
+
+      const idxLabel = row.status === 'dropped'
+        ? 'raw #' + row.rawIdx + ' → dropped'
+        : (row.rawIdx >= 0 ? 'raw #' + row.rawIdx + ' → san #' + row.sanIdx : 'san #' + row.sanIdx);
+      const stClass = row.status === 'dropped' ? 'bad' : (row.status === 'modified' ? 'warn' : 'ok');
+      let inner = '';
+      if (row.status === 'modified' && row.raw !== null && row.san !== null) {
+        inner = '<div class="insp-diff-grid">' +
+          '<div><div class="cfg-key">Before (Raw #' + row.rawIdx + ')</div>' + normalizeMsgBlocks(row.raw).map(renderSingleBlock).join('') + '</div>' +
+          '<div><div class="cfg-key">After (Sanitized #' + row.sanIdx + ')</div>' + normalizeMsgBlocks(row.san).map(renderSingleBlock).join('') + '</div>' +
+        '</div>';
+      } else {
+        const target = row.raw !== null ? row.raw : row.san;
+        inner = normalizeMsgBlocks(target).map(renderSingleBlock).join('');
+      }
+      htmlParts.push('<div class="insp-msg ' + (row.status === 'kept' ? '' : row.status) + '">' +
+        '<div class="insp-head"><span><span class="mono subtle">' + esc(idxLabel) + '</span> <span class="badge ' + roleBadgeClass(row.role) + '">' + esc(row.role) + '</span></span>' +
+        '<span class="badge ' + stClass + '">' + esc(row.status) + '</span></div>' + inner + '</div>');
+    }
+  } else {
+    const list = mode === 'raw' ? rawMsgs : sanMsgs;
+    list.forEach((m, idx) => {
+      const role = String(m.role);
+      if (roleFilter !== 'all' && role !== roleFilter) return;
+      if (query !== '' && !JSON.stringify(m).toLowerCase().includes(query)) return;
+      htmlParts.push('<div class="insp-msg">' +
+        '<div class="insp-head"><span><span class="mono subtle">#' + idx + '</span> <span class="badge ' + roleBadgeClass(role) + '">' + esc(role) + '</span></span></div>' +
+        normalizeMsgBlocks(m).map(renderSingleBlock).join('') + '</div>');
+    });
+  }
+
+  viewer.innerHTML = htmlParts.length > 0 ? htmlParts.join('') : '<div class="empty">No blocks match the current filter.</div>';
+}
 function render() {
   renderMetrics();
   const hostBanner = document.getElementById('hostErrorBanner');
@@ -1537,12 +1937,14 @@ function render() {
   document.getElementById('tabCredCount').textContent = String(state.credentials.length);
   document.getElementById('tabSessCount').textContent = String(state.sessions.length);
   document.getElementById('tabDecCount').textContent = String(state.decisions.length);
+  document.getElementById('tabPayCount').textContent = String(state.payloads.length);
   document.getElementById('modelList').innerHTML = state.models.map(m => '<option value="' + esc(m) + '"></option>').join('');
   // Follow config changes made elsewhere only while there is nothing unsaved here.
   if (draft === null || (!dirty && !saving && canonConfig(state.config) !== draftSourceCanon)) loadDraft(state.config);
   renderCredentials();
   renderSessions();
   renderDecisions();
+  renderPayloadSelector();
 }
 
 function showError(title, detail) {
@@ -1599,7 +2001,7 @@ async function doRefresh() {
       return false;
     }
     // Go encodes empty slices as null; normalize so renderers can rely on arrays.
-    for (const k of ['credentials', 'sessions', 'decisions', 'models']) if (next[k] === null) next[k] = [];
+    for (const k of ['credentials', 'sessions', 'decisions', 'models', 'payloads']) if (next[k] === null) next[k] = [];
     state = next;
     clockSkewMs = new Date(state.now).getTime() - Date.now();
     render();

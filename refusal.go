@@ -1554,9 +1554,124 @@ type requestInterceptResponse struct {
 	ResponseBody    []byte      `json:"ResponseBody,omitempty"`
 }
 
+const (
+	maxCapturedPayloads  = 12
+	maxCapturedBodyBytes = 6 * 1024 * 1024
+)
+
+var (
+	capturedPayloads   []capturedPayload
+	capturedPayloadSeq uint64
+)
+
+func inspectPayloadMeta(rawBody, sanitizedBody []byte, headers http.Header, id string, now time.Time) (capturedPayload, bool) {
+	rawTrim := bytes.TrimSpace(rawBody)
+	sanTrim := bytes.TrimSpace(sanitizedBody)
+	if len(rawTrim) == 0 || !json.Valid(rawTrim) || !json.Valid(sanTrim) {
+		return capturedPayload{}, false
+	}
+	var env struct {
+		Model    string            `json:"model"`
+		Messages []json.RawMessage `json:"messages"`
+		Input    []json.RawMessage `json:"input"`
+		Contents []json.RawMessage `json:"contents"`
+	}
+	if json.Unmarshal(rawTrim, &env) != nil {
+		return capturedPayload{}, false
+	}
+	rawMsgs := len(env.Messages)
+	if rawMsgs == 0 {
+		rawMsgs = len(env.Input)
+	}
+	if rawMsgs == 0 {
+		rawMsgs = len(env.Contents)
+	}
+	var sanEnv struct {
+		Messages []json.RawMessage `json:"messages"`
+		Input    []json.RawMessage `json:"input"`
+		Contents []json.RawMessage `json:"contents"`
+	}
+	_ = json.Unmarshal(sanTrim, &sanEnv)
+	sanMsgs := len(sanEnv.Messages)
+	if sanMsgs == 0 {
+		sanMsgs = len(sanEnv.Input)
+	}
+	if sanMsgs == 0 {
+		sanMsgs = len(sanEnv.Contents)
+	}
+	var session string
+	var metaProbe struct {
+		Metadata struct {
+			UserID string `json:"user_id"`
+		} `json:"metadata"`
+	}
+	if json.Unmarshal(rawTrim, &metaProbe) == nil {
+		uid := strings.TrimSpace(metaProbe.Metadata.UserID)
+		if !strings.HasPrefix(uid, "{") || json.Valid([]byte(uid)) {
+			session = conversationKey(executorRequest{Payload: rawTrim, Headers: headers})
+		}
+	}
+	rawCopy := append(json.RawMessage(nil), rawTrim...)
+	sanCopy := append(json.RawMessage(nil), sanTrim...)
+	return capturedPayload{
+		capturedPayloadMeta: capturedPayloadMeta{
+			ID:                id,
+			Time:              now,
+			Model:             env.Model,
+			Session:           session,
+			RawBytes:          len(rawTrim),
+			SanitizedBytes:    len(sanTrim),
+			RawMessages:       rawMsgs,
+			SanitizedMessages: sanMsgs,
+		},
+		RawBody:       rawCopy,
+		SanitizedBody: sanCopy,
+	}, true
+}
+
+func recordCapturedPayload(rawBody, sanitizedBody []byte, headers http.Header, now time.Time) {
+	if len(rawBody) == 0 || len(rawBody) > maxCapturedBodyBytes || isAuxiliaryRequest(rawBody) {
+		return
+	}
+	entry, ok := inspectPayloadMeta(rawBody, sanitizedBody, headers, "", now)
+	if !ok || entry.RawMessages == 0 {
+		return
+	}
+	stateMu.Lock()
+	capturedPayloadSeq++
+	entry.ID = "p" + strconv.FormatUint(capturedPayloadSeq, 10)
+	capturedPayloads = append(capturedPayloads, entry)
+	if len(capturedPayloads) > maxCapturedPayloads {
+		capturedPayloads = capturedPayloads[len(capturedPayloads)-maxCapturedPayloads:]
+	}
+	stateMu.Unlock()
+}
+
+func lookupCapturedPayload(id string) (capturedPayload, bool) {
+	stateMu.Lock()
+	defer stateMu.Unlock()
+	if id == "" && len(capturedPayloads) > 0 {
+		return capturedPayloads[len(capturedPayloads)-1], true
+	}
+	for i := len(capturedPayloads) - 1; i >= 0; i-- {
+		if capturedPayloads[i].ID == id {
+			return capturedPayloads[i], true
+		}
+	}
+	return capturedPayload{}, false
+}
+
 // handleRequestIntercept applies request wire adaptations across all models and short-circuits
 // Claude Code's local auto-mode safety classifier when bypass_auto_mode_classifier is enabled.
 func handleRequestIntercept(raw []byte) ([]byte, error) {
+	return interceptRequest(raw, true)
+}
+
+func handleRequestInterceptAfter(raw []byte) ([]byte, error) {
+	return interceptRequest(raw, false)
+}
+
+func interceptRequest(raw []byte, capture bool) ([]byte, error) {
 	var req requestInterceptRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
@@ -1581,6 +1696,9 @@ func handleRequestIntercept(raw []byte) ([]byte, error) {
 		}
 	}
 	bodyOut, headersOut, clearHeaders, _ := sanitizeRequest(req.Body, req.Headers, cfg)
+	if capture {
+		recordCapturedPayload(req.Body, bodyOut, req.Headers, time.Now())
+	}
 	var resp requestInterceptResponse
 	if !bytes.Equal(bodyOut, req.Body) {
 		resp.Body = bodyOut

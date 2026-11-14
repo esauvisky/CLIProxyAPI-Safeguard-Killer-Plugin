@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // hostAuth is one credential from the host.auth.list callback (pluginapi.HostAuthFileEntry).
 type hostAuth struct {
@@ -128,6 +131,25 @@ type uiState struct {
 	ManagementError string `json:"management_error,omitempty"`
 	// Metrics aggregates routing decisions for the metrics chart row.
 	Metrics routingMetrics `json:"metrics"`
+	// Payloads lists recent captured client payloads (newest first) for the Payload Inspector tab.
+	Payloads []capturedPayloadMeta `json:"payloads"`
+}
+
+type capturedPayloadMeta struct {
+	ID                string    `json:"id"`
+	Time              time.Time `json:"time"`
+	Model             string    `json:"model"`
+	Session           string    `json:"session,omitempty"`
+	RawBytes          int       `json:"raw_bytes"`
+	SanitizedBytes    int       `json:"sanitized_bytes"`
+	RawMessages       int       `json:"raw_messages"`
+	SanitizedMessages int       `json:"sanitized_messages"`
+}
+
+type capturedPayload struct {
+	capturedPayloadMeta
+	RawBody       json.RawMessage `json:"raw_body"`
+	SanitizedBody json.RawMessage `json:"sanitized_body"`
 }
 
 // uiCredential joins a credential with its models and quota.

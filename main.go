@@ -202,8 +202,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return countGroupTokens(request, currentConfig())
 	case methodExecutorHTTP:
 		return nil, &statusError{Code: "not_supported", Message: method + " is not supported for model groups", HTTPStatus: 501}
-	case methodRequestBefore, methodRequestAfter:
+	case methodRequestBefore:
 		return handleRequestIntercept(request)
+	case methodRequestAfter:
+		return handleRequestInterceptAfter(request)
 	case methodStreamIntercept:
 		return handleStreamIntercept(request)
 	case methodRequestComplete:

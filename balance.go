@@ -444,5 +444,8 @@ func buildUIState() uiState {
 	for index := len(decisions) - 1; index >= 0; index-- {
 		state.Decisions = append(state.Decisions, decisions[index])
 	}
+	for index := len(capturedPayloads) - 1; index >= 0; index-- {
+		state.Payloads = append(state.Payloads, capturedPayloads[index].capturedPayloadMeta)
+	}
 	return state
 }

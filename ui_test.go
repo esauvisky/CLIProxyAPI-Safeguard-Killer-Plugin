@@ -13,6 +13,8 @@ func TestManagementRegistrationPaths(t *testing.T) {
 		{http.MethodGet, "/plugins/safeguard-killer/state"},
 		{http.MethodGet, "/plugins/safeguard-killer/trail"},
 		{http.MethodPost, "/plugins/safeguard-killer/drain"},
+		{http.MethodGet, "/plugins/safeguard-killer/payloads"},
+		{http.MethodPost, "/plugins/safeguard-killer/preview"},
 	}
 	if len(reg.Routes) != len(wantRoutes) {
 		t.Fatalf("routes = %+v", reg.Routes)
@@ -142,3 +144,53 @@ func TestHandleManagementRejectsMalformed(t *testing.T) {
 		t.Fatal("unknown path accepted")
 	}
 }
+
+func TestHandleManagementPayloadCaptureAndPreview(t *testing.T) {
+	reqBody := `{"model":"claude-fable-5-2","messages":[{"role":"user","content":"start"},{"role":"system","content":"<total_tokens>100 tokens left</total_tokens>"},{"role":"assistant","content":[{"type":"text","text":"STOP AND LOOK AT THAT!"},{"type":"tool_use","id":"cpa_gemini_1234567890abcdef1234567890abcdef","name":"Bash","input":{"command":"ls"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"cpa_gemini_1234567890abcdef1234567890abcdef","content":"ok"},{"type":"text","text":"continue"}]}]}`
+	interceptRaw, _ := json.Marshal(requestInterceptRequest{Stream: true, Headers: http.Header{}, Body: []byte(reqBody)})
+	if _, err := handleRequestIntercept(interceptRaw); err != nil {
+		t.Fatalf("handleRequestIntercept: %v", err)
+	}
+
+	rawGet, _ := json.Marshal(managementRequest{Method: http.MethodGet, Path: "/v0/management/plugins/safeguard-killer/payloads"})
+	outGet, errGet := handleManagement(rawGet)
+	if errGet != nil {
+		t.Fatalf("handleManagement(payloads): %v", errGet)
+	}
+	var envGet envelope
+	_ = json.Unmarshal(outGet, &envGet)
+	var respGet managementResponse
+	_ = json.Unmarshal(envGet.Result, &respGet)
+	var captured capturedPayload
+	if err := json.Unmarshal(respGet.Body, &captured); err != nil {
+		t.Fatalf("decode captured payload: %v", err)
+	}
+	if captured.RawMessages != 4 || captured.SanitizedMessages != 3 {
+		t.Fatalf("captured messages = %d -> %d, want 4 -> 3", captured.RawMessages, captured.SanitizedMessages)
+	}
+	if strings.Contains(string(captured.SanitizedBody), "STOP AND LOOK AT THAT") {
+		t.Fatalf("CoT narration survived in sanitized capture: %s", captured.SanitizedBody)
+	}
+
+	rawPreview, _ := json.Marshal(managementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/safeguard-killer/preview",
+		Body:   []byte(reqBody),
+	})
+	outPrev, errPrev := handleManagement(rawPreview)
+	if errPrev != nil {
+		t.Fatalf("handleManagement(preview): %v", errPrev)
+	}
+	var envPrev envelope
+	_ = json.Unmarshal(outPrev, &envPrev)
+	var respPrev managementResponse
+	_ = json.Unmarshal(envPrev.Result, &respPrev)
+	var preview capturedPayload
+	if err := json.Unmarshal(respPrev.Body, &preview); err != nil {
+		t.Fatalf("decode preview payload: %v", err)
+	}
+	if preview.ID != "preview" || preview.SanitizedMessages != 3 {
+		t.Fatalf("preview = %+v", preview.capturedPayloadMeta)
+	}
+}
+

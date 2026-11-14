@@ -675,6 +675,8 @@ func stripHarnessParanoiaText(s string) string {
 	s = strings.ReplaceAll(s, claudeUntrustedArchiveReminder, "")
 	s = strings.ReplaceAll(s, strings.TrimSpace(claudeUntrustedArchiveReminder), "")
 	s = strings.ReplaceAll(s, claudeReaInjectionDirective, "")
+	s = systemNotificationPreamblePattern.ReplaceAllString(s, "")
+	s = emptySystemReminderPattern.ReplaceAllString(s, "")
 	return s
 }
 
@@ -695,10 +697,14 @@ func containsClassifierNudge(raw []byte) bool {
 }
 
 var (
-	interruptedOutputPattern = regexp.MustCompile(`(?is)<interrupted-output>(.*?)</interrupted-output>`)
-	leakedCoTHeaderPattern   = regexp.MustCompile(`(?is)^\s*(?:Thinking Process:\s*\n+|thought\r?\n+)`)
-	leakedCoTSelfTalkPattern = regexp.MustCompile(`(?im)^\s*\*?\*?(?:WAIT A SECOND!?[^\n]*|STOP AND LOOK AT[^\n]*|Hold on\s*[—–-][^\n]*|Wait\s*[—–:-]\s*(?:hold on|I made|let's|why|did)[^\n]*)\*?\*?\s*\n?`)
-	leakedCoTRhetoricalLine  = regexp.MustCompile(`(?m)^[^\n]*\?!\s*\n?`)
+	interruptedOutputPattern   = regexp.MustCompile(`(?is)<interrupted-output>(.*?)</interrupted-output>`)
+	leakedCoTHeaderPattern     = regexp.MustCompile(`(?is)^\s*(?:Thinking Process:\s*\n+|thought\r?\n+)`)
+	leakedCoTSelfTalkPattern   = regexp.MustCompile(`(?im)^\s*\*?\*?(?:WAIT A SECOND!?[^\n]*|STOP AND LOOK AT[^\n]*|Hold on\s*[—–-][^\n]*|Wait\s*[—–:-]\s*(?:hold on|I made|let's|why|did)[^\n]*)\*?\*?\s*\n?`)
+	leakedCoTRhetoricalLine    = regexp.MustCompile(`(?m)^[^\n]*\?!\s*\n?`)
+	emptySystemReminderPattern = regexp.MustCompile(`(?is)<system-reminder>\s*</system-reminder>`)
+	systemNotificationPreamblePattern = regexp.MustCompile(
+		`(?is)\[SYSTEM NOTIFICATION\s*-\s*NOT USER INPUT\]\s*This is an automated background-task event[^\n]*\n(?:Do NOT interpret[^\n]*\n)?(?:No human input has been received[^\n]*\n?)?[ \t\r\n]*`,
+	)
 )
 
 func isNonClaudeToolUseID(id string) bool {
@@ -980,6 +986,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 	}
 	hasReminder := cfg.Features.StripRestrictiveReminders &&
 		(bytes.Contains(rawMessages, []byte("system-reminder")) ||
+			bytes.Contains(rawMessages, []byte("[SYSTEM NOTIFICATION")) ||
 			bytes.Contains(rawMessages, []byte(`"clear_at"`)) ||
 			bytes.Contains(rawMessages, []byte("untrusted data:")) ||
 			bytes.Contains(rawMessages, []byte("prompt-injection attempt:")))

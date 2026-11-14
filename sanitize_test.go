@@ -218,4 +218,30 @@ func TestStripSystemNotificationPreambleKeepsTaskNotification(t *testing.T) {
 	}
 }
 
+func TestStripHistoricalTotalTokensPreservesFinalTurnCounter(t *testing.T) {
+	cfg := defaultPluginConfig()
+	body := `{"model":"claude-fable-5-2","messages":[` +
+		`{"role":"user","content":"step 1"},` +
+		`{"role":"system","content":"<total_tokens>14990000 tokens left</total_tokens>"},` +
+		`{"role":"assistant","content":[{"type":"text","text":"done 1"}]},` +
+		`{"role":"user","content":[{"type":"text","text":"<system-reminder><total_tokens>14980000 tokens left</total_tokens></system-reminder>"},{"type":"text","text":"step 2"}]},` +
+		`{"role":"system","content":[{"type":"text","text":"<total_tokens>14970000 tokens left</total_tokens>"}]},` +
+		`{"role":"assistant","content":[{"type":"text","text":"done 2"}]},` +
+		`{"role":"user","content":"step 3"},` +
+		`{"role":"system","content":[{"type":"text","text":"You are powered by Fable 5.\n\n<total_tokens>14500000 tokens left</total_tokens>"}]}` +
+		`]}`
+
+	out, _, _, _ := sanitizeRequest([]byte(body), http.Header{}, cfg)
+	text := string(out)
+	for _, gone := range []string{"14990000", "14980000", "14970000"} {
+		if strings.Contains(text, gone) {
+			t.Fatalf("historical total_tokens %q survived: %s", gone, text)
+		}
+	}
+	if !strings.Contains(text, "14500000 tokens left") {
+		t.Fatalf("final total_tokens counter was stripped: %s", text)
+	}
+}
+
+
 

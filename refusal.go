@@ -702,10 +702,20 @@ var (
 	leakedCoTSelfTalkPattern   = regexp.MustCompile(`(?im)^\s*\*?\*?(?:WAIT A SECOND!?[^\n]*|STOP AND LOOK AT[^\n]*|Hold on\s*[—–-][^\n]*|Wait\s*[—–:-]\s*(?:hold on|I made|let's|why|did)[^\n]*)\*?\*?\s*\n?`)
 	leakedCoTRhetoricalLine    = regexp.MustCompile(`(?m)^[^\n]*\?!\s*\n?`)
 	emptySystemReminderPattern = regexp.MustCompile(`(?is)<system-reminder>\s*</system-reminder>`)
+	totalTokensTagPattern      = regexp.MustCompile(`(?is)[ \t\r\n]*<total_tokens>[^<]*</total_tokens>[ \t\r\n]*`)
 	systemNotificationPreamblePattern = regexp.MustCompile(
 		`(?is)\[SYSTEM NOTIFICATION\s*-\s*NOT USER INPUT\]\s*This is an automated background-task event[^\n]*\n(?:Do NOT interpret[^\n]*\n)?(?:No human input has been received[^\n]*\n?)?[ \t\r\n]*`,
 	)
 )
+
+func stripHistoricalTotalTokens(s string) string {
+	if !strings.Contains(s, "<total_tokens>") {
+		return s
+	}
+	s = totalTokensTagPattern.ReplaceAllString(s, "\n")
+	s = emptySystemReminderPattern.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
+}
 
 func isNonClaudeToolUseID(id string) bool {
 	for _, prefix := range []string{"cpa_gemini_", "tool_", "call_", "fc_"} {
@@ -819,7 +829,7 @@ func cleanContaminatedText(text string, stripSentinels bool, seenDigests map[str
 
 // cleanMessageBlock sanitizes one content block (text or tool_result with string or nested array
 // content) and returns the updated block and whether it should be kept.
-func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResult bool, prefixes []string, cfg pluginConfig, seenDigests map[string]bool) (map[string]json.RawMessage, bool, bool) {
+func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResult, isLastMsg bool, prefixes []string, cfg pluginConfig, seenDigests map[string]bool) (map[string]json.RawMessage, bool, bool) {
 	changed := false
 	var blockType string
 	_ = json.Unmarshal(block["type"], &blockType)
@@ -859,7 +869,7 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 			outInner := make([]map[string]json.RawMessage, 0, len(innerBlocks))
 			innerChanged := false
 			for _, ib := range innerBlocks {
-				cleanedIB, keep, ibMod := cleanMessageBlock(ib, role, true, nil, cfg, seenDigests)
+				cleanedIB, keep, ibMod := cleanMessageBlock(ib, role, true, isLastMsg, nil, cfg, seenDigests)
 				if ibMod {
 					innerChanged = true
 				}
@@ -928,6 +938,9 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 	}
 	if cfg.Features.DeduplicateInjectedHistory {
 		afterDedup := cleanContaminatedText(updatedText, !inToolResult, seenDigests)
+		if !inToolResult && !isLastMsg {
+			afterDedup = stripHistoricalTotalTokens(afterDedup)
+		}
 		if afterDedup != updatedText {
 			updatedText = strings.TrimSpace(afterDedup)
 			changed = true
@@ -992,6 +1005,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			bytes.Contains(rawMessages, []byte("prompt-injection attempt:")))
 	hasDedupTarget := cfg.Features.DeduplicateInjectedHistory &&
 		(bytes.Contains(rawMessages, []byte("<system-reminder>")) ||
+			bytes.Contains(rawMessages, []byte("<total_tokens>")) ||
 			bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt)) ||
 			bytes.Contains(rawMessages, []byte(claudeCyberGateReplacement)))
 	hasNudge := cfg.Features.NeutralizeClassifierStopNudge && containsClassifierNudge(rawMessages)
@@ -1010,6 +1024,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 	outMessages := make([]cleanIndexedMessage, 0, len(messages))
 	changed := false
 	for origIdx, msg := range messages {
+		isLastMsg := origIdx == len(messages)-1
 		var role string
 		_ = json.Unmarshal(msg["role"], &role)
 		if cfg.Features.StripRestrictiveReminders && role == "system" && restrictiveSystemReminderPattern.Match(msg["content"]) {
@@ -1045,6 +1060,9 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			}
 			if cfg.Features.DeduplicateInjectedHistory {
 				updatedText = cleanContaminatedText(updatedText, true, seenDigests)
+				if !isLastMsg {
+					updatedText = stripHistoricalTotalTokens(updatedText)
+				}
 			}
 			if cfg.Features.FallbackOnRefusal && role == "assistant" {
 				if detectTextRefusal(updatedText) != "" {
@@ -1082,7 +1100,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 					continue
 				}
 			}
-			cleanedBlock, keep, mod := cleanMessageBlock(block, role, false, prefixes, cfg, seenDigests)
+			cleanedBlock, keep, mod := cleanMessageBlock(block, role, false, isLastMsg, prefixes, cfg, seenDigests)
 			if mod {
 				blockChanged = true
 			}

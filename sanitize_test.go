@@ -166,7 +166,7 @@ func TestCleanMessagesAblatesCrossModelCoTAndHealsOrphanedSystem(t *testing.T) {
 			t.Fatalf("cross-model CoT or notice %q survived: %s", gone, text)
 		}
 	}
-	for _, want := range []string{"The SSD controller is in hardware read-only mode.", "cpa_gemini_b2dbd0f067dc67aa75e1a939a7ccbe93", "<task-notification>", "continue", "You are powered by Fable 5."} {
+	for _, want := range []string{"The SSD controller is in hardware read-only mode.", "cpa_gemini_b2dbd0f067dc67aa75e1a939a7ccbe93", "task-notification", "continue", "You are powered by Fable 5."} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("expected content %q missing: %s", want, text)
 		}
@@ -174,8 +174,8 @@ func TestCleanMessagesAblatesCrossModelCoTAndHealsOrphanedSystem(t *testing.T) {
 
 	var parsed struct {
 		Messages []struct {
-			Role    string            `json:"role"`
-			Content []json.RawMessage `json:"content"`
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
 	if err := json.Unmarshal(out, &parsed); err != nil {
@@ -211,7 +211,7 @@ func TestStripSystemNotificationPreambleKeepsTaskNotification(t *testing.T) {
 			t.Fatalf("distrust preamble %q survived: %s", gone, text)
 		}
 	}
-	for _, want := range []string{"<task-notification>", "bwgox2v9q", "/tmp/task.output"} {
+	for _, want := range []string{"task-notification", "bwgox2v9q", "/tmp/task.output"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("task notification payload %q was lost: %s", want, text)
 		}

@@ -724,8 +724,8 @@ var (
 	mcpServersDisconnectedBlockPattern   = regexp.MustCompile(`(?m)^The following MCP servers have disconnected\.[^\n]*\r?\n(?:[A-Za-z0-9_:*.-]+[ \t]*\r?\n?)*`)
 	deferredToolsAvailableBlockPattern   = regexp.MustCompile(`(?m)^The following deferred tools are now available via ToolSearch\.[^\n]*\r?\n(?:[A-Za-z0-9_:*.-]+[ \t]*\r?\n?)+`)
 	envUpdateBlockPattern                = regexp.MustCompile(`(?m)^# Environment update\r?\n(?:[ \t]*-[ \t]*[^\n]+\r?\n?)+[ \t\r\n]*`)
-	systemNotificationPreamblePattern    = regexp.MustCompile(
-		`(?is)\[SYSTEM NOTIFICATION\s*-\s*NOT USER INPUT\]\s*This is an automated background-task event[^\n]*\n(?:Do NOT interpret[^\n]*\n)?(?:No human input has been received[^\n]*\n?)?[ \t\r\n]*`,
+	systemNotificationPreamblePattern = regexp.MustCompile(
+		`(?is)\[SYSTEM NOTIFICATION\s*-\s*NOT USER INPUT\][ \t\r\n]*(?:This is an automated background-task event[^\n]*\n)?(?:Do NOT interpret[^\n]*\n)?(?:No human input has been received[^\n]*\n?)?[ \t\r\n]*`,
 	)
 )
 

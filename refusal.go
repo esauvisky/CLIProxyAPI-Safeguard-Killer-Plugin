@@ -703,10 +703,28 @@ var (
 	leakedCoTRhetoricalLine    = regexp.MustCompile(`(?m)^[^\n]*\?!\s*\n?`)
 	emptySystemReminderPattern = regexp.MustCompile(`(?is)<system-reminder>\s*</system-reminder>`)
 	totalTokensTagPattern      = regexp.MustCompile(`(?is)[ \t\r\n]*<total_tokens>[^<]*</total_tokens>[ \t\r\n]*`)
+	localCommandCaveatPattern  = regexp.MustCompile(`(?is)<local-command-caveat>[\s\S]*?</local-command-caveat>`)
+	localCommandStdoutPattern  = regexp.MustCompile(`(?is)<local-command-stdout>[\s\S]*?</local-command-stdout>`)
+	localUICommandBlockPattern = regexp.MustCompile(
+		`(?is)<command-name>/(?:model|config|fast|theme|vim|status|cost|doctor|clear|compact|login|logout|terminal-setup|permissions|memory)</command-name>\s*<command-message>[\s\S]*?</command-message>\s*<command-args>[\s\S]*?</command-args>`,
+	)
+	userInterruptNoticePattern        = regexp.MustCompile(`(?im)^[ \t]*\[Request interrupted by user(?: for tool use)?\][ \t]*\r?\n?`)
+	abortedSlashModelPattern          = regexp.MustCompile(`(?i)^\s*/model\[\s*$`)
 	systemNotificationPreamblePattern = regexp.MustCompile(
 		`(?is)\[SYSTEM NOTIFICATION\s*-\s*NOT USER INPUT\]\s*This is an automated background-task event[^\n]*\n(?:Do NOT interpret[^\n]*\n)?(?:No human input has been received[^\n]*\n?)?[ \t\r\n]*`,
 	)
 )
+
+func stripLocalCommandAndInterruptNoise(s string) string {
+	s = localCommandCaveatPattern.ReplaceAllString(s, "")
+	s = localUICommandBlockPattern.ReplaceAllString(s, "")
+	s = localCommandStdoutPattern.ReplaceAllString(s, "")
+	s = userInterruptNoticePattern.ReplaceAllString(s, "")
+	if abortedSlashModelPattern.MatchString(s) {
+		return ""
+	}
+	return s
+}
 
 func stripHistoricalTotalTokens(s string) string {
 	if !strings.Contains(s, "<total_tokens>") {
@@ -938,6 +956,9 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 	}
 	if cfg.Features.DeduplicateInjectedHistory {
 		afterDedup := cleanContaminatedText(updatedText, !inToolResult, seenDigests)
+		if !inToolResult && role == "user" {
+			afterDedup = stripLocalCommandAndInterruptNoise(afterDedup)
+		}
 		if !inToolResult && !isLastMsg {
 			afterDedup = stripHistoricalTotalTokens(afterDedup)
 		}
@@ -1006,6 +1027,9 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 	hasDedupTarget := cfg.Features.DeduplicateInjectedHistory &&
 		(bytes.Contains(rawMessages, []byte("<system-reminder>")) ||
 			bytes.Contains(rawMessages, []byte("<total_tokens>")) ||
+			bytes.Contains(rawMessages, []byte("<local-command-")) ||
+			bytes.Contains(rawMessages, []byte("<command-name>")) ||
+			bytes.Contains(rawMessages, []byte("[Request interrupted by user")) ||
 			bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt)) ||
 			bytes.Contains(rawMessages, []byte(claudeCyberGateReplacement)))
 	hasNudge := cfg.Features.NeutralizeClassifierStopNudge && containsClassifierNudge(rawMessages)
@@ -1060,6 +1084,9 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			}
 			if cfg.Features.DeduplicateInjectedHistory {
 				updatedText = cleanContaminatedText(updatedText, true, seenDigests)
+				if role == "user" {
+					updatedText = stripLocalCommandAndInterruptNoise(updatedText)
+				}
 				if !isLastMsg {
 					updatedText = stripHistoricalTotalTokens(updatedText)
 				}
@@ -1073,11 +1100,11 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 			}
 			if updatedText != text {
 				trimmed := strings.TrimSpace(updatedText)
-				if trimmed == "" && (role == "system" || role == "assistant") {
+				if trimmed == "" {
 					changed = true
 					continue
 				}
-				msg["content"], _ = json.Marshal(updatedText)
+				msg["content"], _ = json.Marshal(trimmed)
 				changed = true
 			}
 			outMessages = append(outMessages, cleanIndexedMessage{msg: msg, origIdx: origIdx})

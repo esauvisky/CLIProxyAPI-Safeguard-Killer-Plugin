@@ -243,5 +243,35 @@ func TestStripHistoricalTotalTokensPreservesFinalTurnCounter(t *testing.T) {
 	}
 }
 
+func TestStripLocalCommandCaveatsAndInterruptNoise(t *testing.T) {
+	cfg := defaultPluginConfig()
+	body := `{"model":"claude-fable-5-2","messages":[` +
+		`{"role":"user","content":"run check"},` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01A","name":"Bash","input":{"command":"ls"}}]},` +
+		`{"role":"user","content":[` +
+		`{"type":"tool_result","tool_use_id":"toolu_01A","content":"file1\nfile2"},` +
+		`{"type":"text","text":"[Request interrupted by user]\n"},` +
+		`{"type":"text","text":"/model["},` +
+		`{"type":"text","text":"<local-command-caveat>The command below was run directly in Claude Code.</local-command-caveat>\n"},` +
+		`{"type":"text","text":"<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>\n"},` +
+		`{"type":"text","text":"<local-command-stdout>Set model to Heavy Thinkers</local-command-stdout>\n"},` +
+		`{"type":"text","text":"continue"}` +
+		`]}]}`
+
+	out, _, _, _ := sanitizeRequest([]byte(body), http.Header{}, cfg)
+	text := string(out)
+	for _, gone := range []string{"local-command-caveat", "local-command-stdout", "<command-name>/model</command-name>", "Request interrupted by user", "/model["} {
+		if strings.Contains(text, gone) {
+			t.Fatalf("local command or interrupt noise %q survived: %s", gone, text)
+		}
+	}
+	for _, want := range []string{"file1\\nfile2", "continue"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected user/tool content %q was lost: %s", want, text)
+		}
+	}
+}
+
+
 
 

@@ -10,12 +10,13 @@ import (
 )
 
 const (
-	uiResourcePath        = "/ui"
-	mgmtStateRoutePath    = "/plugins/safeguard-killer/state"
-	mgmtTrailRoutePath    = "/plugins/safeguard-killer/trail"
-	mgmtDrainRoutePath    = "/plugins/safeguard-killer/drain"
-	mgmtPayloadsRoutePath = "/plugins/safeguard-killer/payloads"
-	mgmtPreviewRoutePath  = "/plugins/safeguard-killer/preview"
+	uiResourcePath           = "/ui"
+	mgmtStateRoutePath       = "/plugins/safeguard-killer/state"
+	mgmtTrailRoutePath       = "/plugins/safeguard-killer/trail"
+	mgmtDrainRoutePath       = "/plugins/safeguard-killer/drain"
+	mgmtPayloadsRoutePath    = "/plugins/safeguard-killer/payloads"
+	mgmtPreviewRoutePath     = "/plugins/safeguard-killer/preview"
+	mgmtBenchmarksRoutePath  = "/plugins/safeguard-killer/benchmarks/refresh"
 )
 
 type managementRegistration struct {
@@ -77,6 +78,11 @@ func managementRegistrationPayload() managementRegistration {
 				Method:      http.MethodPost,
 				Path:        mgmtPreviewRoutePath,
 				Description: "Dry-runs Safeguard Killer request sanitization on a raw JSON request body without sending upstream.",
+			},
+			{
+				Method:      http.MethodPost,
+				Path:        mgmtBenchmarksRoutePath,
+				Description: "Refreshes cached Artificial Analysis Coding Agent & Intelligence scores from artificialanalysis.ai.",
 			},
 		},
 		Resources: []managementResource{
@@ -197,6 +203,30 @@ func handleManagement(request []byte) ([]byte, error) {
 		body, errMarshal := json.Marshal(entry)
 		if errMarshal != nil {
 			return nil, fmt.Errorf("marshal preview payload: %w", errMarshal)
+		}
+		return okEnvelope(managementResponse{
+			StatusCode: http.StatusOK,
+			Headers: http.Header{
+				"Content-Type":  []string{"application/json; charset=utf-8"},
+				"Cache-Control": []string{"no-store"},
+			},
+			Body: body,
+		})
+	case strings.HasSuffix(path, mgmtBenchmarksRoutePath):
+		if req.Method != http.MethodPost {
+			return nil, fmt.Errorf("management route %s: unsupported method %q", path, req.Method)
+		}
+		errRefresh := refreshBenchmarksNow()
+		res := struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error,omitempty"`
+		}{OK: errRefresh == nil}
+		if errRefresh != nil {
+			res.Error = errRefresh.Error()
+		}
+		body, errMarshal := json.Marshal(res)
+		if errMarshal != nil {
+			return nil, fmt.Errorf("marshal benchmarks refresh response: %w", errMarshal)
 		}
 		return okEnvelope(managementResponse{
 			StatusCode: http.StatusOK,
@@ -508,7 +538,7 @@ const uiHTML = `<!doctype html>
   .group-head { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
   .group-head .field { flex: 1; min-width: 180px; }
   .model-list { list-style: none; margin: 10px 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-  .model-row { display: grid; grid-template-columns: minmax(160px, 1fr) 100px 100px 270px 72px auto; align-items: end; gap: 6px; }
+  .model-row { display: grid; grid-template-columns: minmax(160px, 1fr) 90px 90px 330px 72px auto; align-items: end; gap: 6px; }
   .model-row .model-score { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-bottom: 7px; }
   .model-row .btn { padding: 7px 10px; font-size: 13px; justify-content: center; }
   .model-row .model-toggle { width: 100%; }
@@ -719,7 +749,11 @@ const uiHTML = `<!doctype html>
     <section class="card">
       <div class="card-header">
         <h2 class="card-title">Smart Groups</h2>
-        <button class="btn sm" data-action="add-group" id="addGroupBtn">Add group</button>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <span class="subtle small" id="aaStatus"></span>
+          <button class="btn sm" id="refreshAABtn" onclick="refreshBenchmarks()">Refresh AA scores</button>
+          <button class="btn sm" data-action="add-group" id="addGroupBtn">Add group</button>
+        </div>
       </div>
       <p class="card-desc">A Smart Group exposes a single virtual model ID that automatically routes around safeguard refusals, content filters, scope-gate lectures, capability mismatches, and quota exhaustion across multiple models. Choose Quality first or Lower cost first and rate each model from 0 to 100. Higher quality is better; higher cost is more expensive. List order does not affect selection. The chosen model stays sticky across idle gaps until compaction, reset, or becoming unusable.</p>
       <div class="groups" id="groupsEditor"></div>
@@ -830,6 +864,7 @@ const TRAIL_API_URL = '/v0/management/plugins/safeguard-killer/trail';
 const DRAIN_API_URL = '/v0/management/plugins/safeguard-killer/drain';
 const PAYLOADS_API_URL = '/v0/management/plugins/safeguard-killer/payloads';
 const PREVIEW_API_URL = '/v0/management/plugins/safeguard-killer/preview';
+const BENCHMARKS_REFRESH_URL = '/v0/management/plugins/safeguard-killer/benchmarks/refresh';
 const CONFIG_API_URL = '/v8/management/config/plugins/configs/safeguard-killer';
 const REFRESH_MS = 10000;
 const APPLY_WAIT_MS = 1500;
@@ -1299,20 +1334,48 @@ function draftModelScores(g) {
   return out;
 }
 
-function renderScoreCell(e) {
-  if (!e.valid) return '<span class="subtle">score: needs valid ratings</span>';
-  if (e.disabled) return '<span class="badge bad">disabled</span> <span class="subtle">not routed</span>';
+function benchmarkFor(modelID) {
+  if (!state || !state.benchmarks || !modelID) return null;
+  return state.benchmarks[modelID] || null;
+}
+
+function formatAATooltip(b) {
+  const parts = [];
+  if (b.model_name) parts.push(b.model_name);
+  if (b.coding_agent > 0) parts.push('Coding Agent: ' + b.coding_agent.toFixed(1));
+  if (b.intelligence > 0) parts.push('Intelligence: ' + b.intelligence.toFixed(1));
+  if (b.frontier_code > 0) parts.push('FrontierCode 2.0: ' + b.frontier_code.toFixed(1));
+  if (b.terminal_bench > 0) parts.push('Terminal-Bench 4.0: ' + b.terminal_bench.toFixed(1));
+  if (b.cost_usd > 0) parts.push('Cost/task: $' + b.cost_usd.toFixed(2));
+  if (b.wall_time_sec > 0) parts.push('Time/task: ' + Math.round(b.wall_time_sec) + 's');
+  if (b.coding_agent > 0) parts.push('Refusals: ' + (b.refused_attempts || 0));
+  return parts.join(' · ');
+}
+
+function renderAABadge(modelID) {
+  const b = benchmarkFor(modelID);
+  if (!b) return '';
+  const val = b.coding_agent > 0 ? 'AA ' + b.coding_agent.toFixed(1) : (b.intelligence > 0 ? 'AA Intel ' + b.intelligence.toFixed(1) : '');
+  if (!val) return '';
+  return ' <span class="badge" title="' + esc(formatAATooltip(b)) + '">' + esc(val) + '</span>';
+}
+
+function renderScoreCell(e, modelID) {
+  const aa = renderAABadge(modelID);
+  if (!e.valid) return '<span class="subtle">score: needs valid ratings</span>' + aa;
+  if (e.disabled) return '<span class="badge bad">disabled</span> <span class="subtle">not routed</span>' + aa;
   const score = 'score <span class="mono">' + e.score.toFixed(1) + '</span>';
   if (e.inPool) {
-    return '<span class="badge ok">in pool</span> ' + score + ' · <span class="mono">' + (e.probability * 100).toFixed(1) + '%</span>';
+    return '<span class="badge ok">in pool</span> ' + score + ' · <span class="mono">' + (e.probability * 100).toFixed(1) + '%</span>' + aa;
   }
-  return '<span class="badge">not picked</span> ' + score + ' · <span class="mono">' + e.gap.toFixed(1) + '</span> below best';
+  return '<span class="badge">not picked</span> ' + score + ' · <span class="mono">' + e.gap.toFixed(1) + '</span> below best' + aa;
 }
 
 function refreshGroupScores(gi) {
-  const scores = draftModelScores(draft.groups[gi]);
+  const g = draft.groups[gi];
+  const scores = draftModelScores(g);
   scores.forEach((e, j) => {
-    document.querySelector('[data-score-cell="' + gi + '.' + j + '"]').innerHTML = renderScoreCell(e);
+    document.querySelector('[data-score-cell="' + gi + '.' + j + '"]').innerHTML = renderScoreCell(e, g.models[j].id);
   });
 }
 
@@ -1334,7 +1397,7 @@ function renderGroups() {
           '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.quality) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="quality"' + groupFieldAttr(i, 'models.' + j + '.quality') + '></label>' +
         '<label class="field model-rating"><span class="cfg-key">Cost</span>' +
           '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.cost) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="cost"' + groupFieldAttr(i, 'models.' + j + '.cost') + '></label>' +
-        '<div class="model-score small" data-score-cell="' + i + '.' + j + '">' + renderScoreCell(scores[j]) + '</div>' +
+        '<div class="model-score small" data-score-cell="' + i + '.' + j + '">' + renderScoreCell(scores[j], m.id) + '</div>' +
         '<button class="btn sm model-toggle" data-action="model-toggle" data-group="' + i + '" data-model="' + j + '">' + (m.disabled ? 'Enable' : 'Disable') + '</button>' +
         '<button class="btn sm danger" data-action="model-remove" data-group="' + i + '" data-model="' + j + '" title="Remove">&times;</button>' +
       '</li>'
@@ -1366,7 +1429,9 @@ function addPendingModel(gi) {
   const g = draft.groups[gi];
   const m = g.pending.trim();
   if (m === '') return;
-  g.models.push({ id: m, quality: '50', cost: '50', disabled: false });
+  const b = benchmarkFor(m);
+  const autoQ = b && b.coding_agent > 0 ? String(Math.round(b.coding_agent)) : (b && b.intelligence > 0 ? String(Math.round(b.intelligence)) : '50');
+  g.models.push({ id: m, quality: autoQ, cost: '10', disabled: false });
   g.pending = '';
   setDirty(true);
   renderGroups();
@@ -1399,7 +1464,7 @@ function onEditorInput(ev) {
   const g = draft.groups[Number(el.dataset.group)];
   if (el.dataset.model !== undefined) {
     g.models[Number(el.dataset.model)][el.dataset.mfield] = el.value;
-    if (el.dataset.mfield !== 'id') refreshGroupScores(Number(el.dataset.group));
+    refreshGroupScores(Number(el.dataset.group));
     setDirty(true);
   } else if (el.dataset.gfield === 'pending') {
     // Text in the add box is not part of the config until "Add model".
@@ -1938,9 +2003,21 @@ function render() {
   document.getElementById('tabSessCount').textContent = String(state.sessions.length);
   document.getElementById('tabDecCount').textContent = String(state.decisions.length);
   document.getElementById('tabPayCount').textContent = String(state.payloads.length);
-  document.getElementById('modelList').innerHTML = state.models.map(m => '<option value="' + esc(m) + '"></option>').join('');
+  document.getElementById('modelList').innerHTML = state.models.map(m => {
+    const b = benchmarkFor(m);
+    const label = b ? formatAATooltip(b) : '';
+    return '<option value="' + esc(m) + '"' + (label ? ' label="' + esc(label) + '"' : '') + '>' + esc(label) + '</option>';
+  }).join('');
+  const aaEl = document.getElementById('aaStatus');
+  if (aaEl) {
+    const count = state.benchmarks ? Object.keys(state.benchmarks).length : 0;
+    if (state.benchmarks_error) aaEl.textContent = 'AA error: ' + state.benchmarks_error;
+    else if (count > 0 && !isZero(state.benchmarks_fetched_at)) aaEl.innerHTML = 'AA: ' + count + ' models (' + rel(state.benchmarks_fetched_at) + ')';
+    else aaEl.textContent = 'AA: loading…';
+  }
   // Follow config changes made elsewhere only while there is nothing unsaved here.
   if (draft === null || (!dirty && !saving && canonConfig(state.config) !== draftSourceCanon)) loadDraft(state.config);
+  else if (draft !== null) draft.groups.forEach((_, gi) => refreshGroupScores(gi));
   renderCredentials();
   renderSessions();
   renderDecisions();
@@ -1960,6 +2037,20 @@ function showError(title, detail) {
 function clearError() {
   document.getElementById('errorBanner').style.display = 'none';
   document.getElementById('statusDot').classList.remove('err');
+}
+
+async function refreshBenchmarks() {
+  const btn = document.getElementById('refreshAABtn');
+  if (btn) btn.disabled = true;
+  try {
+    const resp = await fetch(BENCHMARKS_REFRESH_URL, { method: 'POST', headers: authHeaders() });
+    if (!resp.ok) showError('Failed to refresh AA scores (HTTP ' + resp.status + ')', await resp.text());
+    await refresh();
+  } catch (err) {
+    showError('Network error refreshing AA scores', String(err));
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 // Refreshes are serialized so a save can wait for a state that reflects it.

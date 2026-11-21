@@ -133,6 +133,10 @@ type uiState struct {
 	Metrics routingMetrics `json:"metrics"`
 	// Payloads lists recent captured client payloads (newest first) for the Payload Inspector tab.
 	Payloads []capturedPayloadMeta `json:"payloads"`
+	// Benchmarks maps model IDs to cached Artificial Analysis scores.
+	Benchmarks          map[string]modelBenchmark `json:"benchmarks,omitempty"`
+	BenchmarksFetchedAt time.Time                 `json:"benchmarks_fetched_at,omitempty"`
+	BenchmarksError     string                    `json:"benchmarks_error,omitempty"`
 }
 
 type capturedPayloadMeta struct {

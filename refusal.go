@@ -331,11 +331,12 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 			failedChain = append(failedChain, fmt.Sprintf("`%s` (%s)", attempt.Model, reason))
 		}
 	}
+	servedLabel := formatModelWithBenchmark(served)
 	if started {
 		if len(failedChain) > 0 {
-			return fmt.Sprintf("%s%s → using `%s` from here onwards", prefix, strings.Join(failedChain, " → "), served)
+			return fmt.Sprintf("%s%s → using %s from here onwards", prefix, strings.Join(failedChain, " → "), servedLabel)
 		}
-		return fmt.Sprintf("%susing `%s` from here onwards", prefix, served)
+		return fmt.Sprintf("%susing %s from here onwards", prefix, servedLabel)
 	}
 	modelChanged := prevModel != "" && prevModel != served
 	if !hadActiveFailure && !modelChanged {
@@ -346,14 +347,15 @@ func buildGroupNotice(cfg pluginConfig, group modelGroup, attempts []groupAttemp
 	}
 	if len(failedChain) > 0 {
 		if cfg.Features.VerboseNotices {
-			return fmt.Sprintf("%s%s → switched to `%s`", prefix, strings.Join(failedChain, " → "), served)
+			return fmt.Sprintf("%s%s → switched to %s", prefix, strings.Join(failedChain, " → "), servedLabel)
 		}
-		return fmt.Sprintf("%s%s → `%s`", prefix, strings.Join(failedChain, " → "), served)
+		return fmt.Sprintf("%s%s → %s", prefix, strings.Join(failedChain, " → "), servedLabel)
 	}
+	prevLabel := formatModelWithBenchmark(prevModel)
 	if cfg.Features.VerboseNotices {
-		return fmt.Sprintf("%sswitched from `%s` → `%s`", prefix, prevModel, served)
+		return fmt.Sprintf("%sswitched from %s → %s", prefix, prevLabel, servedLabel)
 	}
-	return fmt.Sprintf("%s`%s` → `%s`", prefix, prevModel, served)
+	return fmt.Sprintf("%s%s → %s", prefix, prevLabel, servedLabel)
 }
 
 func hasRefusalAttempt(attempts []groupAttempt) bool {

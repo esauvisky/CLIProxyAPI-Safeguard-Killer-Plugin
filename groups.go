@@ -185,6 +185,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		return nil, fmt.Errorf("model group %s is not configured", req.Model)
 	}
 	now := time.Now()
+	ensureBenchmarksFresh()
 	aux := isAuxiliaryRequest(req.Payload)
 	sanitizedPayload, sanitizedHeaders, _, _ := sanitizeRequest(req.Payload, req.Headers, cfg)
 	plan := planConversation(cfg, session, group, req.Payload, now)
@@ -260,6 +261,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		return nil, fmt.Errorf("model group %s is not configured", req.Model)
 	}
 	now := time.Now()
+	ensureBenchmarksFresh()
 	aux := isAuxiliaryRequest(req.Payload)
 	sanitizedPayload, sanitizedHeaders, _, hadSafeguards := sanitizeRequest(req.Payload, req.Headers, cfg)
 	stampSafeguards := cfg.Features.BypassAutoModeClassifier && hadSafeguards

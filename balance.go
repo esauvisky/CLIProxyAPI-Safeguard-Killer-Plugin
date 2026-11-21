@@ -418,6 +418,7 @@ func buildUIState() uiState {
 	if state.ManagementError == "" {
 		ensureQuotaFresh(cfg.ManagementKey, snapshot.auths)
 	}
+	ensureBenchmarksFresh()
 	models := make(map[string]bool)
 	stateMu.Lock()
 	defer stateMu.Unlock()
@@ -432,6 +433,15 @@ func buildUIState() uiState {
 		state.Models = append(state.Models, model)
 	}
 	sort.Strings(state.Models)
+	benchKeys := append([]string(nil), state.Models...)
+	for _, g := range cfg.Groups {
+		for _, gm := range g.Models {
+			if !models[gm.ID] {
+				benchKeys = append(benchKeys, gm.ID)
+			}
+		}
+	}
+	state.Benchmarks, state.BenchmarksFetchedAt, state.BenchmarksError = benchmarkSnapshotForModels(benchKeys)
 	for _, binding := range sessions {
 		state.Sessions = append(state.Sessions, *binding)
 	}

@@ -80,6 +80,9 @@ func ensureQuotaFresh(key string, creds []hostAuth) {
 	var stale []hostAuth
 	quotaMu.Lock()
 	for _, cred := range creds {
+		if cred.Disabled {
+			continue
+		}
 		snapshot, ok := quotaSnapshots[cred.ID]
 		if !ok || now.Sub(snapshot.FetchedAt) >= quotaRefreshAge {
 			stale = append(stale, cred)

@@ -995,6 +995,31 @@ func TestGroupTransientFailuresDoNotBlockRecovery(t *testing.T) {
 	}
 }
 
+func TestGroupEmptyResponseCanRetryNextTurn(t *testing.T) {
+	resetHostState(t)
+	cfg := defaultPluginConfig()
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: ratedGroupModels("kimi-k3.1-pro")}
+	payload := []byte(`{"messages":[{"role":"user","content":"work"}]}`)
+	recordConversationFailure("session", group.ID, "kimi-k3.1-pro", "empty response (no text or tool calls)", payload, time.Now())
+	if got := classifyAttemptFailure("empty response (no text or tool calls)"); got != "transient" {
+		t.Fatalf("classifyAttemptFailure() = %q, want transient", got)
+	}
+	stateMu.Lock()
+	groupStates["session\x00"+group.ID].Failures["kimi-k3.1-pro"].Kind = "refusal"
+	stateMu.Unlock()
+
+	plan := planConversation(cfg, "session", group, payload, time.Now())
+	if plan.Err != nil {
+		t.Fatalf("planConversation() error = %v", plan.Err)
+	}
+	if len(plan.Skipped) != 0 || plan.Scores[0].Excluded != "" {
+		t.Fatalf("empty response blocked the next turn: %+v", plan)
+	}
+	if model, ok := plan.nextModel(0); !ok || model != "kimi-k3.1-pro" {
+		t.Fatalf("nextModel() = %q, %v, want kimi-k3.1-pro", model, ok)
+	}
+}
+
 func TestGroupImageInputUnsupportedIsRemembered(t *testing.T) {
 	resetHostState(t)
 	cfg := defaultPluginConfig()

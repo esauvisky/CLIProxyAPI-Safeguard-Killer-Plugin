@@ -66,6 +66,10 @@ func (s *conversationState) skipReasonLocked(model string, payload []byte) strin
 		delete(s.Failures, model)
 		return ""
 	case "refusal":
+		if f.Reason == "empty response" {
+			delete(s.Failures, model)
+			return ""
+		}
 		// The refused content stays in the history until compaction resets this
 		// conversation. Growing the conversation does not call the refused
 		// model again.
@@ -574,7 +578,7 @@ func classifyAttemptFailure(rawDetail string) string {
 		return "no_vision"
 	case "context too long":
 		return "context_too_long"
-	case "empty response", "refusal":
+	case "refusal":
 		return "refusal"
 	}
 	if strings.HasPrefix(summary, "refusal:") {

@@ -113,3 +113,10 @@ func TestDetectTextRefusalFromSessions(t *testing.T) {
 		}
 	}
 }
+
+func TestResourceExhaustedIsInsufficientQuota(t *testing.T) {
+	detail := `host callback host.model.execute_stream: { "error": { "code": 429, "message": "Resource has been exhausted (e.g. check quota).", "status": "RESOURCE_EXHAUSTED" } }`
+	if got := summarizeAttemptReason(detail); got != "insufficient quota" {
+		t.Fatalf("summarizeAttemptReason() = %q, want insufficient quota", got)
+	}
+}

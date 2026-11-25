@@ -496,9 +496,6 @@ func skipReason(cfg pluginConfig, model string, now time.Time) (string, error) {
 		}
 		entry := rankEntry{AuthID: auth.ID}
 		rateCredential(&entry, model, cfg.MinRemaining, now)
-		if strings.HasPrefix(entry.Excluded, "quota error: ") {
-			return "", fmt.Errorf("model %s credential %s: %s", model, auth.ID, entry.Excluded)
-		}
 		if entry.Excluded == "" {
 			return "", nil
 		}

@@ -393,17 +393,21 @@ func TestPickIncludesSynthesizedCredentialMissingFromHostList(t *testing.T) {
 	}
 }
 
-func TestPickFailsOnQuotaTelemetryError(t *testing.T) {
+func TestPickTreatsQuotaTelemetryErrorAsNeutral(t *testing.T) {
 	fakeHost(t, []string{"claude-opus-4-8"}, noOther(t), "a", "b")
 	fakeWeights(t, weightsAB)
-	for _, id := range []string{"a", "b"} {
-		quotaMu.Lock()
-		quotaSnapshots[id] = credentialQuota{AuthID: id, FetchedAt: time.Now(), Error: "HTTP 500"}
-		quotaMu.Unlock()
+	setQuota(t, "b", weekly(0.5, 24*time.Hour))
+	quotaMu.Lock()
+	quotaSnapshots["a"] = credentialQuota{AuthID: "a", FetchedAt: time.Now(), Error: "xai: usage unavailable"}
+	quotaMu.Unlock()
+	t.Cleanup(func() { quotaMu.Lock(); delete(quotaSnapshots, "a"); quotaMu.Unlock() })
+	resp, errPick := pick(pickReq("", "a", "b"), balanceConfig(), testNow)
+	if errPick != nil {
+		t.Fatalf("pick() error = %v, want success", errPick)
 	}
-	t.Cleanup(func() { quotaMu.Lock(); delete(quotaSnapshots, "a"); delete(quotaSnapshots, "b"); quotaMu.Unlock() })
-	_, errPick := pick(pickReq("", "a", "b"), balanceConfig(), testNow)
-	assertNoEligible(t, errPick, "a: quota error: HTTP 500")
+	if resp.AuthID == "" {
+		t.Fatalf("pick() = %+v, want a credential", resp)
+	}
 }
 
 func TestRankExcludesDisabledAndCoolingDown(t *testing.T) {

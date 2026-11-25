@@ -1224,80 +1224,45 @@ func TestSalvagedPartialOutputInTrailAndSkippedWhenSentBack(t *testing.T) {
 	}
 }
 
-func TestSpeedModeScoresSpeedFirst(t *testing.T) {
-	models := []groupModel{{ID: "fast", Quality: 30, Cost: 5, Speed: 95}, {ID: "smart", Quality: 90, Cost: 20, Speed: 20}, {ID: "idle", Quality: 50, Cost: 0, Speed: 0}}
-	scores := scoreModels(modelGroup{ID: "g", Mode: groupModeSpeed, Models: models})
-	wantScores := []float64{0.6*95 + 0.3*30 - 0.1*5, 0.6*20 + 0.3*90 - 0.1*20, 0.6*speedUnmeasuredRating + 0.3*50}
-	wantSpeeds := []float64{95, 20, speedUnmeasuredRating}
-	for i, score := range scores {
-		if score.Model != models[i].ID || score.Speed != wantSpeeds[i] || math.Abs(score.Score-wantScores[i]) > 1e-12 {
-			t.Fatalf("score[%d] = %+v, want score %v", i, score, wantScores[i])
-		}
-	}
-	if scores[0].Score <= scores[1].Score {
-		t.Fatalf("fast model %v does not outscore smart model %v in speed mode", scores[0].Score, scores[1].Score)
-	}
-	quality := scoreModels(modelGroup{ID: "g", Mode: groupModeQuality, Models: models})
-	if quality[1].Score <= quality[0].Score {
-		t.Fatalf("smart model %v does not outscore fast model %v in quality mode", quality[1].Score, quality[0].Score)
-	}
-}
-
-func TestSpeedModeConfigValidation(t *testing.T) {
-	valid := []groupModel{{ID: "a", Quality: 40, Cost: 5, Speed: 80}, {ID: "auto", Quality: 40, Cost: 5}, {ID: "off", Quality: 40, Cost: 5, Disabled: true}}
-	cfg := defaultPluginConfig()
-	cfg.Groups = []modelGroup{{ID: "g", Name: "G", Mode: groupModeSpeed, Models: valid}}
-	if err := validateConfig(cfg); err != nil {
-		t.Fatalf("valid speed group rejected: %v", err)
-	}
-	for _, value := range []float64{-0.01, 100.01, math.NaN(), math.Inf(1)} {
-		cfg.Groups = []modelGroup{{ID: "g", Name: "G", Mode: groupModeQuality, Models: []groupModel{{ID: "a", Quality: 40, Cost: 5, Speed: value}}}}
-		if err := validateConfig(cfg); err == nil {
-			t.Fatalf("speed rating %v accepted", value)
-		}
-	}
-}
-
-func TestSpeedModeUsesMeasuredAndOverriddenRatings(t *testing.T) {
-	const measured = "speed-test-measured"
+func TestSpeedModeScoresMeasuredSpeed(t *testing.T) {
+	const fast = "speed-test-fast"
+	const slow = "speed-test-slow"
 	speedMu.Lock()
-	speedStats[measured] = &modelSpeedStats{Samples: 1, TokensPerSecond: 100}
+	speedStats[fast] = &modelSpeedStats{Samples: 1, TokensPerSecond: 200}
+	speedStats[slow] = &modelSpeedStats{Samples: 1, TokensPerSecond: 25}
 	speedMu.Unlock()
 	t.Cleanup(func() {
 		speedMu.Lock()
-		delete(speedStats, measured)
+		delete(speedStats, fast)
+		delete(speedStats, slow)
 		speedMu.Unlock()
 	})
-	models := []groupModel{{ID: measured, Quality: 30, Cost: 5}, {ID: "speed-test-manual", Quality: 30, Cost: 5, Speed: 80}, {ID: "speed-test-unknown", Quality: 30, Cost: 5}}
+	models := []groupModel{{ID: fast, Quality: 30, Cost: 5}, {ID: slow, Quality: 90, Cost: 20}, {ID: "speed-test-unknown", Quality: 30, Cost: 5}}
 	scores := scoreModels(modelGroup{ID: "g", Mode: groupModeSpeed, Models: models})
-	want := []float64{0.6*speedRating(100) + 0.3*30 - 0.1*5, 0.6*80 + 0.3*30 - 0.1*5, 0.6*50 + 0.3*30 - 0.1*5}
+	want := []float64{0.6*speedRating(200) + 0.3*30 - 0.1*5, 0.6*speedRating(25) + 0.3*90 - 0.1*20, 0.6*50 + 0.3*30 - 0.1*5}
 	for i, score := range scores {
 		if math.Abs(score.Score-want[i]) > 1e-12 {
 			t.Fatalf("score[%d] = %+v, want %v", i, score, want[i])
 		}
 	}
-	if scores[0].Speed != speedRating(100) || scores[1].Speed != 80 || scores[2].Speed != 50 {
-		t.Fatalf("speed ratings = %v, %v, %v", scores[0].Speed, scores[1].Speed, scores[2].Speed)
+	if scores[0].Score <= scores[1].Score {
+		t.Fatalf("fast model %v does not outscore slow model %v in speed mode", scores[0].Score, scores[1].Score)
 	}
 	quality := scoreModels(modelGroup{ID: "g", Mode: groupModeQuality, Models: models})
-	if quality[1].Score != 0.8*30-0.2*5 {
-		t.Fatalf("quality mode must ignore the manual speed rating: %+v", quality[1])
+	if quality[1].Score <= quality[0].Score {
+		t.Fatalf("quality mode must ignore measured speed: %+v", quality)
 	}
 }
 
-func TestSpeedRatingDecoding(t *testing.T) {
-	raw := `{"id":"g","name":"Group","mode":"speed","models":[{"id":"m","quality":40,"cost":5,"speed":82.5}]}`
-	var fromJSON, fromYAML modelGroup
-	if err := json.Unmarshal([]byte(raw), &fromJSON); err != nil {
-		t.Fatalf("json decode: %v", err)
+func TestSpeedModeConfigValidation(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.Groups = []modelGroup{{ID: "g", Name: "G", Mode: groupModeSpeed, Models: []groupModel{{ID: "a", Quality: 40, Cost: 5}}}}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("valid speed group rejected: %v", err)
 	}
-	if err := yaml.Unmarshal([]byte(raw), &fromYAML); err != nil {
-		t.Fatalf("yaml decode: %v", err)
-	}
-	for _, group := range []modelGroup{fromJSON, fromYAML} {
-		if group.Mode != groupModeSpeed || len(group.Models) != 1 || group.Models[0].Speed != 82.5 {
-			t.Fatalf("decoded group = %+v", group)
-		}
+	var group modelGroup
+	if err := json.Unmarshal([]byte(`{"id":"g","name":"G","mode":"speed","models":[{"id":"a","quality":40,"cost":5,"speed":90}]}`), &group); err == nil {
+		t.Fatal("manual speed overrides are no longer part of the group schema")
 	}
 }
 
@@ -1352,34 +1317,15 @@ func TestSpeedRatingScale(t *testing.T) {
 		tokensPerSecond float64
 		want            float64
 	}{
-		{0, 0},
-		{10, 0},
-		{5, 0},
-		{500, 100},
-		{900, 100},
+		{tokensPerSecond: 0, want: 0},
+		{tokensPerSecond: 10, want: 0},
+		{tokensPerSecond: 5, want: 0},
+		{tokensPerSecond: 500, want: 100},
+		{tokensPerSecond: 900, want: 100},
 		{tokensPerSecond: math.Sqrt(10 * 500), want: 50},
 	} {
 		if got := speedRating(tc.tokensPerSecond); got != tc.want {
 			t.Fatalf("speedRating(%v) = %v, want %v", tc.tokensPerSecond, got, tc.want)
-		}
-	}
-}
-
-func TestSpeedProbeModelsUsesEnabledSpeedGroupMembers(t *testing.T) {
-	cfg := defaultPluginConfig()
-	cfg.Groups = []modelGroup{
-		{ID: "fast", Mode: groupModeSpeed, Models: []groupModel{{ID: "a"}, {ID: "b"}, {ID: "off", Disabled: true}}},
-		{ID: "fast2", Mode: groupModeSpeed, Models: []groupModel{{ID: "b"}, {ID: "c"}}},
-		{ID: "quality", Mode: groupModeQuality, Models: []groupModel{{ID: "d"}}},
-	}
-	got := speedProbeModels(cfg)
-	want := []string{"a", "b", "c"}
-	if len(got) != len(want) {
-		t.Fatalf("speedProbeModels = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("speedProbeModels = %v, want %v", got, want)
 		}
 	}
 }

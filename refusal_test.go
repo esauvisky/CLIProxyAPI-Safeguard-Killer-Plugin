@@ -114,8 +114,18 @@ func TestDetectTextRefusalFromSessions(t *testing.T) {
 	}
 }
 
-func TestResourceExhaustedIsInsufficientQuota(t *testing.T) {
+func TestGenericResourceExhaustedIsATransientRateLimit(t *testing.T) {
 	detail := `host callback host.model.execute_stream: { "error": { "code": 429, "message": "Resource has been exhausted (e.g. check quota).", "status": "RESOURCE_EXHAUSTED" } }`
+	if got := summarizeAttemptReason(detail); got != "rate limited" {
+		t.Fatalf("summarizeAttemptReason() = %q, want rate limited", got)
+	}
+	if got := classifyAttemptFailure(detail); got != "transient" {
+		t.Fatalf("classifyAttemptFailure() = %q, want transient so later turns still try the model", got)
+	}
+}
+
+func TestExplicitQuotaExhaustionIsInsufficientQuota(t *testing.T) {
+	detail := `{ "error": { "code": 429, "status": "RESOURCE_EXHAUSTED", "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "QUOTA_EXHAUSTED"}] } }`
 	if got := summarizeAttemptReason(detail); got != "insufficient quota" {
 		t.Fatalf("summarizeAttemptReason() = %q, want insufficient quota", got)
 	}

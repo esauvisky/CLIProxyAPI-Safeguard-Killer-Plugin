@@ -171,8 +171,8 @@ func scoreModels(group modelGroup) []modelScore {
 		default:
 			panic(fmt.Errorf("group %s has invalid mode %q", group.ID, group.Mode))
 		}
-		speed := model.Speed
-		if group.Mode == groupModeSpeed && speed == 0 {
+		speed := 0.0
+		if group.Mode == groupModeSpeed {
 			speed = measuredModelSpeed(model.ID)
 		}
 		if group.Mode == groupModeSpeed {

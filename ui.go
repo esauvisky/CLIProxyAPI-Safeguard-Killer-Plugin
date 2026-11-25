@@ -88,7 +88,7 @@ func managementRegistrationPayload() managementRegistration {
 			{
 				Method:      http.MethodPost,
 				Path:        mgmtSpeedRoutePath,
-				Description: "Measures enabled models in speed-mode groups with small on-demand requests and updates their speed samples.",
+				Description: "Measures every non-embedding model served by a credential with small on-demand requests and updates their speed samples.",
 			},
 		},
 		Resources: []managementResource{
@@ -569,7 +569,7 @@ const uiHTML = `<!doctype html>
   .group-head { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
   .group-head .field { flex: 1; min-width: 180px; }
   .model-list { list-style: none; margin: 10px 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-  .model-row { display: grid; grid-template-columns: minmax(160px, 1fr) 90px 90px 90px 330px 72px auto; align-items: end; gap: 6px; }
+  .model-row { display: grid; grid-template-columns: minmax(160px, 1fr) 90px 90px 330px 72px auto; align-items: end; gap: 6px; }
   .model-row .model-score { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-bottom: 7px; }
   .model-row .btn { padding: 7px 10px; font-size: 13px; justify-content: center; }
   .model-row .model-toggle { width: 100%; }
@@ -788,7 +788,7 @@ const uiHTML = `<!doctype html>
           <button class="btn sm" data-action="add-group" id="addGroupBtn">Add group</button>
         </div>
       </div>
-      <p class="card-desc">A Smart Group exposes a single virtual model ID that automatically routes around safeguard refusals, content filters, scope-gate lectures, capability mismatches, and quota exhaustion across multiple models. Choose Quality first, Lower cost first or Speed first and rate each model from 0 to 100. Higher quality is better; higher cost is more expensive; higher speed is faster. Speed defaults to the measured throughput of completed group requests; set it above 0 only to override that measurement. Other modes ignore it. List order does not affect selection. The chosen model stays sticky across idle gaps until compaction, reset, or becoming unusable.</p>
+      <p class="card-desc">A Smart Group exposes a single virtual model ID that automatically routes around safeguard refusals, content filters, scope-gate lectures, capability mismatches, and quota exhaustion across multiple models. Choose Quality first, Lower cost first or Speed first and rate each model from 0 to 100. Higher quality is better; higher cost is more expensive. Speed first uses the measured throughput of completed responses, averaged with an EWMA; other modes ignore it. List order does not affect selection. The chosen model stays sticky across idle gaps until compaction, reset, or becoming unusable.</p>
       <div class="groups" id="groupsEditor"></div>
       <datalist id="modelList"></datalist>
     </section>
@@ -1100,17 +1100,12 @@ function featuresOf(cfg) {
   return out;
 }
 
-// The server omits speed from models that have none.
-function speedOf(m) {
-  return m.speed === undefined ? 0 : m.speed;
-}
-
 function canonConfig(cfg) {
   return JSON.stringify({
     min_remaining: cfg.min_remaining,
     idle_minutes: cfg.idle_minutes,
     stream_prefetch_bytes: cfg.stream_prefetch_bytes,
-    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: m.quality, cost: m.cost, speed: speedOf(m), disabled: m.disabled === true })) })),
+    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: m.quality, cost: m.cost, disabled: m.disabled === true })) })),
     features: featuresOf(cfg),
   });
 }
@@ -1128,7 +1123,7 @@ function loadDraft(cfg) {
       key: '',
     },
     features: featuresOf(cfg),
-    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: String(m.quality), cost: String(m.cost), speed: String(speedOf(m)), disabled: m.disabled === true })), pending: '' })),
+    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: String(m.quality), cost: String(m.cost), disabled: m.disabled === true })), pending: '' })),
   };
   draftSourceCanon = canonConfig(cfg);
   for (const el of document.querySelectorAll('[data-setting]')) el.value = draft.settings[el.dataset.setting];
@@ -1171,7 +1166,7 @@ function validateDraft() {
   const groups = draft.groups.map(g => ({
     id: g.id.trim(), name: g.name.trim(), mode: g.mode,
     models: g.models.map(m => {
-      const out = { id: m.id.trim(), quality: parseNum(m.quality), cost: parseNum(m.cost), speed: parseNum(m.speed) };
+      const out = { id: m.id.trim(), quality: parseNum(m.quality), cost: parseNum(m.cost) };
       if (m.disabled) out.disabled = true;
       return out;
     }),
@@ -1191,7 +1186,7 @@ function validateDraft() {
       if (m.id === '') errors.push(['groups.' + i + '.models.' + j + '.id', label + ': model #' + (j + 1) + ' is empty']);
       else if (modelIDs.has(m.id)) errors.push(['groups.' + i + '.models.' + j + '.id', label + ': duplicate model ' + m.id]);
       modelIDs.add(m.id);
-      for (const rating of ['quality', 'cost', 'speed']) {
+      for (const rating of ['quality', 'cost']) {
         if (!Number.isFinite(m[rating]) || m[rating] < 0 || m[rating] > 100) errors.push(['groups.' + i + '.models.' + j + '.' + rating, label + ': model #' + (j + 1) + ' ' + rating + ' must be a number from 0 to 100']);
       }
     });
@@ -1353,9 +1348,8 @@ function draftModelScores(g) {
   const out = g.models.map(m => {
     const q = parseNum(String(m.quality));
     const c = parseNum(String(m.cost));
-    const rawSpeed = parseNum(String(m.speed));
-    const sp = rawSpeed === 0 ? effectiveSpeed(m).rating : rawSpeed;
-    const valid = Number.isFinite(q) && Number.isFinite(c) && Number.isFinite(rawSpeed) && q >= 0 && q <= 100 && c >= 0 && c <= 100 && rawSpeed >= 0 && rawSpeed <= 100;
+    const sp = effectiveSpeed(m).rating;
+    const valid = Number.isFinite(q) && Number.isFinite(c) && q >= 0 && q <= 100 && c >= 0 && c <= 100;
     if (m.disabled) return { valid: true, disabled: true };
     if (!valid || !GROUP_MODES.includes(g.mode)) return { valid: false };
     const score = g.mode === 'quality' ? 0.8 * q - 0.2 * c : g.mode === 'cost' ? 0.2 * q - 0.8 * c : 0.6 * sp + 0.3 * q - 0.1 * c;
@@ -1410,7 +1404,6 @@ function measuredSpeed(modelID) {
 }
 
 function effectiveSpeed(m) {
-  if (m.speed > 0) return { rating: Number(m.speed), source: 'manual' };
   const stats = measuredSpeed(m.id);
   if (stats && stats.samples > 0) return { rating: stats.rating, source: 'measured', stats: stats };
   return { rating: 50, source: 'unmeasured' };
@@ -1419,7 +1412,6 @@ function effectiveSpeed(m) {
 function speedLabel(m) {
   const speed = effectiveSpeed(m);
   if (speed.source === 'measured') return 'speed ' + speed.rating + ' · ' + Math.round(speed.stats.tokens_per_second) + ' tok/s · ' + speed.stats.samples + ' samples';
-  if (speed.source === 'manual') return 'speed ' + speed.rating + ' · manual override';
   return 'speed 50 · unmeasured';
 }
 
@@ -1460,8 +1452,6 @@ function renderGroups() {
           '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.quality) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="quality"' + groupFieldAttr(i, 'models.' + j + '.quality') + '></label>' +
         '<label class="field model-rating"><span class="cfg-key">Cost</span>' +
           '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.cost) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="cost"' + groupFieldAttr(i, 'models.' + j + '.cost') + '></label>' +
-        '<label class="field model-rating"><span class="cfg-key">Speed</span>' +
-          '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.speed) + '" placeholder="auto" title="0 = learn from measured tokens/sec; 1-100 = manual override" data-group="' + i + '" data-model="' + j + '" data-mfield="speed"' + groupFieldAttr(i, 'models.' + j + '.speed') + '></label>' +
         '<div class="model-score small" data-score-cell="' + i + '.' + j + '">' + renderScoreCell(scores[j], m) + '</div>' +
         '<button class="btn sm model-toggle" data-action="model-toggle" data-group="' + i + '" data-model="' + j + '">' + (m.disabled ? 'Enable' : 'Disable') + '</button>' +
         '<button class="btn sm danger" data-action="model-remove" data-group="' + i + '" data-model="' + j + '" title="Remove">&times;</button>' +
@@ -1498,7 +1488,7 @@ function addPendingModel(gi) {
   const b = benchmarkFor(m);
   const autoQ = b && b.coding_agent > 0 ? String(Math.round(b.coding_agent)) : (b && b.intelligence > 0 ? String(Math.round(b.intelligence)) : '50');
 
-  g.models.push({ id: m, quality: autoQ, cost: '10', speed: '0', disabled: false });
+  g.models.push({ id: m, quality: autoQ, cost: '10', disabled: false });
   g.pending = '';
   setDirty(true);
   renderGroups();
@@ -2088,9 +2078,10 @@ function render() {
   const speedRefresh = state.speed_refresh || {};
   if (speedBtn) speedBtn.disabled = speedRefresh.running === true;
   if (speedStatus) {
-    if (speedRefresh.running) speedStatus.textContent = 'Measuring ' + speedRefresh.completed + '/' + speedRefresh.total + (speedRefresh.last_model ? ': ' + speedRefresh.last_model : '');
-    else if (speedRefresh.finished_at && !isZero(speedRefresh.finished_at)) speedStatus.textContent = 'Speed samples: ' + speedRefresh.completed + '/' + speedRefresh.total + (speedRefresh.errors ? ' · ' + Object.keys(speedRefresh.errors).length + ' failed' : '');
+    if (speedRefresh.running) speedStatus.textContent = 'Measuring ' + (speedRefresh.completed || 0) + '/' + (speedRefresh.total || 0) + (speedRefresh.last_model ? ': ' + speedRefresh.last_model : '');
+    else if (speedRefresh.finished_at && !isZero(speedRefresh.finished_at)) speedStatus.textContent = 'Speed samples: ' + (speedRefresh.completed || 0) + '/' + (speedRefresh.total || 0) + (speedRefresh.errors ? ' · ' + Object.keys(speedRefresh.errors).length + ' failed' : '');
     else speedStatus.textContent = 'Speed samples: ' + Object.keys(state.speeds || {}).length + ' models';
+    speedStatus.title = Object.entries(speedRefresh.errors || {}).map(([model, error]) => model + ': ' + error).join('\n');
   }
   // Follow config changes made elsewhere only while there is nothing unsaved here.
   if (draft === null || (!dirty && !saving && canonConfig(state.config) !== draftSourceCanon)) loadDraft(state.config);

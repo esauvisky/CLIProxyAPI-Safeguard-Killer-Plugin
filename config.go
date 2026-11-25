@@ -115,8 +115,6 @@ type groupModel struct {
 	ID      string  `yaml:"id" json:"id"`
 	Quality float64 `yaml:"quality" json:"quality"`
 	Cost    float64 `yaml:"cost" json:"cost"`
-	// Speed optionally overrides the measured speed rating, 0 to 100 (higher is faster). Only groups in speed mode score it; zero means learn it from completed requests.
-	Speed float64 `yaml:"speed,omitempty" json:"speed,omitempty"`
 	// Disabled keeps the entry and its ratings in the config but takes it out of routing.
 	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }
@@ -127,7 +125,7 @@ func (g *modelGroup) UnmarshalJSON(raw []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&decoded); err != nil {
-		return fmt.Errorf("group needs {id, name, mode, models: [{id, quality, cost, speed?}]}: %w", err)
+		return fmt.Errorf("group needs {id, name, mode, models: [{id, quality, cost}]}: %w", err)
 	}
 	*g = modelGroup(decoded)
 	return nil
@@ -155,11 +153,10 @@ func (g *modelGroup) UnmarshalYAML(node *yaml.Node) error {
 
 func (m *groupModel) UnmarshalJSON(raw []byte) error {
 	var decoded struct {
-		ID string `json:"id"`
-		Quality *float64 `json:"quality"`
-		Cost *float64 `json:"cost"`
-		Speed float64 `json:"speed"`
-		Disabled bool `json:"disabled"`
+		ID       string   `json:"id"`
+		Quality  *float64 `json:"quality"`
+		Cost     *float64 `json:"cost"`
+		Disabled bool     `json:"disabled"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -169,27 +166,26 @@ func (m *groupModel) UnmarshalJSON(raw []byte) error {
 	if decoded.Quality == nil || decoded.Cost == nil {
 		return fmt.Errorf("model %q needs explicit quality and cost ratings (0–100)", decoded.ID)
 	}
-	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost, Speed: decoded.Speed, Disabled: decoded.Disabled}
+	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost, Disabled: decoded.Disabled}
 	return nil
 }
 
 func (m *groupModel) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("model must be {id, quality, cost, speed?, disabled?}; string model lists are no longer supported")
+		return fmt.Errorf("model must be {id, quality, cost, disabled?}; string model lists are no longer supported")
 	}
 	for i := 0; i < len(node.Content); i += 2 {
 		switch node.Content[i].Value {
-		case "id", "quality", "cost", "speed", "disabled":
+		case "id", "quality", "cost", "disabled":
 		default:
 			return fmt.Errorf("unknown model field %q", node.Content[i].Value)
 		}
 	}
 	var decoded struct {
-		ID string `yaml:"id"`
-		Quality *float64 `yaml:"quality"`
-		Cost *float64 `yaml:"cost"`
-		Speed float64 `yaml:"speed"`
-		Disabled bool `yaml:"disabled"`
+		ID       string   `yaml:"id"`
+		Quality  *float64 `yaml:"quality"`
+		Cost     *float64 `yaml:"cost"`
+		Disabled bool     `yaml:"disabled"`
 	}
 	if err := node.Decode(&decoded); err != nil {
 		return err
@@ -197,7 +193,7 @@ func (m *groupModel) UnmarshalYAML(node *yaml.Node) error {
 	if decoded.Quality == nil || decoded.Cost == nil {
 		return fmt.Errorf("model %q needs explicit quality and cost ratings (0–100)", decoded.ID)
 	}
-	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost, Speed: decoded.Speed, Disabled: decoded.Disabled}
+	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost, Disabled: decoded.Disabled}
 	return nil
 }
 
@@ -296,9 +292,6 @@ func validateConfig(cfg pluginConfig) error {
 			if math.IsNaN(model.Quality) || math.IsInf(model.Quality, 0) || model.Quality < 0 || model.Quality > 100 ||
 				math.IsNaN(model.Cost) || math.IsInf(model.Cost, 0) || model.Cost < 0 || model.Cost > 100 {
 				return fmt.Errorf("group %s model %s: quality and cost must be finite ratings in [0, 100]", group.ID, model.ID)
-			}
-			if math.IsNaN(model.Speed) || math.IsInf(model.Speed, 0) || model.Speed < 0 || model.Speed > 100 {
-				return fmt.Errorf("group %s model %s: speed must be a finite rating in [0, 100]", group.ID, model.ID)
 			}
 		}
 		if enabled == 0 {

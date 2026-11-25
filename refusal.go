@@ -243,9 +243,9 @@ func summarizeAttemptReason(detail string) string {
 		return "low quota"
 	case lower == "refused earlier in session":
 		return "refused earlier"
-	case strings.Contains(lower, "insufficient_credits") || strings.Contains(lower, "insufficient_quota") || strings.Contains(lower, "resource_exhausted"):
+	case strings.Contains(lower, "insufficient_credits") || strings.Contains(lower, "insufficient_quota") || strings.Contains(lower, "quota_exhausted"):
 		return "insufficient quota"
-	case strings.Contains(lower, `"code": 429`) || strings.Contains(lower, `"code":429`) || strings.Contains(lower, "rate limit"):
+	case strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, `"code": 429`) || strings.Contains(lower, `"code":429`) || strings.Contains(lower, "rate limit"):
 		return "rate limited"
 	case strings.Contains(lower, "largest context window") || strings.Contains(lower, "context_length_exceeded"):
 		return "context too long"

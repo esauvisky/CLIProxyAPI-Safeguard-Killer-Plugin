@@ -7,6 +7,7 @@ import (
 	"maps"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -216,8 +217,8 @@ func responseUsage(response *struct {
 	return response.Usage
 }
 
-// Speed probes are explicit, operator-triggered requests. They run only for enabled models in
-// speed-mode groups, sequentially so one provider's load does not distort another's measurement.
+// Speed probes are explicit, operator-triggered requests. They cover every non-embedding model,
+// sequentially so one provider's load does not distort another's measurement.
 type speedRefreshStatus struct {
 	Running    bool              `json:"running"`
 	StartedAt  time.Time         `json:"started_at,omitempty"`
@@ -245,22 +246,27 @@ func speedRefreshSnapshot() speedRefreshStatus {
 	return status
 }
 
-func speedProbeModels(cfg pluginConfig) []string {
+// speedProbeModels lists every non-embedding model currently served by a host credential.
+// Groups are deliberately not consulted: the button measures all usable models, not just group members.
+func speedProbeModels() ([]string, error) {
+	snapshot, err := hostState(time.Now())
+	if err != nil {
+		return nil, err
+	}
 	seen := make(map[string]bool)
 	var models []string
-	for _, group := range cfg.Groups {
-		if group.Mode != groupModeSpeed {
-			continue
-		}
-		for _, model := range group.Models {
-			if model.Disabled || seen[model.ID] {
+	for _, credentialModels := range snapshot.models {
+		for _, model := range credentialModels {
+			model = strings.TrimSpace(model)
+			if model == "" || seen[model] || strings.Contains(strings.ToLower(model), "embedding") {
 				continue
 			}
-			seen[model.ID] = true
-			models = append(models, model.ID)
+			seen[model] = true
+			models = append(models, model)
 		}
 	}
-	return models
+	sort.Strings(models)
+	return models, nil
 }
 
 // startSpeedRefresh starts one asynchronous probe run. A second click while one is running returns
@@ -272,10 +278,14 @@ func startSpeedRefresh() (speedRefreshStatus, error) {
 		speedRefresh.Unlock()
 		return status, nil
 	}
-	models := speedProbeModels(currentConfig())
+	models, errModels := speedProbeModels()
+	if errModels != nil {
+		speedRefresh.Unlock()
+		return speedRefreshStatus{}, fmt.Errorf("list models for speed probes: %w", errModels)
+	}
 	if len(models) == 0 {
 		speedRefresh.Unlock()
-		return speedRefreshStatus{}, fmt.Errorf("no enabled models in speed-mode groups")
+		return speedRefreshStatus{}, fmt.Errorf("no non-embedding models available to measure")
 	}
 	speedRefresh.status = speedRefreshStatus{
 		Running:   true,

@@ -167,6 +167,7 @@ func scoreModels(group modelGroup) []modelScore {
 			score = 0.8*model.Quality - 0.2*model.Cost
 		case groupModeCost:
 			score = 0.2*model.Quality - 0.8*model.Cost
+		case groupModeSpeed:
 		default:
 			panic(fmt.Errorf("group %s has invalid mode %q", group.ID, group.Mode))
 		}

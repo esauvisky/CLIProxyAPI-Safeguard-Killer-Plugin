@@ -2107,13 +2107,32 @@ function clearError() {
   document.getElementById('statusDot').classList.remove('err');
 }
 
+function syncGroupQualitiesFromAA() {
+  for (const g of draft.groups) {
+    for (const m of g.models) {
+      const b = benchmarkFor(m.id);
+      if (!b) continue;
+      m.quality = String(b.coding_agent > 0 ? b.coding_agent : b.intelligence);
+    }
+  }
+  setDirty(true);
+  renderGroups();
+}
+
 async function refreshBenchmarks() {
   const btn = document.getElementById('refreshAABtn');
   if (btn) btn.disabled = true;
   try {
     const resp = await fetch(BENCHMARKS_REFRESH_URL, { method: 'POST', headers: authHeaders() });
-    if (!resp.ok) showError('Failed to refresh AA scores (HTTP ' + resp.status + ')', await resp.text());
+    if (!resp.ok) {
+      showError('Failed to refresh AA scores (HTTP ' + resp.status + ')', await resp.text());
+      await refresh();
+      return;
+    }
+    const result = JSON.parse(await resp.text());
     await refresh();
+    if (!result.ok) showError('Failed to refresh AA scores', result.error || '');
+    else syncGroupQualitiesFromAA();
   } catch (err) {
     showError('Network error refreshing AA scores', String(err));
   } finally {

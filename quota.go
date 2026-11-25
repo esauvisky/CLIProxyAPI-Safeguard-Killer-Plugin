@@ -32,7 +32,7 @@ const (
 
 	claudeUserAgent      = "claude-cli/2.1.280 (external, cli)"
 	codexUserAgent       = "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"
-	antigravityUserAgent = "antigravity/hub/2.23.0 darwin/arm64"
+	antigravityUserAgent = "antigravity/cli/1.5.13 (aidev_client; os_type=linux; arch=amd64; cl=1025641825; auth_method=consumer)"
 	xaiClientVersion     = "1.0.46"
 	xaiUserAgent         = "grok-pager/" + xaiClientVersion + " grok-shell/" + xaiClientVersion + " (macos; aarch64)"
 

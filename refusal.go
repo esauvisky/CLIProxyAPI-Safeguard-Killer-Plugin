@@ -726,7 +726,7 @@ var (
 	mcpServersDisconnectedBlockPattern   = regexp.MustCompile(`(?m)^The following MCP servers have disconnected\.[^\n]*\r?\n(?:[A-Za-z0-9_:*.-]+[ \t]*\r?\n?)*`)
 	deferredToolsAvailableBlockPattern   = regexp.MustCompile(`(?m)^The following deferred tools are now available via ToolSearch\.[^\n]*\r?\n(?:[A-Za-z0-9_:*.-]+[ \t]*\r?\n?)+`)
 	envUpdateBlockPattern                = regexp.MustCompile(`(?m)^# Environment update\r?\n(?:[ \t]*-[ \t]*[^\n]+\r?\n?)+[ \t\r\n]*`)
-	systemNotificationPreamblePattern = regexp.MustCompile(
+	systemNotificationPreamblePattern    = regexp.MustCompile(
 		`(?is)\[SYSTEM NOTIFICATION\s*-\s*NOT USER INPUT\][ \t\r\n]*(?:This is an automated background-task event[^\n]*\n)?(?:Do NOT interpret[^\n]*\n)?(?:No human input has been received[^\n]*\n?)?[ \t\r\n]*`,
 	)
 )
@@ -1138,7 +1138,8 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 	hasCrossModelCoT := cfg.Features.FallbackOnRefusal && containsCrossModelCoT(rawMessages)
 	hasAssistantRefusal := cfg.Features.FallbackOnRefusal && bytes.Contains(rawMessages, []byte(`"assistant"`)) && detectTextRefusal(string(rawMessages)) != ""
 	hasSystemGate := cfg.Features.RewriteCyberSystemPrompt && (bytes.Contains(rawMessages, []byte(claudeCyberGatePrompt)) || bytes.Contains(rawMessages, []byte(claudeFableTierPrompt)) || bytes.Contains(rawMessages, []byte(claudeVisibleThinkingClause)))
-	if !hasNotice && !hasReminder && !hasDedupTarget && !hasNudge && !hasSystemGate && !hasRedactedThinking && !hasCrossModelCoT && !hasAssistantRefusal {
+	hasSystemTurns := bytes.Contains(rawMessages, []byte(`"role":"system"`)) || bytes.Contains(rawMessages, []byte(`"role": "system"`))
+	if !hasNotice && !hasReminder && !hasDedupTarget && !hasNudge && !hasSystemGate && !hasRedactedThinking && !hasCrossModelCoT && !hasAssistantRefusal && !hasSystemTurns {
 		return rawMessages
 	}
 	var messages []map[string]json.RawMessage
@@ -1307,9 +1308,9 @@ type cleanIndexedMessage struct {
 	origIdx int
 }
 
-// normalizeCleanedIndexedMessages ensures mid-conversation role="system" turns never precede a
-// role="user" turn (Anthropic HTTP 400) after an intervening assistant turn is dropped, and merges
-// adjacent same-role turns separated by a dropped turn while keeping leading tool_result blocks first.
+// normalizeCleanedIndexedMessages removes ordinary mid-conversation role="system" turns, which
+// Anthropic rejects, by folding system-before-assistant turns into the preceding user turn and
+// dropping system-before-user turns. Directive-only system turns and a final system turn pass through.
 func normalizeCleanedIndexedMessages(items []cleanIndexedMessage) ([]map[string]json.RawMessage, bool) {
 	if len(items) == 0 {
 		return []map[string]json.RawMessage{}, false
@@ -1320,12 +1321,12 @@ func normalizeCleanedIndexedMessages(items []cleanIndexedMessage) ([]map[string]
 		_ = json.Unmarshal(m["role"], &r)
 		return r
 	}
-	// Pass 1: resolve mid-conversation system turns whose next non-system turn is "user".
+	// Pass 1: resolve ordinary mid-conversation system turns.
 	pass1 := make([]cleanIndexedMessage, 0, len(items))
 	var pendingTaskReminders []map[string]json.RawMessage
 	for i := 0; i < len(items); i++ {
 		role := roleOf(items[i].msg)
-		if role == "system" {
+		if role == "system" && !directiveOnlySystemMessage(items[i].msg) {
 			nextNonSys := ""
 			for j := i + 1; j < len(items); j++ {
 				if r := roleOf(items[j].msg); r != "system" {
@@ -1342,6 +1343,19 @@ func normalizeCleanedIndexedMessages(items []cleanIndexedMessage) ([]map[string]
 						"type": json.RawMessage(`"text"`),
 						"text": rawText,
 					})
+				}
+				continue
+			}
+			if nextNonSys == "assistant" {
+				changed = true
+				blocks := contentToBlocks(items[i].msg["content"])
+				if len(pass1) > 0 && roleOf(pass1[len(pass1)-1].msg) == "user" {
+					previous := pass1[len(pass1)-1].msg
+					previous["content"], _ = json.Marshal(append(contentToBlocks(previous["content"]), blocks...))
+				} else {
+					items[i].msg["role"] = json.RawMessage(`"user"`)
+					items[i].msg["content"], _ = json.Marshal(blocks)
+					pass1 = append(pass1, items[i])
 				}
 				continue
 			}
@@ -1371,6 +1385,15 @@ func normalizeCleanedIndexedMessages(items []cleanIndexedMessage) ([]map[string]
 		prevOrig = it.origIdx
 	}
 	return out, changed
+}
+
+func directiveOnlySystemMessage(msg map[string]json.RawMessage) bool {
+	var content []json.RawMessage
+	if json.Unmarshal(msg["content"], &content) != nil || len(content) != 0 {
+		return false
+	}
+	_, ok := msg["output_config"]
+	return ok
 }
 
 func extractMessageText(raw json.RawMessage) string {

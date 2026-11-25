@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -191,6 +192,40 @@ func TestCleanMessagesAblatesCrossModelCoTAndHealsOrphanedSystem(t *testing.T) {
 	}
 }
 
+func TestCleanMessagesFoldsMidConversationSystemTurns(t *testing.T) {
+	cfg := defaultPluginConfig()
+	body := `{"model":"claude-opus-5-5","messages":[` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":"ok"}]},` +
+		`{"role":"system","content":"The date has changed."},` +
+		`{"role":"assistant","content":[{"type":"tool_use","id":"tool_2","name":"Bash","input":{"command":"ls"}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_2","content":"done"}]},` +
+		`{"role":"system","content":[],"output_config":{"effort":"high"}},` +
+		`{"role":"assistant","content":"finished"},` +
+		`{"role":"system","content":"Final system turn"}` +
+		`]}`
+
+	out, _, _, _ := sanitizeRequest([]byte(body), http.Header{}, cfg)
+	var parsed struct {
+		Messages []map[string]json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("unmarshal sanitized payload: %v", err)
+	}
+	if len(parsed.Messages) != 6 {
+		t.Fatalf("messages = %d, want 6: %s", len(parsed.Messages), out)
+	}
+	if !bytes.Contains(parsed.Messages[0]["content"], []byte("The date has changed.")) || !bytes.Contains(parsed.Messages[0]["content"], []byte("tool_result")) {
+		t.Fatalf("system text was not folded into the preceding user turn: %s", parsed.Messages[0]["content"])
+	}
+	for i, msg := range parsed.Messages {
+		var role string
+		_ = json.Unmarshal(msg["role"], &role)
+		if role == "system" && i < len(parsed.Messages)-1 && !directiveOnlySystemMessage(msg) {
+			t.Fatalf("ordinary mid-conversation system turn survived at %d: %s", i, out)
+		}
+	}
+}
+
 func TestStripSystemNotificationPreambleKeepsTaskNotification(t *testing.T) {
 	cfg := defaultPluginConfig()
 	sysTurn := "[SYSTEM NOTIFICATION - NOT USER INPUT]\n" +
@@ -345,9 +380,3 @@ func TestStripSupersededEnvironmentUpdatesAndContradictedSandbox(t *testing.T) {
 		}
 	}
 }
-
-
-
-
-
-

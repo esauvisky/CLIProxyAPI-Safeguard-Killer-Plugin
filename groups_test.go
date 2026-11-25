@@ -1227,10 +1227,11 @@ func TestSalvagedPartialOutputInTrailAndSkippedWhenSentBack(t *testing.T) {
 func TestSpeedModeScoresSpeedFirst(t *testing.T) {
 	models := []groupModel{{ID: "fast", Quality: 30, Cost: 5, Speed: 95}, {ID: "smart", Quality: 90, Cost: 20, Speed: 20}, {ID: "idle", Quality: 50, Cost: 0, Speed: 0}}
 	scores := scoreModels(modelGroup{ID: "g", Mode: groupModeSpeed, Models: models})
-	want := []float64{0.6*95 + 0.3*30 - 0.1*5, 0.6*20 + 0.3*90 - 0.1*20, 0.3 * 50}
+	wantScores := []float64{0.6*95 + 0.3*30 - 0.1*5, 0.6*20 + 0.3*90 - 0.1*20, 0.6*speedUnmeasuredRating + 0.3*50}
+	wantSpeeds := []float64{95, 20, speedUnmeasuredRating}
 	for i, score := range scores {
-		if score.Model != models[i].ID || score.Speed != models[i].Speed || math.Abs(score.Score-want[i]) > 1e-12 {
-			t.Fatalf("score[%d] = %+v, want score %v", i, score, want[i])
+		if score.Model != models[i].ID || score.Speed != wantSpeeds[i] || math.Abs(score.Score-wantScores[i]) > 1e-12 {
+			t.Fatalf("score[%d] = %+v, want score %v", i, score, wantScores[i])
 		}
 	}
 	if scores[0].Score <= scores[1].Score {
@@ -1337,8 +1338,8 @@ func TestMeasuredSpeedLearnsEWMA(t *testing.T) {
 	speedMu.RLock()
 	stats := speedStats[model]
 	speedMu.RUnlock()
-	if stats.Samples != 2 || stats.TokensPerSecond != 62.5 || stats.FirstTokenSec != 1.75 {
-		t.Fatalf("stats = %+v, want 2 samples at 62.5 tok/s and 1.75s to first token", stats)
+	if stats.Samples != 2 || stats.TokensPerSecond != 62.5 || stats.FirstTokenSec != 1.25 {
+		t.Fatalf("stats = %+v, want 2 samples at 62.5 tok/s and 1.25s to first token", stats)
 	}
 	recordModelSpeedSample(model, 0, start, start, start.Add(time.Second))
 	if measuredModelSpeed(model) != speedRating(62.5) {

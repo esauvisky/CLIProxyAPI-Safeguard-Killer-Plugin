@@ -16,6 +16,7 @@ func TestManagementRegistrationPaths(t *testing.T) {
 		{http.MethodGet, "/plugins/safeguard-killer/payloads"},
 		{http.MethodPost, "/plugins/safeguard-killer/preview"},
 		{http.MethodPost, "/plugins/safeguard-killer/benchmarks/refresh"},
+		{http.MethodPost, "/plugins/safeguard-killer/speed/refresh"},
 	}
 	if len(reg.Routes) != len(wantRoutes) {
 		t.Fatalf("routes = %+v", reg.Routes)

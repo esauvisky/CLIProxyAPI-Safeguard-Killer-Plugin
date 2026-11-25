@@ -225,6 +225,9 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 			}
 		}
 		attempts = append(attempts, groupAttempt{Model: model, Result: "served", Duration: time.Since(attemptStart)})
+		if !aux {
+			recordModelSpeedResponse(model, resp.Body, attemptStart, time.Now())
+		}
 		recordGroupDecision(group, session, attempts, model, plan.SelectedScores)
 		bodyOut := resp.Body
 		prevModel := recordServed(cfg, session, group.ID, model, prevLookupModel, req.Payload, time.Now())
@@ -313,7 +316,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)), plan.SelectedScores)
 			prefetched, shiftIndices = injectStreamNotice(prefetched, effectiveFormat(req.Format, req.SourceFormat), notice)
 		}
-		go forwardStream(resp.StreamID, req.StreamID, req.HostCallbackID, prefetched, done, shiftIndices, stampSafeguards, cfg.Features.FallbackOnRefusal, session, group, model)
+		go forwardStream(resp.StreamID, req.StreamID, req.HostCallbackID, prefetched, done, shiftIndices, stampSafeguards, cfg.Features.FallbackOnRefusal, session, group, model, attemptStart, !aux)
 		return okEnvelope(executorStreamOpenResponse{Headers: cleanResponseHeaders(resp.Headers)})
 	}
 	recordGroupDecision(group, session, attempts, "", plan.Scores)
@@ -326,9 +329,28 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 }
 
 // forwardStream flushes prefetched chunks and copies the remainder of the target model's stream.
-func forwardStream(source, target, callbackID string, prefetched [][]byte, sourceDone, shiftIndices, stampSafeguards, checkRefusal bool, session string, group modelGroup, model string) {
+func forwardStream(source, target, callbackID string, prefetched [][]byte, sourceDone, shiftIndices, stampSafeguards, checkRefusal bool, session string, group modelGroup, model string, attemptStart time.Time, measureSpeed bool) {
 	seenToolIDs := make(map[string]bool)
+	firstOutput := time.Time{}
+	outputTokens := 0
+	observeSpeed := func(payload []byte) {
+		if len(payload) == 0 {
+			return
+		}
+		if firstOutput.IsZero() {
+			firstOutput = time.Now()
+		}
+		if tokens := outputTokensFromChunk(payload); tokens > outputTokens {
+			outputTokens = tokens
+		}
+	}
+	finishSpeed := func() {
+		if measureSpeed && outputTokens > 0 && !firstOutput.IsZero() {
+			recordModelSpeedSample(model, outputTokens, attemptStart, firstOutput, time.Now())
+		}
+	}
 	for _, payload := range prefetched {
+		observeSpeed(payload)
 		payload = processStreamSafeguardChunk(payload, seenToolIDs, stampSafeguards)
 		if _, errEmit := hostCall(methodHostStreamEmit, hostStreamEmit{StreamID: target, Payload: payload, HostCallbackID: callbackID}); errEmit != nil {
 			if !sourceDone {
@@ -338,6 +360,7 @@ func forwardStream(source, target, callbackID string, prefetched [][]byte, sourc
 		}
 	}
 	if sourceDone {
+		finishSpeed()
 		closeStream(target, callbackID, "")
 		return
 	}
@@ -353,6 +376,7 @@ func forwardStream(source, target, callbackID string, prefetched [][]byte, sourc
 			return
 		}
 		if len(chunk.Payload) > 0 {
+			observeSpeed(chunk.Payload)
 			observeConversationUsage(session, group.ID, chunk.Payload)
 			if checkRefusal {
 				if refusal, _, _, _, _ := inspectStreamChunk(chunk.Payload); refusal != "" {
@@ -371,6 +395,9 @@ func forwardStream(source, target, callbackID string, prefetched [][]byte, sourc
 			}
 		}
 		if chunk.Error != "" || chunk.Done {
+			if chunk.Error == "" && chunk.Done {
+				finishSpeed()
+			}
 			closeStream(target, callbackID, chunk.Error)
 			return
 		}

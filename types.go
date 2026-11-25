@@ -137,6 +137,10 @@ type uiState struct {
 	Benchmarks          map[string]modelBenchmark `json:"benchmarks,omitempty"`
 	BenchmarksFetchedAt time.Time                 `json:"benchmarks_fetched_at,omitempty"`
 	BenchmarksError     string                    `json:"benchmarks_error,omitempty"`
+	// Speeds contains measured per-model throughput learned from completed group responses.
+	Speeds map[string]modelSpeedSnapshot `json:"speeds,omitempty"`
+	// SpeedRefresh reports the on-demand probe run started by Update speed samples.
+	SpeedRefresh speedRefreshStatus `json:"speed_refresh"`
 }
 
 type capturedPayloadMeta struct {

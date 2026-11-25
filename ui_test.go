@@ -124,7 +124,7 @@ func TestGroupSchemaJSONRoundtrip(t *testing.T) {
 }
 
 func TestUIUsesRatedGroupSchema(t *testing.T) {
-	for _, want := range []string{`data-gfield="mode"`, `data-mfield="quality"`, `data-mfield="cost"`, "Quality first", "Lower cost first", "model_scores"} {
+	for _, want := range []string{`data-gfield="mode"`, `data-mfield="quality"`, `data-mfield="cost"`, "Quality first", "Lower cost first", "Speed first", `data-mfield="speed"`, "model_scores"} {
 		if !strings.Contains(uiHTML, want) {
 			t.Fatalf("ui html does not contain %s", want)
 		}

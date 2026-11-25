@@ -410,7 +410,7 @@ func containsString(values []string, target string) bool {
 func buildUIState() uiState {
 	now := time.Now()
 	cfg := currentConfig()
-	state := uiState{Version: pluginVersion, Now: now, Config: cfg, ManagementError: managementStatus(cfg.ManagementKey, now), Metrics: computeRoutingMetrics()}
+	state := uiState{Version: pluginVersion, Now: now, Config: cfg, ManagementError: managementStatus(cfg.ManagementKey, now), Metrics: computeRoutingMetrics(), Speeds: speedStatsSnapshot(), SpeedRefresh: speedRefreshSnapshot()}
 	snapshot, errHost := hostState(now)
 	if errHost != nil {
 		state.Error = errHost.Error()

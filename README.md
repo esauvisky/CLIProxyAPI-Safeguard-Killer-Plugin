@@ -47,17 +47,18 @@ Once a model answers, the conversation stays on it:
 - **Compaction Reset:** Refusal records and the current model reset, and the next turn selects again, only when the payload shrinks below 70% **and** the message list collapses to at most half (a real `/compact`, auto-compaction, or `/clear`). Claude Code clearing old tool results shrinks bytes without collapsing messages, and does not reset.
 - **Session-Scoped Capability Memory:** Models that fail with `no tools`, `not found`, `no vision` (while images are in payload), or `context too long` (until compaction shrinks the payload) are skipped automatically without re-trying.
 
-### Model Selection (`mode`, `quality`, `cost`)
-Each Smart Group needs an explicit `mode`, and each model in it needs `quality` and `cost` ratings from `0` to `100`. Higher `quality` is better; higher `cost` is more expensive. The order of `models` has no effect on selection.
+### Model Selection (`mode`, `quality`, `cost`, `speed`)
+Each Smart Group needs an explicit `mode`, and each model in it needs `quality` and `cost` ratings from `0` to `100`. Higher `quality` is better; higher `cost` is more expensive. Models may also carry a `speed` rating from `0` to `100` (higher is faster). Only `speed` mode scores it; other modes ignore it. Leave `speed` at `0` to use the measured rating from completed group responses. The order of `models` has no effect on selection.
 
 | `mode` | UI label | Score |
 | --- | --- | --- |
 | `quality` | Quality first | `0.8 × quality − 0.2 × cost` |
 | `cost` | Lower cost first | `0.2 × quality − 0.8 × cost` |
+| `speed` | Speed first | `0.6 × speed + 0.3 × quality − 0.1 × cost` |
 
 A new conversation, or one reset by compaction, scores every eligible model (excluding refused, capability-incompatible, and unavailable models). Only models within `3` points of the best score stay in the pool, and one is picked by softmax over their scores with temperature `1`. Models farther from the best get no traffic. The pick then stays sticky as described above. When it refuses or becomes unusable, the remaining eligible models are scored the same way.
 
-Every group decision logs `mode` and `model_scores` (`model`, `quality`, `cost`, `score`, `probability`, `excluded`). The **Recent Decisions** tab and the conversation trail show these for each pick.
+Every group decision logs `mode` and `model_scores` (`model`, `quality`, `cost`, `speed`, `score`, `probability`, `excluded`). The **Recent Decisions** tab and the conversation trail show these for each pick.
 
 ---
 
@@ -87,7 +88,7 @@ This replaces the former strategy and cost-tier flags. Existing group configurat
 Open **Safeguard Killer** in the CPA Management Center sidebar. The interface is organized into five tabs:
 
 1. **General Settings:** Configure `management_key`, `min_remaining`, `idle_minutes`, `stream_prefetch_bytes`, the safeguard/adaptation toggles, and the custom client notice prefix.
-2. **Smart Groups:** Add and delete Smart Groups, pick each group's mode (**Quality first** or **Lower cost first**), and add, remove, and rate models (quality and cost, `0` to `100`). Each model row shows its live score for the selected mode and whether it is in the selection pool (within `3` points of the best) with its share of new conversations, or how far below the best it falls. New groups default to Quality first; new models default to quality `50` and cost `50`.
+2. **Smart Groups:** Add and delete Smart Groups, pick each group's mode (**Quality first**, **Lower cost first** or **Speed first**), and add, remove, and rate models (quality, cost and speed, `0` to `100`). Each model row shows its live score for the selected mode and whether it is in the selection pool (within `3` points of the best) with its share of new conversations, or how far below the best it falls. New groups default to Quality first; new models default to quality from their Artificial Analysis score (else `50`), cost `10`, and speed `0` (learn from measured throughput).
 3. **Sessions:** Live view of active credential bindings and Smart Group model pins.
 4. **Recent Decisions:** Routing metrics (refusals, compaction resets), a per-conversation trail, and an audit log of every group selection (mode, model scores, probabilities, exclusions), failover chain, and credential quota ranking.
 5. **Credentials:** Live status and quota windows for every host credential.
@@ -171,3 +172,6 @@ plugins:
               quality: 60
               cost: 20
 ```
+
+### Measured speed data
+The plugin measures each model's speed from completed group responses on this CPA instance: output tokens divided by response seconds, plus first-token latency. The displayed rating maps tokens per second logarithmically from `10` (rating `0`) to `500` (rating `100`), and is an EWMA across completed responses. Requests that fail, are aborted by the client, or report no output-token usage do not contribute samples. Before a model has samples it rates a neutral `50`. Set `speed` above `0` to override the measurement manually. The stats persist with the session state. **Update speed samples** in the Smart Groups editor starts an on-demand probe for every enabled model in a speed-mode group, sending a short fixed prompt and measuring the completed response. Probes run sequentially, with a 90-second per-model timeout; failures appear in the refresh status without discarding older samples.

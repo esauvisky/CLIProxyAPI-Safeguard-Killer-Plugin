@@ -1223,3 +1223,162 @@ func TestSalvagedPartialOutputInTrailAndSkippedWhenSentBack(t *testing.T) {
 		t.Fatalf("refused assistant turn or notice leaked into upstream payload: %v", forwardedBodies)
 	}
 }
+
+func TestSpeedModeScoresSpeedFirst(t *testing.T) {
+	models := []groupModel{{ID: "fast", Quality: 30, Cost: 5, Speed: 95}, {ID: "smart", Quality: 90, Cost: 20, Speed: 20}, {ID: "idle", Quality: 50, Cost: 0, Speed: 0}}
+	scores := scoreModels(modelGroup{ID: "g", Mode: groupModeSpeed, Models: models})
+	want := []float64{0.6*95 + 0.3*30 - 0.1*5, 0.6*20 + 0.3*90 - 0.1*20, 0.3 * 50}
+	for i, score := range scores {
+		if score.Model != models[i].ID || score.Speed != models[i].Speed || math.Abs(score.Score-want[i]) > 1e-12 {
+			t.Fatalf("score[%d] = %+v, want score %v", i, score, want[i])
+		}
+	}
+	if scores[0].Score <= scores[1].Score {
+		t.Fatalf("fast model %v does not outscore smart model %v in speed mode", scores[0].Score, scores[1].Score)
+	}
+	quality := scoreModels(modelGroup{ID: "g", Mode: groupModeQuality, Models: models})
+	if quality[1].Score <= quality[0].Score {
+		t.Fatalf("smart model %v does not outscore fast model %v in quality mode", quality[1].Score, quality[0].Score)
+	}
+}
+
+func TestSpeedModeConfigValidation(t *testing.T) {
+	valid := []groupModel{{ID: "a", Quality: 40, Cost: 5, Speed: 80}, {ID: "auto", Quality: 40, Cost: 5}, {ID: "off", Quality: 40, Cost: 5, Disabled: true}}
+	cfg := defaultPluginConfig()
+	cfg.Groups = []modelGroup{{ID: "g", Name: "G", Mode: groupModeSpeed, Models: valid}}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("valid speed group rejected: %v", err)
+	}
+	for _, value := range []float64{-0.01, 100.01, math.NaN(), math.Inf(1)} {
+		cfg.Groups = []modelGroup{{ID: "g", Name: "G", Mode: groupModeQuality, Models: []groupModel{{ID: "a", Quality: 40, Cost: 5, Speed: value}}}}
+		if err := validateConfig(cfg); err == nil {
+			t.Fatalf("speed rating %v accepted", value)
+		}
+	}
+}
+
+func TestSpeedModeUsesMeasuredAndOverriddenRatings(t *testing.T) {
+	const measured = "speed-test-measured"
+	speedMu.Lock()
+	speedStats[measured] = &modelSpeedStats{Samples: 1, TokensPerSecond: 100}
+	speedMu.Unlock()
+	t.Cleanup(func() {
+		speedMu.Lock()
+		delete(speedStats, measured)
+		speedMu.Unlock()
+	})
+	models := []groupModel{{ID: measured, Quality: 30, Cost: 5}, {ID: "speed-test-manual", Quality: 30, Cost: 5, Speed: 80}, {ID: "speed-test-unknown", Quality: 30, Cost: 5}}
+	scores := scoreModels(modelGroup{ID: "g", Mode: groupModeSpeed, Models: models})
+	want := []float64{0.6*speedRating(100) + 0.3*30 - 0.1*5, 0.6*80 + 0.3*30 - 0.1*5, 0.6*50 + 0.3*30 - 0.1*5}
+	for i, score := range scores {
+		if math.Abs(score.Score-want[i]) > 1e-12 {
+			t.Fatalf("score[%d] = %+v, want %v", i, score, want[i])
+		}
+	}
+	if scores[0].Speed != speedRating(100) || scores[1].Speed != 80 || scores[2].Speed != 50 {
+		t.Fatalf("speed ratings = %v, %v, %v", scores[0].Speed, scores[1].Speed, scores[2].Speed)
+	}
+	quality := scoreModels(modelGroup{ID: "g", Mode: groupModeQuality, Models: models})
+	if quality[1].Score != 0.8*30-0.2*5 {
+		t.Fatalf("quality mode must ignore the manual speed rating: %+v", quality[1])
+	}
+}
+
+func TestSpeedRatingDecoding(t *testing.T) {
+	raw := `{"id":"g","name":"Group","mode":"speed","models":[{"id":"m","quality":40,"cost":5,"speed":82.5}]}`
+	var fromJSON, fromYAML modelGroup
+	if err := json.Unmarshal([]byte(raw), &fromJSON); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if err := yaml.Unmarshal([]byte(raw), &fromYAML); err != nil {
+		t.Fatalf("yaml decode: %v", err)
+	}
+	for _, group := range []modelGroup{fromJSON, fromYAML} {
+		if group.Mode != groupModeSpeed || len(group.Models) != 1 || group.Models[0].Speed != 82.5 {
+			t.Fatalf("decoded group = %+v", group)
+		}
+	}
+}
+
+func TestOutputTokensExtraction(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"claude message", `{"usage":{"output_tokens":120}}`, 120},
+		{"openai chat", `{"usage":{"completion_tokens":80,"prompt_tokens":900}}`, 80},
+		{"openai responses", `{"response":{"usage":{"output_tokens":240}}}`, 240},
+		{"gemini", `{"usageMetadata":{"candidatesTokenCount":60,"thoughtsTokenCount":15}}`, 75},
+		{"stream uses latest cumulative usage", "data: {\"usage\":{\"output_tokens\":12}}\n\ndata: {\"usage\":{\"output_tokens\":140}}\n\n", 140},
+		{"no usage", `{"content":[]}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := outputTokensFromChunk([]byte(tc.body)); got != tc.want {
+				t.Fatalf("outputTokensFromChunk = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMeasuredSpeedLearnsEWMA(t *testing.T) {
+	const model = "speed-test-ewma"
+	t.Cleanup(func() {
+		speedMu.Lock()
+		delete(speedStats, model)
+		speedMu.Unlock()
+	})
+	start := time.Now()
+	recordModelSpeedSample(model, 100, start, start.Add(time.Second), start.Add(2*time.Second))
+	if got := measuredModelSpeed(model); got != speedRating(50) {
+		t.Fatalf("first sample rating = %v, want %v", got, speedRating(50))
+	}
+	recordModelSpeedSample(model, 400, start, start.Add(2*time.Second), start.Add(4*time.Second))
+	speedMu.RLock()
+	stats := speedStats[model]
+	speedMu.RUnlock()
+	if stats.Samples != 2 || stats.TokensPerSecond != 62.5 || stats.FirstTokenSec != 1.75 {
+		t.Fatalf("stats = %+v, want 2 samples at 62.5 tok/s and 1.75s to first token", stats)
+	}
+	recordModelSpeedSample(model, 0, start, start, start.Add(time.Second))
+	if measuredModelSpeed(model) != speedRating(62.5) {
+		t.Fatal("a response without output tokens must not change the rating")
+	}
+}
+
+func TestSpeedRatingScale(t *testing.T) {
+	for _, tc := range []struct {
+		tokensPerSecond float64
+		want            float64
+	}{
+		{0, 0},
+		{10, 0},
+		{5, 0},
+		{500, 100},
+		{900, 100},
+		{tokensPerSecond: math.Sqrt(10 * 500), want: 50},
+	} {
+		if got := speedRating(tc.tokensPerSecond); got != tc.want {
+			t.Fatalf("speedRating(%v) = %v, want %v", tc.tokensPerSecond, got, tc.want)
+		}
+	}
+}
+
+func TestSpeedProbeModelsUsesEnabledSpeedGroupMembers(t *testing.T) {
+	cfg := defaultPluginConfig()
+	cfg.Groups = []modelGroup{
+		{ID: "fast", Mode: groupModeSpeed, Models: []groupModel{{ID: "a"}, {ID: "b"}, {ID: "off", Disabled: true}}},
+		{ID: "fast2", Mode: groupModeSpeed, Models: []groupModel{{ID: "b"}, {ID: "c"}}},
+		{ID: "quality", Mode: groupModeQuality, Models: []groupModel{{ID: "d"}}},
+	}
+	got := speedProbeModels(cfg)
+	want := []string{"a", "b", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("speedProbeModels = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("speedProbeModels = %v, want %v", got, want)
+		}
+	}
+}

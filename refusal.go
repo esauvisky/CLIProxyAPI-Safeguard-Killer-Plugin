@@ -70,6 +70,7 @@ var sessionStatePath = filepath.Join(os.TempDir(), "safeguard-killer-sessions.js
 type persistedSessionState struct {
 	Sessions      map[string]*sessionBinding    `json:"sessions"`
 	Conversations map[string]*conversationState `json:"conversations"`
+	Speeds        map[string]*modelSpeedStats   `json:"speeds,omitempty"`
 }
 
 func loadPersistedSessions(now time.Time) {
@@ -84,6 +85,13 @@ func loadPersistedSessions(now time.Time) {
 	if json.Unmarshal(raw, &snap) != nil {
 		return
 	}
+	speedMu.Lock()
+	for k, v := range snap.Speeds {
+		if v != nil && v.Samples > 0 {
+			speedStats[k] = v
+		}
+	}
+	speedMu.Unlock()
 	stateMu.Lock()
 	for k, v := range snap.Sessions {
 		if v != nil && now.Sub(v.LastSeen) <= sessionRetention {
@@ -102,9 +110,17 @@ func savePersistedSessionsLocked() {
 	if sessionStatePath == "" {
 		return
 	}
+	speedMu.RLock()
+	speeds := make(map[string]*modelSpeedStats, len(speedStats))
+	for model, stats := range speedStats {
+		copy := *stats
+		speeds[model] = &copy
+	}
+	speedMu.RUnlock()
 	raw, errMarshal := json.Marshal(persistedSessionState{
 		Sessions:      sessions,
 		Conversations: groupStates,
+		Speeds:        speeds,
 	})
 	if errMarshal != nil {
 		return

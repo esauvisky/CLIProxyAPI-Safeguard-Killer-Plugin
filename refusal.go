@@ -681,9 +681,9 @@ var (
 	claudeOpeningPattern = regexp.MustCompile(`(?mi)^[ \t]*You are (?:Claude Code, Anthropic's official CLI for Claude(?:, running within the Claude Agent SDK)?|a Claude agent, built on Anthropic's Claude Agent SDK)\.[ \t]*\n?`)
 	outputStyleOpeningPattern = regexp.MustCompile(`(?mi)^[ \t]*You are an interactive agent that helps users according to your "Output Style"[^\n]*\n?`)
 	fableIdentityPattern      = regexp.MustCompile(`(?mi)^[ \t]*This iteration of Claude is Claude (?:Fable|Mythos)[^\n]*\n?`)
-	// Claude Code's autonomy_append section is emitted for every model whose cloaked id resolves to
-	// Fable 5, so non-Claude targets get Fable's "never end the turn" instructions verbatim. The
-	// paragraphs are single lines in the assembled prompt.
+	// Claude Code emits autonomy paragraphs for every model whose cloaked id resolves to Fable 5, so
+	// non-Claude targets receive Fable's "never end the turn" instructions verbatim. They are removed
+	// for non-Claude targets only; Claude targets keep them.
 	autonomyParagraphPattern = regexp.MustCompile(`(?m)^[ \t]*You are operating autonomously\.[^\n]*\n?`)
 	autonomyEndingPattern    = regexp.MustCompile(`(?m)^[ \t]*Before ending your turn, check your last paragraph\.[^\n]*\n?`)
 

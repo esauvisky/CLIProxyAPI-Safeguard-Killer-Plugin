@@ -164,7 +164,7 @@ func TestSanitizeStripsLatestModelsAndReaDirectives(t *testing.T) {
 }
 
 func TestAdaptPromptForModelKeysIdentityByTarget(t *testing.T) {
-	prompt := "You are Claude Code, Anthropic's official CLI for Claude.\n\nThis iteration of Claude is Claude Fable 5, the first model.\n\n# Harness\nKeep this."
+	prompt := "You are Claude Code, Anthropic's official CLI for Claude.\n\nThis iteration of Claude is Claude Fable 5, the first model.\n\nYou are operating autonomously. The user is not watching in real time.\n\nBefore ending your turn, check your last paragraph. Do that work now with tool calls.\n\n# Harness\nKeep this."
 	body := mustJSON(t, map[string]any{
 		"model": "claude-fable-5-2",
 		"system": []any{map[string]any{"type": "text", "text": prompt}},
@@ -176,21 +176,21 @@ func TestAdaptPromptForModelKeysIdentityByTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := jsonStrings(t, sanitized)
-	requireAbsent(t, text, "You are Claude Code", "This iteration of Claude is")
+	requireAbsent(t, text, "You are Claude Code", "This iteration of Claude is", "You are operating autonomously", "Before ending your turn")
 	requirePresent(t, text, "# Harness", "Keep this.")
 
 	claude, err := adaptPromptForModel([]byte(body), "claude-fable-5-dd-2-5-elbaf", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	requirePresent(t, jsonStrings(t, claude), "You are Claude Code", "This iteration of Claude is")
+	requirePresent(t, jsonStrings(t, claude), "You are Claude Code", "This iteration of Claude is", "Before ending your turn")
 
 	opus, err := adaptPromptForModel([]byte(body), "claude-opus-5-5", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	opusText := jsonStrings(t, opus)
-	requirePresent(t, opusText, "You are Claude Code")
+	requirePresent(t, opusText, "You are Claude Code", "Before ending your turn")
 	requireAbsent(t, opusText, "This iteration of Claude is")
 }
 

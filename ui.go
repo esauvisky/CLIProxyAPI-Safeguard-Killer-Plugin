@@ -10,14 +10,14 @@ import (
 )
 
 const (
-	uiResourcePath           = "/ui"
-	mgmtStateRoutePath       = "/plugins/safeguard-killer/state"
-	mgmtTrailRoutePath       = "/plugins/safeguard-killer/trail"
-	mgmtDrainRoutePath       = "/plugins/safeguard-killer/drain"
-	mgmtPayloadsRoutePath    = "/plugins/safeguard-killer/payloads"
-	mgmtPreviewRoutePath     = "/plugins/safeguard-killer/preview"
-	mgmtBenchmarksRoutePath  = "/plugins/safeguard-killer/benchmarks/refresh"
-	mgmtSpeedRoutePath       = "/plugins/safeguard-killer/speed/refresh"
+	uiResourcePath          = "/ui"
+	mgmtStateRoutePath      = "/plugins/safeguard-killer/state"
+	mgmtTrailRoutePath      = "/plugins/safeguard-killer/trail"
+	mgmtDrainRoutePath      = "/plugins/safeguard-killer/drain"
+	mgmtPayloadsRoutePath   = "/plugins/safeguard-killer/payloads"
+	mgmtPreviewRoutePath    = "/plugins/safeguard-killer/preview"
+	mgmtBenchmarksRoutePath = "/plugins/safeguard-killer/benchmarks/refresh"
+	mgmtSpeedRoutePath      = "/plugins/safeguard-killer/speed/refresh"
 )
 
 type managementRegistration struct {
@@ -568,12 +568,33 @@ const uiHTML = `<!doctype html>
   .group-card { border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 12px; background: var(--bg-secondary); }
   .group-head { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
   .group-head .field { flex: 1; min-width: 180px; }
-  .model-list { list-style: none; margin: 10px 0 8px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-  .model-row { display: grid; grid-template-columns: minmax(160px, 1fr) 90px 90px 330px 72px auto; align-items: end; gap: 6px; }
-  .model-row .model-score { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-bottom: 7px; }
-  .model-row .btn { padding: 7px 10px; font-size: 13px; justify-content: center; }
-  .model-row .model-toggle { width: 100%; }
-  .model-row.disabled .field { opacity: 0.45; }
+  .group-summary { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0 2px; font-size: 12px; color: var(--text-secondary); }
+  .group-summary .dot { color: var(--text-tertiary); }
+  .group-models { margin-top: 8px; }
+  .group-models td { vertical-align: top; padding: 8px 10px; }
+  .group-models th.num, .group-models td.num { text-align: right; }
+  .group-models .input { width: 100%; }
+  .group-models .col-model { min-width: 220px; }
+  .group-models .col-quality { width: 108px; }
+  .group-models .col-speed { width: 200px; }
+  .group-models .col-score { width: 148px; }
+  .group-models .col-share { width: 210px; }
+  .group-models .col-actions { width: 132px; }
+  .group-models tr.disabled td:not(.col-actions) { opacity: 0.5; }
+  .group-models tr.disabled .input { opacity: 1; }
+  .group-models .input:focus-visible, .group-models .btn:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 1px; }
+  .model-meta { margin-top: 5px; font-size: 11px; color: var(--text-tertiary); display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .speed-cell { display: flex; flex-direction: column; gap: 5px; padding-top: 5px; }
+  .speed-head { display: flex; align-items: baseline; gap: 6px; }
+  .speed-head .mono { font-size: 14px; font-weight: 700; }
+  .meter { display: block; height: 5px; border-radius: var(--radius-full); background: var(--bg-tertiary); overflow: hidden; }
+  .meter-fill { display: block; height: 100%; border-radius: var(--radius-full); background: var(--primary-color); }
+  .meter-fill.win { background: var(--viz-success); }
+  .share-cell { display: flex; flex-direction: column; gap: 5px; padding-top: 2px; }
+  .share-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .share-head .mono { font-size: 14px; font-weight: 700; }
+  .actions-cell { display: flex; gap: 6px; }
+  .actions-cell .btn { padding: 7px 9px; font-size: 12px; }
   .add-row { display: flex; gap: 6px; align-items: center; }
   .attempts { margin: 6px 0 0; padding-left: 20px; font-size: 12px; }
   .attempts li { padding: 1px 4px; border-radius: 4px; }
@@ -788,7 +809,7 @@ const uiHTML = `<!doctype html>
           <button class="btn sm" data-action="add-group" id="addGroupBtn">Add group</button>
         </div>
       </div>
-      <p class="card-desc">A Smart Group exposes a single virtual model ID that automatically routes around safeguard refusals, content filters, scope-gate lectures, capability mismatches, and quota exhaustion across multiple models. Choose Quality first, Lower cost first or Speed first and rate each model from 0 to 100. Higher quality is better; higher cost is more expensive. Speed first uses the measured throughput of completed responses, averaged with an EWMA; other modes ignore it. List order does not affect selection. The chosen model stays sticky across idle gaps until compaction, reset, or becoming unusable.</p>
+      <p class="card-desc">A Smart Group exposes a single virtual model ID that automatically routes around safeguard refusals, content filters, scope-gate lectures, capability mismatches, and quota exhaustion across multiple models. Choose Quality first or Speed first and rate each model's quality from 0 to 100. Speed first uses the measured throughput of completed responses, averaged with an EWMA; Quality first ignores it. List order does not affect selection. The chosen model stays sticky across idle gaps until compaction, reset, or becoming unusable.</p>
       <div class="groups" id="groupsEditor"></div>
       <datalist id="modelList"></datalist>
     </section>
@@ -1105,7 +1126,7 @@ function canonConfig(cfg) {
     min_remaining: cfg.min_remaining,
     idle_minutes: cfg.idle_minutes,
     stream_prefetch_bytes: cfg.stream_prefetch_bytes,
-    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: m.quality, cost: m.cost, disabled: m.disabled === true })) })),
+    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: m.quality, disabled: m.disabled === true })) })),
     features: featuresOf(cfg),
   });
 }
@@ -1123,7 +1144,7 @@ function loadDraft(cfg) {
       key: '',
     },
     features: featuresOf(cfg),
-    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: String(m.quality), cost: String(m.cost), disabled: m.disabled === true })), pending: '' })),
+    groups: groupsOf(cfg).map(g => ({ id: g.id, name: g.name, mode: g.mode, models: g.models.map(m => ({ id: m.id, quality: String(m.quality), disabled: m.disabled === true })), pending: '' })),
   };
   draftSourceCanon = canonConfig(cfg);
   for (const el of document.querySelectorAll('[data-setting]')) el.value = draft.settings[el.dataset.setting];
@@ -1166,7 +1187,7 @@ function validateDraft() {
   const groups = draft.groups.map(g => ({
     id: g.id.trim(), name: g.name.trim(), mode: g.mode,
     models: g.models.map(m => {
-      const out = { id: m.id.trim(), quality: parseNum(m.quality), cost: parseNum(m.cost) };
+      const out = { id: m.id.trim(), quality: parseNum(m.quality) };
       if (m.disabled) out.disabled = true;
       return out;
     }),
@@ -1180,15 +1201,13 @@ function validateDraft() {
     if (g.name === '') errors.push(['groups.' + i + '.name', label + ' needs a name']);
     if (g.models.length === 0) errors.push(['groups.' + i + '.add', label + ' needs at least one model']);
     else if (g.models.every(m => m.disabled)) errors.push(['groups.' + i + '.add', label + ' needs at least one enabled model']);
-    if (!GROUP_MODES.includes(g.mode)) errors.push(['groups.' + i + '.mode', label + ': select Quality first, Lower cost first or Speed first']);
+    if (!GROUP_MODES.includes(g.mode)) errors.push(['groups.' + i + '.mode', label + ': select Quality first or Speed first']);
     const modelIDs = new Set();
     g.models.forEach((m, j) => {
       if (m.id === '') errors.push(['groups.' + i + '.models.' + j + '.id', label + ': model #' + (j + 1) + ' is empty']);
       else if (modelIDs.has(m.id)) errors.push(['groups.' + i + '.models.' + j + '.id', label + ': duplicate model ' + m.id]);
       modelIDs.add(m.id);
-      for (const rating of ['quality', 'cost']) {
-        if (!Number.isFinite(m[rating]) || m[rating] < 0 || m[rating] > 100) errors.push(['groups.' + i + '.models.' + j + '.' + rating, label + ': model #' + (j + 1) + ' ' + rating + ' must be a number from 0 to 100']);
-      }
+      if (!Number.isFinite(m.quality) || m.quality < 0 || m.quality > 100) errors.push(['groups.' + i + '.models.' + j + '.quality', label + ': model #' + (j + 1) + ' quality must be a number from 0 to 100']);
     });
   });
   groups.forEach((g, i) => {
@@ -1333,11 +1352,10 @@ function groupFieldAttr(i, rest) {
 }
 
 const MODE_HINTS = {
-  quality: 'Quality first: score = 0.8 × quality − 0.2 × cost.',
-  cost: 'Lower cost first: score = 0.2 × quality − 0.8 × cost.',
-  speed: 'Speed first: score = 0.6 × speed + 0.3 × quality − 0.1 × cost.',
+  quality: 'Quality first: score = quality.',
+  speed: 'Speed first: score = (2 × speed + quality) ÷ 3.',
 };
-const GROUP_MODES = ['quality', 'cost', 'speed'];
+const GROUP_MODES = ['quality', 'speed'];
 
 // Mirrors scoreModels and setSelectionProbabilities in routing.go for a new conversation in which
 // every enabled model is eligible.
@@ -1347,12 +1365,11 @@ const SCORE_TEMPERATURE = 1;
 function draftModelScores(g) {
   const out = g.models.map(m => {
     const q = parseNum(String(m.quality));
-    const c = parseNum(String(m.cost));
     const sp = effectiveSpeed(m).rating;
-    const valid = Number.isFinite(q) && Number.isFinite(c) && q >= 0 && q <= 100 && c >= 0 && c <= 100;
+    const valid = Number.isFinite(q) && q >= 0 && q <= 100;
     if (m.disabled) return { valid: true, disabled: true };
     if (!valid || !GROUP_MODES.includes(g.mode)) return { valid: false };
-    const score = g.mode === 'quality' ? 0.8 * q - 0.2 * c : g.mode === 'cost' ? 0.2 * q - 0.8 * c : 0.6 * sp + 0.3 * q - 0.1 * c;
+    const score = g.mode === 'quality' ? q : (2 * sp + q) / 3;
     return { valid: true, disabled: false, score: score, probability: 0, gap: 0, inPool: false };
   });
   let best = -Infinity;
@@ -1409,28 +1426,66 @@ function effectiveSpeed(m) {
   return { rating: 50, source: 'unmeasured' };
 }
 
-function speedLabel(m) {
-  const speed = effectiveSpeed(m);
-  if (speed.source === 'measured') return 'speed ' + speed.rating + ' · ' + Math.round(speed.stats.tokens_per_second) + ' tok/s · ' + speed.stats.samples + ' samples';
-  return 'speed 50 · unmeasured';
+function renderSpeedCell(model) {
+  const speed = effectiveSpeed(model);
+  const width = Math.max(0, Math.min(100, speed.rating));
+  if (speed.source !== 'measured') {
+    return '<div class="speed-cell">' +
+      '<div class="speed-head"><span class="mono">50</span> <span class="subtle small">neutral</span></div>' +
+      '<span class="meter"><span class="meter-fill" style="width:' + width + '%"></span></span>' +
+      '<div class="model-meta">no samples yet</div>' +
+    '</div>';
+  }
+  const stats = speed.stats;
+  const detail = Math.round(stats.tokens_per_second) + ' tok/s · ' + stats.samples + ' sample' + (stats.samples === 1 ? '' : 's') +
+    (stats.first_token_sec > 0 ? ' · ' + stats.first_token_sec.toFixed(2) + 's first token' : '');
+  return '<div class="speed-cell">' +
+    '<div class="speed-head"><span class="mono">' + speed.rating + '</span> <span class="subtle small">/ 100</span></div>' +
+    '<span class="meter"><span class="meter-fill" style="width:' + width + '%"></span></span>' +
+    '<div class="model-meta">' + esc(detail) + '</div>' +
+  '</div>';
 }
 
-function renderScoreCell(e, model) {
-  const aa = renderAABadge(model.id);
-  if (!e.valid) return '<span class="subtle">score: needs valid ratings</span>' + aa;
-  if (e.disabled) return '<span class="badge bad">disabled</span> <span class="subtle">not routed</span>' + aa;
-  const score = 'score <span class="mono">' + e.score.toFixed(1) + '</span> <span class="subtle">· ' + esc(speedLabel(model)) + '</span>';
-  if (e.inPool) {
-    return '<span class="badge ok">in pool</span> ' + score + ' · <span class="mono">' + (e.probability * 100).toFixed(1) + '%</span>' + aa;
-  }
-  return '<span class="badge">not picked</span> ' + score + ' · <span class="mono">' + e.gap.toFixed(1) + '</span> below best' + aa;
+function renderScoreCell(e) {
+  if (!e.valid) return '<span class="subtle">needs a valid quality rating</span>';
+  if (e.disabled) return '<span class="badge">disabled</span>';
+  const windowLabel = e.inPool ? '<span class="badge ok">in pool</span>' : '<span class="badge">out of pool</span>';
+  const gap = e.inPool ? '' : '<div class="model-meta">' + e.gap.toFixed(1) + ' below best</div>';
+  return '<div class="mono" style="font-size:14px;font-weight:700;">' + e.score.toFixed(1) + '</div>' + windowLabel + gap;
+}
+
+function renderShareCell(e) {
+  if (!e.valid) return '<span class="subtle">-</span>';
+  if (e.disabled) return '<span class="subtle">not routed</span>';
+  if (!e.inPool) return '<span class="subtle">0%</span><div class="model-meta">outside the 3-point pool</div>';
+  const width = Math.max(0, Math.min(100, e.probability * 100));
+  return '<div class="share-cell">' +
+    '<div class="share-head"><span class="mono">' + (e.probability * 100).toFixed(1) + '%</span></div>' +
+    '<span class="meter"><span class="meter-fill win" style="width:' + width + '%"></span></span>' +
+  '</div>';
+}
+
+function groupSummary(scores) {
+  const eligible = scores.filter(e => e.valid && !e.disabled);
+  if (eligible.length === 0) return '<span class="subtle">No eligible models yet.</span>';
+  const pool = eligible.filter(e => e.inPool);
+  const best = Math.max.apply(null, eligible.map(e => e.score));
+  return '<span><span class="mono">' + eligible.length + '</span> eligible</span>' +
+    '<span class="dot">·</span><span>best score <span class="mono">' + best.toFixed(1) + '</span></span>' +
+    '<span class="dot">·</span><span><span class="mono">' + pool.length + '</span> in pool</span>' +
+    '<span class="dot">·</span><span>new conversations split across the pool by the shares below</span>';
 }
 
 function refreshGroupScores(gi) {
   const g = draft.groups[gi];
   const scores = draftModelScores(g);
+  const summary = document.querySelector('[data-group-summary="' + gi + '"]');
+  if (summary !== null) summary.innerHTML = groupSummary(scores);
   scores.forEach((e, j) => {
-    document.querySelector('[data-score-cell="' + gi + '.' + j + '"]').innerHTML = renderScoreCell(e, g.models[j]);
+    const model = g.models[j];
+    document.querySelector('[data-score-cell="' + gi + '.' + j + '"]').innerHTML = renderScoreCell(e);
+    document.querySelector('[data-share-cell="' + gi + '.' + j + '"]').innerHTML = renderShareCell(e);
+    document.querySelector('[data-speed-cell="' + gi + '.' + j + '"]').innerHTML = renderSpeedCell(model);
   });
 }
 
@@ -1444,19 +1499,24 @@ function renderGroups() {
   }
   root.innerHTML = draft.groups.map((g, i) => {
     const scores = draftModelScores(g);
-    const models = g.models.map((m, j) =>
-      '<li class="model-row' + (m.disabled ? ' disabled' : '') + '">' +
-        '<label class="field model-id"><span class="cfg-key">Model ID</span>' +
+    const rows = g.models.map((m, j) => {
+      const aa = renderAABadge(m.id);
+      return '<tr class="' + (m.disabled ? 'disabled' : '') + '">' +
+        '<td class="col-model"><label class="field"><span class="cfg-key">Model ID</span>' +
           '<input class="input mono" list="modelList" value="' + esc(m.id) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="id"' + groupFieldAttr(i, 'models.' + j + '.id') + '></label>' +
-        '<label class="field model-rating"><span class="cfg-key">Quality</span>' +
-          '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.quality) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="quality"' + groupFieldAttr(i, 'models.' + j + '.quality') + '></label>' +
-        '<label class="field model-rating"><span class="cfg-key">Cost</span>' +
-          '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.cost) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="cost"' + groupFieldAttr(i, 'models.' + j + '.cost') + '></label>' +
-        '<div class="model-score small" data-score-cell="' + i + '.' + j + '">' + renderScoreCell(scores[j], m) + '</div>' +
-        '<button class="btn sm model-toggle" data-action="model-toggle" data-group="' + i + '" data-model="' + j + '">' + (m.disabled ? 'Enable' : 'Disable') + '</button>' +
-        '<button class="btn sm danger" data-action="model-remove" data-group="' + i + '" data-model="' + j + '" title="Remove">&times;</button>' +
-      '</li>'
-    ).join('');
+          (aa ? '<div class="model-meta">' + aa.trim() + '</div>' : '') +
+        '</td>' +
+        '<td class="col-quality"><label class="field"><span class="cfg-key">Quality</span>' +
+          '<input class="input mono" type="number" min="0" max="100" step="any" value="' + esc(m.quality) + '" data-group="' + i + '" data-model="' + j + '" data-mfield="quality"' + groupFieldAttr(i, 'models.' + j + '.quality') + '></label></td>' +
+        '<td class="col-speed num" data-speed-cell="' + i + '.' + j + '">' + renderSpeedCell(m) + '</td>' +
+        '<td class="col-score num" data-score-cell="' + i + '.' + j + '">' + renderScoreCell(scores[j]) + '</td>' +
+        '<td class="col-share num" data-share-cell="' + i + '.' + j + '">' + renderShareCell(scores[j]) + '</td>' +
+        '<td class="col-actions"><div class="actions-cell">' +
+          '<button class="btn sm" data-action="model-toggle" data-group="' + i + '" data-model="' + j + '">' + (m.disabled ? 'Enable' : 'Disable') + '</button>' +
+          '<button class="btn sm danger" data-action="model-remove" data-group="' + i + '" data-model="' + j + '" title="Remove model">&times;</button>' +
+        '</div></td>' +
+      '</tr>';
+    }).join('');
     return '<div class="group-card">' +
       '<div class="group-head">' +
         '<label class="field"><span class="cfg-key">Codename (what clients request)</span>' +
@@ -1466,13 +1526,13 @@ function renderGroups() {
         '<label class="field"><span class="cfg-key">Selection mode</span>' +
           '<select class="input" data-group="' + i + '" data-gfield="mode"' + groupFieldAttr(i, 'mode') + '>' +
             '<option value="quality"' + (g.mode === 'quality' ? ' selected' : '') + '>Quality first</option>' +
-            '<option value="cost"' + (g.mode === 'cost' ? ' selected' : '') + '>Lower cost first</option>' +
             '<option value="speed"' + (g.mode === 'speed' ? ' selected' : '') + '>Speed first</option>' +
           '</select></label>' +
         '<button class="btn sm danger" data-action="group-remove" data-group="' + i + '">Delete group</button>' +
       '</div>' +
       '<div class="hint" style="margin-top:6px" data-group-hint="' + i + '">' + esc(MODE_HINTS[g.mode]) + ' Models in the pool are within 3 points of the best score and share new conversations by the percentages shown (softmax, temperature 1). Percentages assume every model is eligible; refused or unavailable models drop out and the pool is recalculated. Credential balancing is separate: account weight, quota bottleneck, and load.' + '</div>' +
-      '<ul class="model-list">' + models + '</ul>' +
+      '<div class="group-summary" data-group-summary="' + i + '">' + groupSummary(scores) + '</div>' +
+      '<div class="table-wrap group-models"><table><thead><tr><th class="col-model">Model</th><th class="col-quality">Quality</th><th class="col-speed num">Speed</th><th class="col-score num">Score</th><th class="col-share num">Selection share</th><th class="col-actions">Actions</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
       '<div class="add-row">' +
         '<input class="input grow mono" list="modelList" placeholder="Add model (pick or type)" value="' + esc(g.pending) + '" data-group="' + i + '" data-gfield="pending"' + groupFieldAttr(i, 'add') + '>' +
         '<button class="btn sm" data-action="model-add" data-group="' + i + '">Add model</button>' +
@@ -1488,7 +1548,7 @@ function addPendingModel(gi) {
   const b = benchmarkFor(m);
   const autoQ = b && b.coding_agent > 0 ? String(Math.round(b.coding_agent)) : (b && b.intelligence > 0 ? String(Math.round(b.intelligence)) : '50');
 
-  g.models.push({ id: m, quality: autoQ, cost: '10', disabled: false });
+  g.models.push({ id: m, quality: autoQ, disabled: false });
   g.pending = '';
   setDirty(true);
   renderGroups();
@@ -1672,7 +1732,7 @@ function renderAttempts(d) {
   ).join('') + '</ol>';
 }
 
-const MODE_LABELS = { quality: 'Quality first', cost: 'Lower cost first', speed: 'Speed first' };
+const MODE_LABELS = { quality: 'Quality first', speed: 'Speed first' };
 
 // mode and model_scores are omitempty on decisions and trail entries.
 function renderModelScores(e) {
@@ -1683,14 +1743,13 @@ function renderModelScores(e) {
     '<tr class="' + (ms.model === e.auth_id ? 'winner' : '') + '">' +
       '<td class="mono">' + esc(ms.model) + '</td>' +
       '<td class="mono">' + esc(num(ms.quality, 1)) + '</td>' +
-      '<td class="mono">' + esc(num(ms.cost, 1)) + '</td>' +
       '<td class="mono">' + (ms.speed === undefined ? '<span class="subtle">-</span>' : esc(num(ms.speed, 1))) + '</td>' +
       '<td class="mono">' + esc(num(ms.score, 2)) + '</td>' +
       '<td class="mono">' + (ms.excluded ? '<span class="subtle">-</span>' : esc(pct(ms.probability))) + '</td>' +
       '<td>' + (ms.excluded ? '<span class="badge bad">' + esc(ms.excluded) + '</span>' : '') + '</td>' +
     '</tr>'
   ).join('');
-  return out + '<table class="rank"><thead><tr><th>Model</th><th>Quality</th><th>Cost</th><th>Speed</th><th>Score</th><th>Probability</th><th>Excluded</th></tr></thead><tbody>' + rows + '</tbody></table>';
+  return out + '<table class="rank"><thead><tr><th>Model</th><th>Quality</th><th>Speed</th><th>Score</th><th>Probability</th><th>Excluded</th></tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
 function renderDecisions() {

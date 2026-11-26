@@ -89,7 +89,7 @@ func TestHandleManagementUI(t *testing.T) {
 }
 
 func TestGroupSchemaJSONRoundtrip(t *testing.T) {
-	want := modelGroup{ID: "best", Name: "General Purpose", Mode: "cost", Models: []groupModel{{ID: "claude-opus-5-5", Quality: 95, Cost: 90}, {ID: "glm-5.3", Quality: 70, Cost: 10}}}
+	want := modelGroup{ID: "best", Name: "General Purpose", Mode: "quality", Models: []groupModel{{ID: "claude-opus-5-5", Quality: 95}, {ID: "glm-5.3", Quality: 70}}}
 	raw, errMarshal := json.Marshal(want)
 	if errMarshal != nil {
 		t.Fatal(errMarshal)
@@ -106,7 +106,7 @@ func TestGroupSchemaJSONRoundtrip(t *testing.T) {
 		t.Fatal(errUnmarshal)
 	}
 	for _, m := range models {
-		if len(m) != 3 || m["id"] == nil || m["quality"] == nil || m["cost"] == nil {
+		if len(m) != 2 || m["id"] == nil || m["quality"] == nil || m["cost"] != nil {
 			t.Fatalf("model fields = %s", fields["models"])
 		}
 	}
@@ -125,12 +125,12 @@ func TestGroupSchemaJSONRoundtrip(t *testing.T) {
 }
 
 func TestUIUsesRatedGroupSchema(t *testing.T) {
-	for _, want := range []string{`data-gfield="mode"`, `data-mfield="quality"`, `data-mfield="cost"`, "Quality first", "Lower cost first", "Speed first", "model_scores"} {
+	for _, want := range []string{`data-gfield="mode"`, `data-mfield="quality"`, "Quality first", "Speed first", "model_scores"} {
 		if !strings.Contains(uiHTML, want) {
 			t.Fatalf("ui html does not contain %s", want)
 		}
 	}
-	for _, gone := range []string{"strategy", "cheap_models", "cheap_first", "cheap_probe", "tier_up_after", "tier_ups"} {
+	for _, gone := range []string{`data-mfield="cost"`, "Lower cost first", `"cost"`, "strategy", "cheap_models", "cheap_first", "cheap_probe", "tier_up_after", "tier_ups"} {
 		if strings.Contains(uiHTML, gone) {
 			t.Fatalf("ui html still references %s", gone)
 		}
@@ -195,4 +195,3 @@ func TestHandleManagementPayloadCaptureAndPreview(t *testing.T) {
 		t.Fatalf("preview = %+v", preview.capturedPayloadMeta)
 	}
 }
-

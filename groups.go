@@ -201,6 +201,10 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if errBody != nil {
 			return nil, errBody
 		}
+		body, errBody = withoutRedactedThinking(body, model)
+		if errBody != nil {
+			return nil, errBody
+		}
 		attemptStart := time.Now()
 		rawResp, errCall := hostCall(methodHostModelExecute, hostModelRequest{
 			EntryProtocol: req.SourceFormat, ExitProtocol: req.Format, Model: model, Body: body,
@@ -278,6 +282,10 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 	}
 	for model, available := plan.nextModel(rand.Float64()); available; model, available = plan.nextModel(rand.Float64()) {
 		body, errBody := withModel(sanitizedPayload, model)
+		if errBody != nil {
+			return nil, errBody
+		}
+		body, errBody = withoutRedactedThinking(body, model)
 		if errBody != nil {
 			return nil, errBody
 		}

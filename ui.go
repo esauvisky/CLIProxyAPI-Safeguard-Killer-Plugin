@@ -777,15 +777,8 @@ const uiHTML = `<!doctype html>
         <label class="feature-item">
           <input type="checkbox" data-feature="strip_restrictive_system_reminders">
           <span>
-            <span class="feature-title">Strip restrictive &lt;system-reminder&gt; blocks</span>
-            <span class="feature-desc">Remove mid-conversation &lt;system-reminder&gt; or role=system refusal and dual-use warning injections from messages while preserving normal harness reminders.</span>
-          </span>
-        </label>
-        <label class="feature-item">
-          <input type="checkbox" data-feature="deduplicate_injected_history">
-          <span>
-            <span class="feature-title">Deduplicate injected history &amp; tool contamination</span>
-            <span class="feature-desc">Strip first-turn safeguard sentinels and repeated &lt;system-reminder&gt; blocks from conversation history and tool_result blocks so accumulated guardrails do not re-trigger hedging on later turns.</span>
+            <span class="feature-title">Strip harness noise (reminders by type, environment, sandbox, output style)</span>
+            <span class="feature-desc">Remove git status, environment, bash sandbox, model identity and command-output reminders, [SYSTEM NOTIFICATION] preambles, and the untrusted-archive and injection paragraphs. Replace Claude Code output-style reminders with one terse-output directive. Every other reminder is kept.</span>
           </span>
         </label>
       </div>
@@ -1108,7 +1101,6 @@ const FEATURE_KEYS = [
   'bypass_auto_mode_classifier',
   'neutralize_classifier_stop_nudges',
   'strip_restrictive_system_reminders',
-  'deduplicate_injected_history',
 ];
 
 function featuresOf(cfg) {

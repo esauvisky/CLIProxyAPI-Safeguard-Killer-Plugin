@@ -170,8 +170,8 @@ func TestHandleManagementPayloadCaptureAndPreview(t *testing.T) {
 	if captured.RawMessages != 4 || captured.SanitizedMessages != 3 {
 		t.Fatalf("captured messages = %d -> %d, want 4 -> 3", captured.RawMessages, captured.SanitizedMessages)
 	}
-	if strings.Contains(string(captured.SanitizedBody), "STOP AND LOOK AT THAT") {
-		t.Fatalf("CoT narration survived in sanitized capture: %s", captured.SanitizedBody)
+	if !strings.Contains(string(captured.SanitizedBody), "STOP AND LOOK AT THAT") {
+		t.Fatalf("assistant narration was stripped from sanitized capture: %s", captured.SanitizedBody)
 	}
 
 	rawPreview, _ := json.Marshal(managementRequest{

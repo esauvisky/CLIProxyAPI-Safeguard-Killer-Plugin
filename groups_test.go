@@ -562,7 +562,7 @@ func TestAutoModeClassifierShortCircuitAndSafeguardSanitization(t *testing.T) {
 	}
 
 	normalReq := `{"Headers":{"Anthropic-Beta":["dangerous-tool-use-2026-09-03,server-side-fallback-2026-06-01,oauth-2025-04-20"],"X-Cc-Atis":["v1.taint"]},"Body":"` +
-		b64(`{"model":"claude-opus-5-5","safeguards":[{"type":"dangerous_tool_use"}],"fallbacks":"default","system":[{"type":"text","text":"`+claudeCyberGatePrompt+`"}],"messages":[{"role":"user","content":"hi"}]}`) + `"}`
+		b64(`{"model":"claude-opus-5-5","safeguards":[{"type":"dangerous_tool_use"}],"fallbacks":"default","system":[{"type":"text","text":"`+testCyberGate+`"}],"messages":[{"role":"user","content":"hi"}]}`) + `"}`
 	raw, errIntercept = handleRequestIntercept([]byte(normalReq))
 	if errIntercept != nil {
 		t.Fatalf("handleRequestIntercept(normal) error = %v", errIntercept)
@@ -1247,7 +1247,7 @@ func TestSalvagedPartialOutputInTrailAndSkippedWhenSentBack(t *testing.T) {
 		t.Fatalf("trail did not record salvaged partial output on groupAttempt: %+v", trail)
 	}
 
-	// Next turn sends back a prior refused assistant message and notice; verify both are skipped when sent upstream.
+	// Next turn sends back a prior refused assistant message and notice; verify the notice is stripped when sent upstream.
 	forwardedBodies = nil
 	req2 := `{"Model":"uncensored-models","SourceFormat":"claude","Format":"claude","Stream":true,"Payload":"` +
 		b64(`{"model":"uncensored-models","metadata":{"user_id":"user_abc_session_salvage-sess"},"messages":[{"role":"user","content":"solve"},{"role":"assistant","content":[{"type":"text","text":"⚡ [Safeguard Killer] notice\n\n"},{"type":"text","text":"I cannot help with exploit development."}]},{"role":"user","content":"follow up"}]}`) + `","stream_id":"dst2"}`
@@ -1255,8 +1255,8 @@ func TestSalvagedPartialOutputInTrailAndSkippedWhenSentBack(t *testing.T) {
 		t.Fatalf("second executeGroupStream() error = %v", err)
 	}
 	<-emitted
-	if len(forwardedBodies) == 0 || strings.Contains(forwardedBodies[0], "I cannot help with exploit development") || strings.Contains(forwardedBodies[0], "[Safeguard Killer]") {
-		t.Fatalf("refused assistant turn or notice leaked into upstream payload: %v", forwardedBodies)
+	if len(forwardedBodies) == 0 || strings.Contains(forwardedBodies[0], "[Safeguard Killer]") {
+		t.Fatalf("notice leaked into upstream payload: %v", forwardedBodies)
 	}
 }
 

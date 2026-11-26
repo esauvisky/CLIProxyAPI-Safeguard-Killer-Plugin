@@ -152,7 +152,6 @@ const (
 type modelScore struct {
 	Model       string  `json:"model"`
 	Quality     float64 `json:"quality"`
-	Cost        float64 `json:"cost"`
 	Speed       float64 `json:"speed,omitempty"`
 	Score       float64 `json:"score"`
 	Probability float64 `json:"probability"`
@@ -168,9 +167,7 @@ func scoreModels(group modelGroup) []modelScore {
 		var score float64
 		switch group.Mode {
 		case groupModeQuality:
-			score = 0.8*model.Quality - 0.2*model.Cost
-		case groupModeCost:
-			score = 0.2*model.Quality - 0.8*model.Cost
+			score = model.Quality
 		case groupModeSpeed:
 		default:
 			panic(fmt.Errorf("group %s has invalid mode %q", group.ID, group.Mode))
@@ -178,11 +175,9 @@ func scoreModels(group modelGroup) []modelScore {
 		speed := 0.0
 		if group.Mode == groupModeSpeed {
 			speed = measuredModelSpeed(model.ID)
+			score = (2*speed + model.Quality) / 3
 		}
-		if group.Mode == groupModeSpeed {
-			score = 0.6*speed + 0.3*model.Quality - 0.1*model.Cost
-		}
-		scores = append(scores, modelScore{Model: model.ID, Quality: model.Quality, Cost: model.Cost, Speed: speed, Score: score})
+		scores = append(scores, modelScore{Model: model.ID, Quality: model.Quality, Speed: speed, Score: score})
 	}
 	return scores
 }

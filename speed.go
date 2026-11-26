@@ -18,7 +18,7 @@ const (
 	// 500 tok/s or more is 100. This is a throughput scale, not an AA benchmark.
 	speedSlowTokensPerSec = 10.0
 	speedFastTokensPerSec = 500.0
-	// Models without samples start neutral, so a new speed group still ranks by quality and cost.
+	// Models without samples start neutral, so a new speed group still ranks by quality.
 	speedUnmeasuredRating = 50.0
 	// Each completed response moves the per-model EWMA by a quarter of the new sample.
 	speedSampleWeight = 0.25

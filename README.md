@@ -2,7 +2,7 @@
 
 <img src="assets/logo.png" width="96" align="right" alt="Safeguard Killer logo">
 
-**Safeguard Killer** is an ABI v1 plugin for CLIProxyAPI that neutralizes client/upstream safety classifiers, strips refusal-taint telemetry, and provides **Smart Groups** — virtual models that automatically route around safeguard refusals across providers, select models by quality and cost ratings, keep conversations sticky to preserve prompt caches, and balance provider quota.
+**Safeguard Killer** is an ABI v1 plugin for CLIProxyAPI that neutralizes client/upstream safety classifiers, strips refusal-taint telemetry, and provides **Smart Groups** — virtual models that automatically route around safeguard refusals across providers, select models by quality and measured speed, keep conversations sticky to preserve prompt caches, and balance provider quota.
 
 It is built to work particularly well with **Claude Code**, **Claude models**, **OpenAI models**, **Codex**, and **Gemini models**.
 
@@ -47,18 +47,17 @@ Once a model answers, the conversation stays on it:
 - **Compaction Reset:** Refusal records and the current model reset, and the next turn selects again, only when the payload shrinks below 70% **and** the message list collapses to at most half (a real `/compact`, auto-compaction, or `/clear`). Claude Code clearing old tool results shrinks bytes without collapsing messages, and does not reset.
 - **Session-Scoped Capability Memory:** Models that fail with `no tools`, `not found`, `no vision` (while images are in payload), or `context too long` (until compaction shrinks the payload) are skipped automatically without re-trying.
 
-### Model Selection (`mode`, `quality`, `cost`, measured speed)
-Each Smart Group needs an explicit `mode`, and each model in it needs `quality` and `cost` ratings from `0` to `100`. Higher `quality` is better; higher `cost` is more expensive. Only `speed` mode also scores the measured speed rating; other modes ignore it. The order of `models` has no effect on selection.
+### Model Selection (`mode`, `quality`, measured speed)
+Each Smart Group needs an explicit `mode`, and each model in it needs a `quality` rating from `0` to `100`. Higher `quality` is better. Only `speed` mode also scores the measured speed rating; `quality` mode ignores it. The order of `models` has no effect on selection.
 
 | `mode` | UI label | Score |
 | --- | --- | --- |
-| `quality` | Quality first | `0.8 × quality − 0.2 × cost` |
-| `cost` | Lower cost first | `0.2 × quality − 0.8 × cost` |
-| `speed` | Speed first | `0.6 × speed + 0.3 × quality − 0.1 × cost` |
+| `quality` | Quality first | `quality` |
+| `speed` | Speed first | `(2 × speed + quality) ÷ 3` |
 
 A new conversation, or one reset by compaction, scores every eligible model (excluding refused, capability-incompatible, and unavailable models). Only models within `3` points of the best score stay in the pool, and one is picked by softmax over their scores with temperature `1`. Models farther from the best get no traffic. The pick then stays sticky as described above. When it refuses or becomes unusable, the remaining eligible models are scored the same way.
 
-Every group decision logs `mode` and `model_scores` (`model`, `quality`, `cost`, `speed`, `score`, `probability`, `excluded`). The **Recent Decisions** tab and the conversation trail show these for each pick.
+Every group decision logs `mode` and `model_scores` (`model`, `quality`, `speed`, `score`, `probability`, `excluded`). The **Recent Decisions** tab and the conversation trail show these for each pick.
 
 ---
 
@@ -88,7 +87,7 @@ This replaces the former strategy and cost-tier flags. Existing group configurat
 Open **Safeguard Killer** in the CPA Management Center sidebar. The interface is organized into five tabs:
 
 1. **General Settings:** Configure `management_key`, `min_remaining`, `idle_minutes`, `stream_prefetch_bytes`, the safeguard/adaptation toggles, and the custom client notice prefix.
-2. **Smart Groups:** Add and delete Smart Groups, pick each group's mode (**Quality first**, **Lower cost first** or **Speed first**), and add, remove, and rate models (quality and cost, `0` to `100`). Each model row shows its live score for the selected mode and whether it is in the selection pool (within `3` points of the best) with its share of new conversations, or how far below the best it falls. New groups default to Quality first; new models default to quality from their Artificial Analysis score (else `50`), cost `10`.
+2. **Smart Groups:** Add and delete Smart Groups, pick each group's mode (**Quality first** or **Speed first**), and add, remove, and rate models (quality, `0` to `100`). Each model row shows its live score for the selected mode and whether it is in the selection pool (within `3` points of the best) with its share of new conversations, or how far below the best it falls. New groups default to Quality first; new models default to quality from their Artificial Analysis score (else `50`).
 3. **Sessions:** Live view of active credential bindings and Smart Group model pins.
 4. **Recent Decisions:** Routing metrics (refusals, compaction resets), a per-conversation trail, and an audit log of every group selection (mode, model scores, probabilities, exclusions), failover chain, and credential quota ranking.
 5. **Credentials:** Live status and quota windows for every host credential.
@@ -142,35 +141,26 @@ plugins:
           models:
             - id: "claude-opus-5-5"
               quality: 95
-              cost: 90
             - id: "gpt-6.1-sol"
               quality: 94
-              cost: 85
             - id: "gemini-4-argon-high"
               quality: 90
-              cost: 60
             - id: "kimi-k3.1-pro"
               quality: 82
-              cost: 25
             - id: "glm-5.3"
               quality: 80
-              cost: 10
         - id: "uncensored-best"
           name: "Uncensored Best"
-          mode: "cost"
+          mode: "quality"
           models:
             - id: "glm-5.3-uncensored"
               quality: 75
-              cost: 10
             - id: "deepseek-v4.1-flash-uncensored"
               quality: 70
-              cost: 5
             - id: "hermes-4-405b"
               quality: 72
-              cost: 30
             - id: "abliterated-model-large-v2"
               quality: 60
-              cost: 20
 ```
 
 ### Measured speed data

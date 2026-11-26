@@ -15,7 +15,7 @@ import (
 func ratedGroupModels(ids ...string) []groupModel {
 	models := make([]groupModel, len(ids))
 	for i, id := range ids {
-		models[i] = groupModel{ID: id, Quality: 90 - 20*float64(i), Cost: 10}
+		models[i] = groupModel{ID: id, Quality: 90 - 20*float64(i)}
 	}
 	return models
 }
@@ -436,7 +436,7 @@ func TestChildAndHelperRequestsPreserveParentRefusal(t *testing.T) {
 }
 
 func TestGroupDoesNotRetrySkippedModelsWhenExhausted(t *testing.T) {
-	for _, mode := range []string{groupModeQuality, groupModeCost} {
+	for _, mode := range []string{groupModeQuality, groupModeSpeed} {
 		t.Run(mode, func(t *testing.T) {
 			resetHostState(t)
 			cfg := defaultPluginConfig()
@@ -745,13 +745,13 @@ func TestRoutingMetricsAggregatesRefusals(t *testing.T) {
 }
 
 func TestGroupScoreModes(t *testing.T) {
-	models := []groupModel{{ID: "premium", Quality: 90, Cost: 80}, {ID: "economy", Quality: 70, Cost: 10}, {ID: "zero", Quality: 0, Cost: 0}}
+	models := []groupModel{{ID: "premium", Quality: 90}, {ID: "economy", Quality: 70}, {ID: "zero", Quality: 0}}
 	for _, tc := range []struct {
 		mode string
 		want []float64
 	}{
-		{groupModeQuality, []float64{56, 54, 0}},
-		{groupModeCost, []float64{-46, 6, 0}},
+		{groupModeQuality, []float64{90, 70, 0}},
+		{groupModeSpeed, []float64{(2*speedUnmeasuredRating + 90) / 3, (2*speedUnmeasuredRating + 70) / 3, (2*speedUnmeasuredRating + 0) / 3}},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			scores := scoreModels(modelGroup{ID: "g", Mode: tc.mode, Models: models})
@@ -759,7 +759,7 @@ func TestGroupScoreModes(t *testing.T) {
 				t.Fatalf("scores = %+v", scores)
 			}
 			for i, score := range scores {
-				if score.Model != models[i].ID || score.Quality != models[i].Quality || score.Cost != models[i].Cost || math.Abs(score.Score-tc.want[i]) > 1e-12 || score.Excluded != "" || score.Probability != 0 {
+				if score.Model != models[i].ID || score.Quality != models[i].Quality || math.Abs(score.Score-tc.want[i]) > 1e-12 || score.Excluded != "" || score.Probability != 0 {
 					t.Fatalf("score[%d] = %+v, want score %v", i, score, tc.want[i])
 				}
 			}
@@ -768,16 +768,28 @@ func TestGroupScoreModes(t *testing.T) {
 }
 
 func TestGroupModesSelectDifferentPreferredModels(t *testing.T) {
+	const slowPremium = "slow-premium"
+	const fastEconomy = "fast-economy"
+	speedMu.Lock()
+	speedStats[slowPremium] = &modelSpeedStats{Samples: 1, TokensPerSecond: 10}
+	speedStats[fastEconomy] = &modelSpeedStats{Samples: 1, TokensPerSecond: 500}
+	speedMu.Unlock()
+	t.Cleanup(func() {
+		speedMu.Lock()
+		delete(speedStats, slowPremium)
+		delete(speedStats, fastEconomy)
+		speedMu.Unlock()
+	})
 	for _, tc := range []struct {
 		mode string
 		want string
 	}{
-		{groupModeQuality, "premium"},
-		{groupModeCost, "economy"},
+		{groupModeQuality, slowPremium},
+		{groupModeSpeed, fastEconomy},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			resetHostState(t)
-			group := modelGroup{ID: "g", Mode: tc.mode, Models: []groupModel{{ID: "premium", Quality: 100, Cost: 60}, {ID: "economy", Quality: 60, Cost: 10}}}
+			group := modelGroup{ID: "g", Mode: tc.mode, Models: []groupModel{{ID: slowPremium, Quality: 100}, {ID: fastEconomy, Quality: 60}}}
 			plan := planConversation(defaultPluginConfig(), "session", group, []byte(`{"messages":[]}`), time.Now())
 			if plan.Err != nil || plan.Sticky || len(plan.Skipped) != 0 {
 				t.Fatalf("new conversation plan = %+v", plan)
@@ -852,7 +864,8 @@ func TestGroupFallbackRecalculatesShortlist(t *testing.T) {
 	if model, ok := plan.nextModel(0); !ok || model != "a" {
 		t.Fatalf("first draw = %q, %v", model, ok)
 	}
-	wantB := 1 / (1 + math.Exp(-2))
+	// The second model is 2.5 points behind the best, so it re-enters the pool alone once the best is attempted.
+	wantB := 1 / (1 + math.Exp(-2.5))
 	if math.Abs(plan.Scores[1].Probability-wantB) > 1e-12 || math.Abs(plan.Scores[2].Probability-(1-wantB)) > 1e-12 || plan.Scores[3].Probability != 0 {
 		t.Fatalf("fallback shortlist = %+v", plan.Scores)
 	}
@@ -867,7 +880,7 @@ func TestGroupFallbackRecalculatesShortlist(t *testing.T) {
 }
 
 func TestGroupIdleStickinessAndReselection(t *testing.T) {
-	for _, mode := range []string{groupModeQuality, groupModeCost} {
+	for _, mode := range []string{groupModeQuality, groupModeSpeed} {
 		for _, idleMinutes := range []int{0, 5} {
 			t.Run(mode+"/idle="+(time.Duration(idleMinutes)*time.Minute).String(), func(t *testing.T) {
 				resetHostState(t)
@@ -1074,14 +1087,14 @@ func TestGroupPlanPropagatesHostFailure(t *testing.T) {
 }
 
 func TestGroupConfigValidation(t *testing.T) {
-	for _, mode := range []string{groupModeQuality, groupModeCost} {
+	for _, mode := range []string{groupModeQuality, groupModeSpeed} {
 		cfg := defaultPluginConfig()
-		cfg.Groups = []modelGroup{{ID: "g", Name: "Group", Mode: mode, Models: []groupModel{{ID: "zero", Quality: 0, Cost: 0}, {ID: "max", Quality: 100, Cost: 100}}}}
+		cfg.Groups = []modelGroup{{ID: "g", Name: "Group", Mode: mode, Models: []groupModel{{ID: "zero", Quality: 0}, {ID: "max", Quality: 100}}}}
 		if err := validateConfig(cfg); err != nil {
 			t.Fatalf("valid %s config rejected: %v", mode, err)
 		}
 	}
-	for _, mode := range []string{"", "order", "race", "invalid"} {
+	for _, mode := range []string{"", "cost", "order", "race", "invalid"} {
 		cfg := defaultPluginConfig()
 		cfg.Groups = []modelGroup{{ID: "g", Name: "Group", Mode: mode, Models: ratedGroupModels("m")}}
 		if err := validateConfig(cfg); err == nil {
@@ -1094,17 +1107,10 @@ func TestGroupConfigValidation(t *testing.T) {
 		t.Fatal("duplicate model IDs accepted")
 	}
 	for _, value := range []float64{-0.01, 100.01, math.NaN(), math.Inf(1), math.Inf(-1)} {
-		for _, field := range []string{"quality", "cost"} {
-			model := groupModel{ID: "m", Quality: 50, Cost: 50}
-			if field == "quality" {
-				model.Quality = value
-			} else {
-				model.Cost = value
-			}
-			cfg.Groups[0].Models = []groupModel{model}
-			if err := validateConfig(cfg); err == nil {
-				t.Fatalf("%s rating %v accepted", field, value)
-			}
+		model := groupModel{ID: "m", Quality: value}
+		cfg.Groups[0].Models = []groupModel{model}
+		if err := validateConfig(cfg); err == nil {
+			t.Fatalf("quality rating %v accepted", value)
 		}
 	}
 }
@@ -1118,11 +1124,11 @@ func TestGroupConfigDecoding(t *testing.T) {
 				}
 				return yaml.Unmarshal([]byte(raw), group)
 			}
-			for _, mode := range []string{groupModeQuality, groupModeCost} {
+			for _, mode := range []string{groupModeQuality, groupModeSpeed} {
 				var group modelGroup
-				raw := `{"id":"g","name":"Group","mode":"` + mode + `","models":[{"id":"m","quality":0,"cost":0}]}`
+				raw := `{"id":"g","name":"Group","mode":"` + mode + `","models":[{"id":"m","quality":0}]}`
 				if err := decode(raw, &group); err != nil {
-					t.Fatalf("decode zero ratings: %v", err)
+					t.Fatalf("decode zero rating: %v", err)
 				}
 				cfg := defaultPluginConfig()
 				cfg.Groups = []modelGroup{group}
@@ -1132,7 +1138,7 @@ func TestGroupConfigDecoding(t *testing.T) {
 			}
 			for _, oldField := range []string{`"strategy":"upgrade"`, `"cheap_models":["m"]`, `"cheap_first":true`, `"cheap_probe":true`, `"tier_up_after":2`} {
 				var group modelGroup
-				raw := `{"id":"g","name":"Group","mode":"quality",` + oldField + `,"models":[{"id":"m","quality":50,"cost":10}]}`
+				raw := `{"id":"g","name":"Group","mode":"quality",` + oldField + `,"models":[{"id":"m","quality":50}]}`
 				if err := decode(raw, &group); err == nil {
 					t.Fatalf("obsolete group field accepted: %s", oldField)
 				}
@@ -1140,8 +1146,9 @@ func TestGroupConfigDecoding(t *testing.T) {
 			for _, raw := range []string{
 				`{"id":"g","name":"Group","mode":"quality","models":["m"]}`,
 				`{"id":"g","name":"Group","mode":"quality","models":[{"id":"m","cost":10}]}`,
-				`{"id":"g","name":"Group","mode":"quality","models":[{"id":"m","quality":50}]}`,
-				`{"id":"g","name":"Group","mode":"quality","models":[{"id":"m","quality":null,"cost":10}]}`,
+				`{"id":"g","name":"Group","mode":"quality","models":[{"id":"m","quality":50,"cost":10}]}`,
+				`{"id":"g","name":"Group","mode":"quality","models":[{"id":"m"}]}`,
+				`{"id":"g","name":"Group","mode":"quality","models":[{"id":"m","quality":null}]}`,
 			} {
 				var group modelGroup
 				if err := decode(raw, &group); err == nil {
@@ -1182,7 +1189,7 @@ func TestDisabledGroupModelIsNotScored(t *testing.T) {
 		t.Fatalf("scores = %+v, want only the enabled model", scores)
 	}
 	var parsed groupModel
-	if err := yaml.Unmarshal([]byte("{id: off, quality: 1, cost: 2, disabled: true}"), &parsed); err != nil || !parsed.Disabled {
+	if err := yaml.Unmarshal([]byte("{id: off, quality: 1, disabled: true}"), &parsed); err != nil || !parsed.Disabled {
 		t.Fatalf("yaml disabled = %+v, %v", parsed, err)
 	}
 }
@@ -1266,9 +1273,9 @@ func TestSpeedModeScoresMeasuredSpeed(t *testing.T) {
 		delete(speedStats, slow)
 		speedMu.Unlock()
 	})
-	models := []groupModel{{ID: fast, Quality: 30, Cost: 5}, {ID: slow, Quality: 90, Cost: 20}, {ID: "speed-test-unknown", Quality: 30, Cost: 5}}
+	models := []groupModel{{ID: fast, Quality: 30}, {ID: slow, Quality: 90}, {ID: "speed-test-unknown", Quality: 30}}
 	scores := scoreModels(modelGroup{ID: "g", Mode: groupModeSpeed, Models: models})
-	want := []float64{0.6*speedRating(200) + 0.3*30 - 0.1*5, 0.6*speedRating(25) + 0.3*90 - 0.1*20, 0.6*50 + 0.3*30 - 0.1*5}
+	want := []float64{(2*speedRating(200) + 30) / 3, (2*speedRating(25) + 90) / 3, (2*speedUnmeasuredRating + 30) / 3}
 	for i, score := range scores {
 		if math.Abs(score.Score-want[i]) > 1e-12 {
 			t.Fatalf("score[%d] = %+v, want %v", i, score, want[i])
@@ -1285,12 +1292,12 @@ func TestSpeedModeScoresMeasuredSpeed(t *testing.T) {
 
 func TestSpeedModeConfigValidation(t *testing.T) {
 	cfg := defaultPluginConfig()
-	cfg.Groups = []modelGroup{{ID: "g", Name: "G", Mode: groupModeSpeed, Models: []groupModel{{ID: "a", Quality: 40, Cost: 5}}}}
+	cfg.Groups = []modelGroup{{ID: "g", Name: "G", Mode: groupModeSpeed, Models: []groupModel{{ID: "a", Quality: 40}}}}
 	if err := validateConfig(cfg); err != nil {
 		t.Fatalf("valid speed group rejected: %v", err)
 	}
 	var group modelGroup
-	if err := json.Unmarshal([]byte(`{"id":"g","name":"G","mode":"speed","models":[{"id":"a","quality":40,"cost":5,"speed":90}]}`), &group); err == nil {
+	if err := json.Unmarshal([]byte(`{"id":"g","name":"G","mode":"speed","models":[{"id":"a","quality":40,"speed":90}]}`), &group); err == nil {
 		t.Fatal("manual speed overrides are no longer part of the group schema")
 	}
 }

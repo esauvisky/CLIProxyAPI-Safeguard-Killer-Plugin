@@ -16,7 +16,6 @@ const (
 	groupProvider = "model-groups"
 
 	groupModeQuality = "quality"
-	groupModeCost    = "cost"
 	groupModeSpeed   = "speed"
 )
 
@@ -114,8 +113,7 @@ type modelGroup struct {
 type groupModel struct {
 	ID      string  `yaml:"id" json:"id"`
 	Quality float64 `yaml:"quality" json:"quality"`
-	Cost    float64 `yaml:"cost" json:"cost"`
-	// Disabled keeps the entry and its ratings in the config but takes it out of routing.
+	// Disabled keeps the entry and its rating in the config but takes it out of routing.
 	Disabled bool `yaml:"disabled,omitempty" json:"disabled,omitempty"`
 }
 
@@ -125,7 +123,7 @@ func (g *modelGroup) UnmarshalJSON(raw []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&decoded); err != nil {
-		return fmt.Errorf("group needs {id, name, mode, models: [{id, quality, cost}]}: %w", err)
+		return fmt.Errorf("group needs {id, name, mode, models: [{id, quality}]}: %w", err)
 	}
 	*g = modelGroup(decoded)
 	return nil
@@ -139,7 +137,7 @@ func (g *modelGroup) UnmarshalYAML(node *yaml.Node) error {
 		switch node.Content[i].Value {
 		case "id", "name", "mode", "models":
 		default:
-			return fmt.Errorf("unknown group field %q; use mode: quality, cost or speed and rated model entries", node.Content[i].Value)
+			return fmt.Errorf("unknown group field %q; use mode: quality or speed and rated model entries", node.Content[i].Value)
 		}
 	}
 	type plain modelGroup
@@ -155,7 +153,6 @@ func (m *groupModel) UnmarshalJSON(raw []byte) error {
 	var decoded struct {
 		ID       string   `json:"id"`
 		Quality  *float64 `json:"quality"`
-		Cost     *float64 `json:"cost"`
 		Disabled bool     `json:"disabled"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -163,20 +160,20 @@ func (m *groupModel) UnmarshalJSON(raw []byte) error {
 	if err := decoder.Decode(&decoded); err != nil {
 		return err
 	}
-	if decoded.Quality == nil || decoded.Cost == nil {
-		return fmt.Errorf("model %q needs explicit quality and cost ratings (0–100)", decoded.ID)
+	if decoded.Quality == nil {
+		return fmt.Errorf("model %q needs an explicit quality rating (0–100)", decoded.ID)
 	}
-	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost, Disabled: decoded.Disabled}
+	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Disabled: decoded.Disabled}
 	return nil
 }
 
 func (m *groupModel) UnmarshalYAML(node *yaml.Node) error {
 	if node.Kind != yaml.MappingNode {
-		return fmt.Errorf("model must be {id, quality, cost, disabled?}; string model lists are no longer supported")
+		return fmt.Errorf("model must be {id, quality, disabled?}; string model lists are no longer supported")
 	}
 	for i := 0; i < len(node.Content); i += 2 {
 		switch node.Content[i].Value {
-		case "id", "quality", "cost", "disabled":
+		case "id", "quality", "disabled":
 		default:
 			return fmt.Errorf("unknown model field %q", node.Content[i].Value)
 		}
@@ -184,16 +181,15 @@ func (m *groupModel) UnmarshalYAML(node *yaml.Node) error {
 	var decoded struct {
 		ID       string   `yaml:"id"`
 		Quality  *float64 `yaml:"quality"`
-		Cost     *float64 `yaml:"cost"`
 		Disabled bool     `yaml:"disabled"`
 	}
 	if err := node.Decode(&decoded); err != nil {
 		return err
 	}
-	if decoded.Quality == nil || decoded.Cost == nil {
-		return fmt.Errorf("model %q needs explicit quality and cost ratings (0–100)", decoded.ID)
+	if decoded.Quality == nil {
+		return fmt.Errorf("model %q needs an explicit quality rating (0–100)", decoded.ID)
 	}
-	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Cost: *decoded.Cost, Disabled: decoded.Disabled}
+	*m = groupModel{ID: decoded.ID, Quality: *decoded.Quality, Disabled: decoded.Disabled}
 	return nil
 }
 
@@ -276,8 +272,8 @@ func validateConfig(cfg pluginConfig) error {
 		if len(group.Models) == 0 {
 			return fmt.Errorf("group %s needs at least one model", group.ID)
 		}
-		if group.Mode != groupModeQuality && group.Mode != groupModeCost && group.Mode != groupModeSpeed {
-			return fmt.Errorf("group %s needs mode quality, cost or speed, got %q", group.ID, group.Mode)
+		if group.Mode != groupModeQuality && group.Mode != groupModeSpeed {
+			return fmt.Errorf("group %s needs mode quality or speed, got %q", group.ID, group.Mode)
 		}
 		models := make(map[string]bool, len(group.Models))
 		enabled := 0
@@ -289,9 +285,8 @@ func validateConfig(cfg pluginConfig) error {
 				return fmt.Errorf("group %s has an empty or duplicate model id %q", group.ID, model.ID)
 			}
 			models[model.ID] = true
-			if math.IsNaN(model.Quality) || math.IsInf(model.Quality, 0) || model.Quality < 0 || model.Quality > 100 ||
-				math.IsNaN(model.Cost) || math.IsInf(model.Cost, 0) || model.Cost < 0 || model.Cost > 100 {
-				return fmt.Errorf("group %s model %s: quality and cost must be finite ratings in [0, 100]", group.ID, model.ID)
+			if math.IsNaN(model.Quality) || math.IsInf(model.Quality, 0) || model.Quality < 0 || model.Quality > 100 {
+				return fmt.Errorf("group %s model %s: quality must be a finite rating in [0, 100]", group.ID, model.ID)
 			}
 		}
 		if enabled == 0 {
@@ -331,7 +326,7 @@ func pluginRegistration() registration {
 				{Name: "min_remaining", Type: "number", Default: 0.02, Description: "Quota fraction (0-1) every window of a credential must keep for it to be used."},
 				{Name: "idle_minutes", Type: "integer", Default: 5, Description: "Minutes without a prompt after which a credential binding may re-rank (0 disables credential affinity). Group model bindings last until compaction, reset, or failure."},
 				{Name: "stream_prefetch_bytes", Type: "integer", Default: 128, Description: "Bytes of visible text a smart group stream buffers and checks for refusals before forwarding to the client."},
-				{Name: "groups", Type: "array", Description: "Smart Groups ({id, name, mode: quality|cost, models: [{id, quality, cost}]}). Ratings are 0–100; higher quality is better, higher cost is more expensive. Weighted selection among models within 3 score points of the best; conversations stay pinned until compaction, reset, or failure."},
+				{Name: "groups", Type: "array", Description: "Smart Groups ({id, name, mode: quality|speed, models: [{id, quality}]}). quality is 0–100; higher is better. Weighted selection among models within 3 score points of the best; conversations stay pinned until compaction, reset, or failure."},
 				{Name: "features", Type: "object", Description: "Safeguard and client-wire adaptation toggles and custom notice_prefix."},
 			},
 		},

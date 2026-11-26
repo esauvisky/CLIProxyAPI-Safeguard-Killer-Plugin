@@ -206,6 +206,10 @@ func TestWithModelKeepsBodiesWithoutModelField(t *testing.T) {
 	if errSet != nil || string(out) != `{"contents":[]}` {
 		t.Fatalf("withModel = %s, %v", out, errSet)
 	}
+	out, errSet = withModel([]byte(`{"model":"old","fallbacks":"default"}`), "new")
+	if errSet != nil || string(out) != `{"fallbacks":"default","model":"new"}` {
+		t.Fatalf("withModel changed fields besides model = %s, %v", out, errSet)
+	}
 	if _, errSet := withModel([]byte(`not json`), "m"); errSet == nil {
 		t.Fatalf("withModel(non-JSON) error = nil")
 	}

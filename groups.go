@@ -507,17 +507,16 @@ func skipReason(cfg pluginConfig, model string, now time.Time) (string, error) {
 	return "no usable credentials: " + strings.Join(excluded, ", "), nil
 }
 
-// withModel sets the top-level "model" field the client sent to the target model.
+// withModel sets the top-level "model" field on the already-sanitized group payload.
 // Protocols that carry the model only in the path (Gemini) have no "model" field and are passed
 // through unchanged.
 func withModel(payload []byte, model string) ([]byte, error) {
-	bodyOut, _, _, _ := sanitizeRequest(payload, nil, currentConfig())
 	var body map[string]json.RawMessage
-	if errUnmarshal := json.Unmarshal(bodyOut, &body); errUnmarshal != nil {
+	if errUnmarshal := json.Unmarshal(payload, &body); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode group request body: %w", errUnmarshal)
 	}
 	if _, ok := body["model"]; !ok {
-		return bodyOut, nil
+		return payload, nil
 	}
 	encoded, _ := json.Marshal(model)
 	body["model"] = encoded

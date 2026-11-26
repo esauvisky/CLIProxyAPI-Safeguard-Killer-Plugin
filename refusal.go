@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -680,6 +681,11 @@ var (
 	claudeOpeningPattern = regexp.MustCompile(`(?mi)^[ \t]*You are (?:Claude Code, Anthropic's official CLI for Claude(?:, running within the Claude Agent SDK)?|a Claude agent, built on Anthropic's Claude Agent SDK)\.[ \t]*\n?`)
 	outputStyleOpeningPattern = regexp.MustCompile(`(?mi)^[ \t]*You are an interactive agent that helps users according to your "Output Style"[^\n]*\n?`)
 	fableIdentityPattern      = regexp.MustCompile(`(?mi)^[ \t]*This iteration of Claude is Claude (?:Fable|Mythos)[^\n]*\n?`)
+	// Claude Code's autonomy_append section is emitted for every model whose cloaked id resolves to
+	// Fable 5, so non-Claude targets get Fable's "never end the turn" instructions verbatim. The
+	// paragraphs are single lines in the assembled prompt.
+	autonomyParagraphPattern = regexp.MustCompile(`(?m)^[ \t]*You are operating autonomously\.[^\n]*\n?`)
+	autonomyEndingPattern    = regexp.MustCompile(`(?m)^[ \t]*Before ending your turn, check your last paragraph\.[^\n]*\n?`)
 
 	envBlockPattern                   = regexp.MustCompile(`(?m)^# Environment(?: update)?\r?\n(?:You have been invoked[^\n]*\r?\n)?(?:[ \t]*-[ \t][^\n]*\r?\n?)+[ \t\r\n]*`)
 	poweredByPattern                  = regexp.MustCompile(`(?m)^[ \t]*You are powered by the model named [^\n]*\n?`)
@@ -828,7 +834,7 @@ func stripHarnessNoise(s string, st *cleanState, cfg featureConfig) string {
 // opening, the output-style opening, and the Fable/Mythos identity paragraph. It runs per attempt, so
 // the client history stays untouched and earlier turns keep their bytes for prompt caching.
 func adaptPromptForModel(payload []byte, model string, cfg pluginConfig) ([]byte, error) {
-	if !cfg.Features.StripModelIdentity {
+	if !cfg.Features.StripModelIdentity && !cfg.Features.SanitizeAgyText {
 		return payload, nil
 	}
 	var body map[string]json.RawMessage
@@ -838,6 +844,9 @@ func adaptPromptForModel(payload []byte, model string, cfg pluginConfig) ([]byte
 	changed := false
 	st := &cleanState{}
 	fn := func(s string) string {
+		if cfg.Features.SanitizeAgyText && modelIsAgy(model) {
+			s = sanitizeNonPrintableText(s)
+		}
 		s = adaptForModel(s, model, cfg.Features)
 		return rewriteSystemText(s, st, cfg)
 	}
@@ -853,6 +862,22 @@ func adaptPromptForModel(payload []byte, model string, cfg pluginConfig) ([]byte
 		if !bytes.Equal(updated, rawSys) {
 			body[field] = updated
 			changed = true
+		}
+	}
+	if cfg.Features.SanitizeAgyText && modelIsAgy(model) {
+		for _, field := range []string{"messages", "input", "contents"} {
+			rawHistory, ok := body[field]
+			if !ok {
+				continue
+			}
+			updated, errRewrite := rewriteSystemFieldStrings(rawHistory, sanitizeNonPrintableText)
+			if errRewrite != nil {
+				return nil, errRewrite
+			}
+			if !bytes.Equal(updated, rawHistory) {
+				body[field] = updated
+				changed = true
+			}
 		}
 	}
 	if !changed {
@@ -872,11 +897,42 @@ func adaptForModel(s, model string, cfg featureConfig) string {
 	if !modelIsClaude(model) {
 		s = claudeOpeningPattern.ReplaceAllString(s, "")
 		s = outputStyleOpeningPattern.ReplaceAllString(s, "")
+		s = autonomyParagraphPattern.ReplaceAllString(s, "")
+		s = autonomyEndingPattern.ReplaceAllString(s, "")
 	}
 	if !modelIsFable(model) {
 		s = fableIdentityPattern.ReplaceAllString(s, "")
 	}
 	return s
+}
+
+// modelIsAgy reports whether a target model id is served by the cliproxy-antigravity bridge, which
+// stages oversized prompts as a prompt.txt file for its own read_file tool.
+func modelIsAgy(model string) bool {
+	return strings.HasPrefix(strings.ToLower(model), "agy/")
+}
+
+// sanitizeNonPrintableText replaces runes that are not printable per unicode.IsPrint with U+FFFD,
+// keeping newlines and tabs. agy's read_file treats a staged prompt containing them as binary, so
+// the model cannot read its own request. Prompt text is meant to be readable, so this is lossless
+// for prose and code; only decorative private-use and control runes change.
+func sanitizeNonPrintableText(s string) string {
+	if strings.IndexFunc(s, func(r rune) bool {
+		return r != '\n' && r != '\r' && r != '\t' && !unicode.IsPrint(r)
+	}) == -1 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t' || unicode.IsPrint(r):
+			b.WriteRune(r)
+		default:
+			b.WriteRune('\ufffd')
+		}
+	}
+	return b.String()
 }
 
 func walkJSONStrings(v any, fn func(string) string, changed *bool) any {
@@ -1710,6 +1766,20 @@ func interceptRequest(raw []byte, capture bool) ([]byte, error) {
 	bodyOut, headersOut, clearHeaders, _, errSanitize := sanitizeRequest(req.Body, req.Headers, cfg)
 	if errSanitize != nil {
 		return nil, errSanitize
+	}
+	var modelProbe struct {
+		Model string `json:"model"`
+	}
+	if len(req.Body) > 0 {
+		if errUnmarshal := json.Unmarshal(req.Body, &modelProbe); errUnmarshal != nil {
+			return nil, fmt.Errorf("decode intercepted request model: %w", errUnmarshal)
+		}
+		if _, isGroup := cfg.group(modelProbe.Model); !isGroup {
+			bodyOut, errSanitize = adaptPromptForModel(bodyOut, modelProbe.Model, cfg)
+			if errSanitize != nil {
+				return nil, errSanitize
+			}
+		}
 	}
 	if capture {
 		recordCapturedPayload(req.Body, bodyOut, req.Headers, time.Now())

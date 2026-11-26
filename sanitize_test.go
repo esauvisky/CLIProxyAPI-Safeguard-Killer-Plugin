@@ -194,6 +194,71 @@ func TestAdaptPromptForModelKeysIdentityByTarget(t *testing.T) {
 	requireAbsent(t, opusText, "This iteration of Claude is")
 }
 
+func TestAdaptPromptForModelStripsAutonomyForNonClaude(t *testing.T) {
+	autonomy := "You are operating autonomously. The user is not watching in real time and cannot answer questions mid-task, so asking 'Want me to...?' will block the work. For reversible actions that follow from the original request, proceed without asking.\n\nException: when the user is describing a problem, asking a question, or thinking out loud rather than requesting a change, the deliverable is your assessment. Report your findings and stop.\n\nBefore ending your turn, check your last paragraph. If it is a plan, do that work now with tool calls. That includes retrying after errors and gathering missing information yourself. Do not stop because the context or session is long. End your turn only when the task is complete.\n\nBefore running a command that changes system state (such as restarts), check that the evidence actually supports that specific action."
+	body := mustJSON(t, map[string]any{
+		"model": "groups/heavy-thinkers",
+		"system": []any{map[string]any{"type": "text", "text": "Keep this.\n\n" + autonomy + "\n\n# Context management\nAlso keep this."}},
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	cfg := defaultPluginConfig()
+	out, err := adaptPromptForModel([]byte(body), "deepseek-v4.1-flash", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := jsonStrings(t, out)
+	requireAbsent(t, text, "You are operating autonomously", "Before ending your turn")
+	requirePresent(t, text, "Keep this.", "Report your findings and stop.", "Before running a command that changes system state", "# Context management")
+
+	for _, model := range []string{"claude-fable-5-2", "claude-opus-5-5"} {
+		out, err = adaptPromptForModel([]byte(body), model, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		requirePresent(t, jsonStrings(t, out), "You are operating autonomously", "Before ending your turn")
+	}
+}
+
+func TestAdaptPromptForModelSanitizesNonPrintableForAgy(t *testing.T) {
+	body := mustJSON(t, map[string]any{
+		"model": "groups/heavy-thinkers",
+		"system": []any{map[string]any{"type": "text", "text": "Icon= keep this"}},
+		"messages": []any{
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "content": "Icon=\nIcon=\ntext"},
+				map[string]any{"type": "text", "text": "done"},
+			}},
+		},
+	})
+	cfg := defaultPluginConfig()
+	out, err := adaptPromptForModel([]byte(body), "agy/gemini-4-neon", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := jsonStrings(t, out)
+	if strings.Contains(text, "") {
+		t.Fatalf("private-use rune survived for agy target: %s", text)
+	}
+	requirePresent(t, text, "keep this", "text", "done")
+
+	for _, model := range []string{"kimi-k3.1-pro", "claude-fable-5-2"} {
+		unchanged, err := adaptPromptForModel([]byte(body), model, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(jsonStrings(t, unchanged), "") {
+			t.Fatalf("%s prompt text was sanitized although the target is not agy", model)
+		}
+	}
+}
+
+func TestSanitizeNonPrintableTextKeepsPrintableUnicode(t *testing.T) {
+	in := "a—b…c✓d→e\nline\ttab\r\nascii"
+	if got := sanitizeNonPrintableText(in); got != in {
+		t.Fatalf("printable text changed: %q", got)
+	}
+}
+
 func TestSanitizePreservesToolSourceCode(t *testing.T) {
 	body := mustJSON(t, map[string]any{
 		"model": "claude-opus-5-5",

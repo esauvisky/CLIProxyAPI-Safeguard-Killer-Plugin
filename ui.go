@@ -794,8 +794,15 @@ const uiHTML = `<!doctype html>
         <label class="feature-item">
           <input type="checkbox" data-feature="strip_model_identity">
           <span>
-            <span class="feature-title">Strip model-keyed identity (Claude Code opening, Fable paragraph)</span>
-            <span class="feature-desc">Per attempt: remove "You are Claude Code..." and the output-style opening for non-Claude targets, and remove "This iteration of Claude is..." for non-Fable targets. The client history stays untouched, so prompt caches remain stable.</span>
+            <span class="feature-title">Strip model-keyed identity (Claude Code opening, Fable paragraph, autonomy block)</span>
+            <span class="feature-desc">Per attempt: remove "You are Claude Code...", the output-style opening, and the autonomy_append paragraphs ("You are operating autonomously...", "Before ending your turn...") for non-Claude targets, and remove "This iteration of Claude is..." for non-Fable targets. The client history stays untouched, so prompt caches remain stable.</span>
+          </span>
+        </label>
+        <label class="feature-item">
+          <input type="checkbox" data-feature="sanitize_agy_text">
+          <span>
+            <span class="feature-title">Sanitize agy prompt text</span>
+            <span class="feature-desc">Per attempt on agy targets, replace non-printable runes (private-use and control characters) with U+FFFD in the system prompt and conversation, so agy's read_file does not reject the staged prompt.txt as binary.</span>
           </span>
         </label>
       </div>
@@ -1120,6 +1127,7 @@ const FEATURE_KEYS = [
   'strip_restrictive_system_reminders',
   'strip_rea_directives',
   'strip_model_identity',
+  'sanitize_agy_text',
 ];
 
 function featuresOf(cfg) {

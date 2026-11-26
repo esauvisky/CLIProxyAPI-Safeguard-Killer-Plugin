@@ -64,10 +64,11 @@ type registrationCapabilities struct {
 }
 
 type pluginConfig struct {
-	// Enabled and Priority are host runtime fields present in every plugin config_yaml; they are
-	// decoded so the strict config decoder accepts the host's payload.
-	Enabled   bool `yaml:"enabled"`
-	Priority  int  `yaml:"priority"`
+	// Enabled, Priority and Store are host runtime fields present in every plugin config_yaml; they
+	// are decoded so the strict config decoder accepts the host's payload.
+	Enabled  bool           `yaml:"enabled"`
+	Priority int            `yaml:"priority"`
+	Store    map[string]any `yaml:"store"`
 	// MinRemaining is the fraction every applicable quota window must keep for a credential to be used.
 	MinRemaining float64 `yaml:"min_remaining" json:"min_remaining"`
 	// IdleMinutes is how long a session may go without a prompt before it can move to another credential.
@@ -99,6 +100,7 @@ type featureConfig struct {
 	StripRestrictiveReminders     bool   `yaml:"strip_restrictive_system_reminders" json:"strip_restrictive_system_reminders"`
 	StripReaDirectives            bool   `yaml:"strip_rea_directives" json:"strip_rea_directives"`
 	StripModelIdentity            bool   `yaml:"strip_model_identity" json:"strip_model_identity"`
+	SanitizeAgyText               bool   `yaml:"sanitize_agy_text" json:"sanitize_agy_text"`
 }
 
 func (f featureConfig) effectiveNoticePrefix() string {
@@ -222,6 +224,7 @@ func defaultPluginConfig() pluginConfig {
 			StripRestrictiveReminders:     true,
 			StripReaDirectives:            true,
 			StripModelIdentity:            true,
+			SanitizeAgyText:               true,
 		},
 	}
 }

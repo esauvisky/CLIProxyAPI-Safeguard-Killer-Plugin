@@ -304,12 +304,14 @@ const neutralRate = 1
 // applicable window must keep at least minRemaining. The rate is the bottleneck: the lowest
 // remaining / hours_to_reset among applicable windows that report a reset time. A window without
 // a reset time (the provider does not report one) only takes part in the threshold check.
-// A missing snapshot or a snapshot without windows excludes the credential. A quota fetch error
+// A missing snapshot is neutral while the asynchronous first refresh runs; upstream quota responses
+// remain authoritative. A snapshot without windows excludes the credential. A quota fetch error
 // (e.g. a model or plan that reports no usage) rates the credential neutral and shows the error in Window.
 func rateCredential(entry *rankEntry, model string, minRemaining float64, now time.Time) {
 	quota, ok := quotaFor(entry.AuthID)
 	if !ok {
-		entry.Excluded = "quota not fetched yet"
+		entry.Window = "quota not fetched yet"
+		entry.Rate = neutralRate
 		return
 	}
 	if quota.Source == quotaSourceNone {

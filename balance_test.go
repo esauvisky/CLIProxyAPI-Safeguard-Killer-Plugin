@@ -209,6 +209,14 @@ func TestPickFailsWhenAllExcludedByWeight(t *testing.T) {
 	assertNoEligible(t, errPick, "account weight is 0")
 }
 
+func TestRateCredentialBeforeFirstQuotaFetchIsNeutral(t *testing.T) {
+	entry := rankEntry{AuthID: "not-fetched"}
+	rateCredential(&entry, "m", 0.02, testNow)
+	if entry.Excluded != "" || entry.Rate != neutralRate || entry.Window != "quota not fetched yet" {
+		t.Fatalf("rateCredential() = %+v, want neutral rate while first refresh runs", entry)
+	}
+}
+
 func TestPickNeutralRateForOptionalQuota(t *testing.T) {
 	fakeHost(t, []string{"claude-opus-4-8"}, noOther(t), "a", "b")
 	fakeWeights(t, `{"files":[{"id":"a"},{"id":"b","weight":0}]}`)

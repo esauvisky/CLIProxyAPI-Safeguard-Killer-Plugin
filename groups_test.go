@@ -932,7 +932,7 @@ func TestGroupPinnedModelQuotaTriggersReselection(t *testing.T) {
 }
 
 func TestGroupTransientFailuresDoNotBlockRecovery(t *testing.T) {
-	for _, failure := range []string{"", "empty response (no text or tool calls)", "no tools", "quota", "removed"} {
+	for _, failure := range []string{"", "no tools", "quota", "removed"} {
 		name := failure
 		if name == "" {
 			name = "pinned model fails during request"

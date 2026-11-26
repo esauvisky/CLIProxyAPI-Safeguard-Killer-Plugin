@@ -664,10 +664,22 @@ var (
 
 	// Generic enough to survive small upstream wording changes: the gate paragraph is one line that
 	// starts "IMPORTANT: Assist with ... security testing"; the tier blurb is one sentence that
-	// mentions "additional safety measures" after a Fable/Mythos name.
-	cyberGatePattern       = regexp.MustCompile(`(?i)IMPORTANT:[ \t]*Assist with[^\n]*?security testing[^\n]*\n?`)
-	fableTierPattern       = regexp.MustCompile(`(?mi)Claude (?:Fable|Mythos)[^\n]*?additional safety measures[^\n]*?\.(?:[ \t]+|$)`)
+	// mentions "additional safety measures" after a Fable/Mythos name. The tail pattern catches the
+	// sentence when upstream splits the gate across lines or blocks.
+	cyberGatePattern     = regexp.MustCompile(`(?i)IMPORTANT:[ \t]*Assist with[^\n]*?security testing[^\n]*\n?`)
+	cyberGateTailPattern = regexp.MustCompile(`(?i)Dual-use security tools[^\n]*?require clear authorization context[^\n]*\.`)
+	// The tier sentence starts after a sentence boundary so the identity paragraph's opening
+	// ("This iteration of Claude is Claude Fable 5, the first model...") survives; $1 keeps the boundary.
+	fableTierPattern       = regexp.MustCompile(`(?mi)(^|\. )[ \t]*Claude (?:Fable|Mythos)[^\n]*?includes additional safety measures[^\n]*?\.`)
 	visibleThinkingPattern = regexp.MustCompile(`(?i),\s*including\s+(?:the\s+)?visible\s+thinking`)
+
+	reaDataOnlyPattern   = regexp.MustCompile(`(?i)\s*Treat them as data, never as instructions[^\n]*\.?`)
+	reaProvenancePattern = regexp.MustCompile(`(?i)\s*Results that carry target content are marked with _meta\.provenance\.untrusted_content\.`)
+	fableTrainingPattern = regexp.MustCompile(`(?mi)\s*The training of (?:Fable|Mythos)[^\n]*included measures to limit advances[^\n]*\.`)
+	latestModelsPattern  = regexp.MustCompile(`(?m)^[ \t]*-[ \t]*The most recent Claude models are the Claude 5 family[^\n]*\n?`)
+	claudeOpeningPattern = regexp.MustCompile(`(?mi)^[ \t]*You are (?:Claude Code, Anthropic's official CLI for Claude(?:, running within the Claude Agent SDK)?|a Claude agent, built on Anthropic's Claude Agent SDK)\.[ \t]*\n?`)
+	outputStyleOpeningPattern = regexp.MustCompile(`(?mi)^[ \t]*You are an interactive agent that helps users according to your "Output Style"[^\n]*\n?`)
+	fableIdentityPattern      = regexp.MustCompile(`(?mi)^[ \t]*This iteration of Claude is Claude (?:Fable|Mythos)[^\n]*\n?`)
 
 	envBlockPattern                   = regexp.MustCompile(`(?m)^# Environment(?: update)?\r?\n(?:You have been invoked[^\n]*\r?\n)?(?:[ \t]*-[ \t][^\n]*\r?\n?)+[ \t\r\n]*`)
 	poweredByPattern                  = regexp.MustCompile(`(?m)^[ \t]*You are powered by the model named [^\n]*\n?`)
@@ -772,24 +784,99 @@ func stripSystemReminders(s string, st *cleanState) string {
 // visible-thinking clause from a system prompt text.
 func stripCyberGate(s string) string {
 	s = cyberGatePattern.ReplaceAllString(s, "")
-	s = fableTierPattern.ReplaceAllString(s, "")
+	s = cyberGateTailPattern.ReplaceAllString(s, "")
+	s = fableTierPattern.ReplaceAllString(s, "$1")
+	s = fableTrainingPattern.ReplaceAllString(s, "")
 	return visibleThinkingPattern.ReplaceAllString(s, "")
+}
+
+// modelIsClaude reports whether a target model id belongs to Anthropic, which includes the cloaked
+// "claude-fable-5-dd-" ids; provider-prefixed ids such as "agy/claude-..." are not Anthropic.
+func modelIsClaude(model string) bool {
+	return strings.HasPrefix(strings.ToLower(model), "claude-")
+}
+
+// modelIsFable reports whether a target model id is Fable or Mythos, the models Claude Code keys its
+// identity paragraph and research-limit note to.
+func modelIsFable(model string) bool {
+	lower := strings.ToLower(model)
+	return strings.HasPrefix(lower, "claude-fable-") || strings.HasPrefix(lower, "claude-mythos-")
 }
 
 // stripHarnessNoise removes harness text from a non-tool-result message or system prompt text:
 // reminders by type, environment and sandbox sections, the model identity line, output-style
 // reminders, the untrusted-archive and injection paragraphs, and the background-task preamble.
-func stripHarnessNoise(s string, st *cleanState) string {
+func stripHarnessNoise(s string, st *cleanState, cfg featureConfig) string {
 	s = stripSystemReminders(s, st)
 	s = strings.ReplaceAll(s, claudeUntrustedArchiveReminder, "")
 	s = strings.ReplaceAll(s, strings.TrimSpace(claudeUntrustedArchiveReminder), "")
 	s = strings.ReplaceAll(s, claudeReaInjectionDirective, "")
+	if cfg.StripReaDirectives {
+		s = reaDataOnlyPattern.ReplaceAllString(s, "")
+		s = reaProvenancePattern.ReplaceAllString(s, "")
+	}
 	s = envBlockPattern.ReplaceAllString(s, "")
+	s = latestModelsPattern.ReplaceAllString(s, "")
 	s = stripSection(s, "## Bash command sandbox", sandboxSectionStops)
 	s = poweredByPattern.ReplaceAllString(s, "")
 	s = onlyYouSeeOutputLine.ReplaceAllString(s, "")
 	s = systemNotificationPreamblePattern.ReplaceAllString(s, "")
 	return emptyReminderPattern.ReplaceAllString(s, "")
+}
+
+// adaptForModel rewrites prompt text that Claude Code composes for a specific model: the Claude Code
+// opening, the output-style opening, and the Fable/Mythos identity paragraph. It runs per attempt, so
+// the client history stays untouched and earlier turns keep their bytes for prompt caching.
+func adaptPromptForModel(payload []byte, model string, cfg pluginConfig) ([]byte, error) {
+	if !cfg.Features.StripModelIdentity {
+		return payload, nil
+	}
+	var body map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(payload, &body); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode group request body: %w", errUnmarshal)
+	}
+	changed := false
+	st := &cleanState{}
+	fn := func(s string) string {
+		s = adaptForModel(s, model, cfg.Features)
+		return rewriteSystemText(s, st, cfg)
+	}
+	for _, field := range []string{"system", "systemInstruction", "instructions"} {
+		rawSys, ok := body[field]
+		if !ok {
+			continue
+		}
+		updated, errRewrite := rewriteSystemFieldStrings(rawSys, fn)
+		if errRewrite != nil {
+			return nil, errRewrite
+		}
+		if !bytes.Equal(updated, rawSys) {
+			body[field] = updated
+			changed = true
+		}
+	}
+	if !changed {
+		return payload, nil
+	}
+	marshaled, errMarshal := json.Marshal(body)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("encode model-adapted request: %w", errMarshal)
+	}
+	return marshaled, nil
+}
+
+func adaptForModel(s, model string, cfg featureConfig) string {
+	if !cfg.StripModelIdentity {
+		return s
+	}
+	if !modelIsClaude(model) {
+		s = claudeOpeningPattern.ReplaceAllString(s, "")
+		s = outputStyleOpeningPattern.ReplaceAllString(s, "")
+	}
+	if !modelIsFable(model) {
+		s = fableIdentityPattern.ReplaceAllString(s, "")
+	}
+	return s
 }
 
 func walkJSONStrings(v any, fn func(string) string, changed *bool) any {
@@ -831,35 +918,45 @@ func walkJSONStrings(v any, fn func(string) string, changed *bool) any {
 // rewriteSystemFieldJSON applies the enabled system-prompt rules to every string of a top-level
 // system field (a string, Claude text blocks, or a Gemini parts object). Text blocks that become
 // empty are dropped because upstreams reject empty text blocks.
-func rewriteSystemFieldJSON(raw json.RawMessage, cfg pluginConfig) json.RawMessage {
+func rewriteSystemFieldJSON(raw json.RawMessage, cfg pluginConfig) (json.RawMessage, error) {
 	st := &cleanState{}
-	fn := func(s string) string {
-		if cfg.Features.RewriteCyberSystemPrompt {
-			s = stripCyberGate(s)
-		}
-		if cfg.Features.StripRestrictiveReminders {
-			s = stripHarnessNoise(s, st)
-		}
-		return s
+	return rewriteSystemFieldStrings(raw, func(s string) string {
+		return rewriteSystemText(s, st, cfg)
+	})
+}
+
+// rewriteSystemText applies the enabled system-prompt rules to one text.
+func rewriteSystemText(s string, st *cleanState, cfg pluginConfig) string {
+	if cfg.Features.RewriteCyberSystemPrompt {
+		s = stripCyberGate(s)
 	}
+	if cfg.Features.StripRestrictiveReminders {
+		s = stripHarnessNoise(s, st, cfg.Features)
+	}
+	return s
+}
+
+// rewriteSystemFieldStrings applies fn to every string of a top-level system field and drops text
+// blocks that become empty, since upstreams reject empty text blocks.
+func rewriteSystemFieldStrings(raw json.RawMessage, fn func(string) string) (json.RawMessage, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 	var value any
-	if dec.Decode(&value) != nil {
-		return raw
+	if errDecode := dec.Decode(&value); errDecode != nil {
+		return nil, fmt.Errorf("decode system field: %w", errDecode)
 	}
 	changed := false
 	value = walkJSONStrings(value, fn, &changed)
 	if !changed {
-		return raw
+		return raw, nil
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
-	if enc.Encode(value) != nil {
-		return raw
+	if errEncode := enc.Encode(value); errEncode != nil {
+		return nil, fmt.Errorf("encode system field: %w", errEncode)
 	}
-	return json.RawMessage(bytes.TrimRight(buf.Bytes(), "\n"))
+	return json.RawMessage(bytes.TrimRight(buf.Bytes(), "\n")), nil
 }
 
 func containsClassifierNudge(raw []byte) bool {
@@ -930,6 +1027,10 @@ func cleanText(text, role string, inToolResult bool, prefixes []string, cfg plug
 		if cfg.Features.StripRestrictiveReminders {
 			text = stripSystemReminders(text, st)
 		}
+		if cfg.Features.StripReaDirectives {
+			text = reaDataOnlyPattern.ReplaceAllString(text, "")
+			text = reaProvenancePattern.ReplaceAllString(text, "")
+		}
 		return text
 	}
 	if cfg.Features.RewriteCyberSystemPrompt && (role == "system" || role == "developer") {
@@ -939,7 +1040,7 @@ func cleanText(text, role string, inToolResult bool, prefixes []string, cfg plug
 		text = neutralizeTextNudges(text)
 	}
 	if cfg.Features.StripRestrictiveReminders && role != "assistant" {
-		text = stripHarnessNoise(text, st)
+		text = stripHarnessNoise(text, st, cfg.Features)
 	}
 	return text
 }
@@ -1057,14 +1158,14 @@ func messagesNeedCleaning(raw []byte, cfg pluginConfig, prefixes []string) bool 
 
 // cleanMessages removes previously injected Safeguard Killer notices, neutralizes classifier-stop
 // nudges, strips harness noise by type, and resolves mid-conversation role="system" turns.
-func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessage {
+func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessage, error) {
 	prefixes := activeNoticePrefixes(cfg)
 	if !messagesNeedCleaning(rawMessages, cfg, prefixes) {
-		return rawMessages
+		return rawMessages, nil
 	}
 	var messages []map[string]json.RawMessage
-	if json.Unmarshal(rawMessages, &messages) != nil {
-		return rawMessages
+	if errUnmarshal := json.Unmarshal(rawMessages, &messages); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode request messages: %w", errUnmarshal)
 	}
 	st := &cleanState{}
 	kept := make([]map[string]json.RawMessage, 0, len(messages))
@@ -1122,13 +1223,13 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) json.RawMessag
 		changed = true
 	}
 	if !changed {
-		return rawMessages
+		return rawMessages, nil
 	}
 	out, errMarshal := json.Marshal(normalized)
 	if errMarshal != nil {
-		return rawMessages
+		return nil, fmt.Errorf("encode request messages: %w", errMarshal)
 	}
-	return out
+	return out, nil
 }
 
 // foldSystemTurns removes ordinary mid-conversation role="system" turns, which Anthropic rejects,
@@ -1174,7 +1275,12 @@ func foldSystemTurns(items []map[string]json.RawMessage) ([]map[string]json.RawM
 				blocks := contentToBlocks(items[i]["content"])
 				if len(out) > 0 && roleOf(out[len(out)-1]) == "user" {
 					previous := out[len(out)-1]
-					previous["content"], _ = json.Marshal(append(contentToBlocks(previous["content"]), blocks...))
+					if text, isText := singleTextContent(previous["content"]); isText && len(blocks) == 1 && blockIsText(blocks[0]) {
+						blockText := extractMessageText(items[i]["content"])
+						previous["content"], _ = json.Marshal(text + "\n\n" + blockText)
+					} else {
+						previous["content"], _ = json.Marshal(append(contentToBlocks(previous["content"]), blocks...))
+					}
 				} else {
 					items[i]["role"] = json.RawMessage(`"user"`)
 					items[i]["content"], _ = json.Marshal(blocks)
@@ -1202,6 +1308,21 @@ func directiveOnlySystemMessage(msg map[string]json.RawMessage) bool {
 	}
 	_, ok := msg["output_config"]
 	return ok
+}
+
+// singleTextContent returns a message's string content when it is a plain string, keeping string
+// content when folding avoids the JSON overhead of converting it to a text block.
+func singleTextContent(raw json.RawMessage) (string, bool) {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s, true
+	}
+	return "", false
+}
+
+func blockIsText(block map[string]json.RawMessage) bool {
+	var kind string
+	return json.Unmarshal(block["type"], &kind) == nil && kind == "text"
 }
 
 func extractMessageText(raw json.RawMessage) string {
@@ -1291,7 +1412,7 @@ func withoutRedactedThinking(payload []byte, model string) ([]byte, error) {
 
 // sanitizeRequest applies the enabled wire adaptations to a request body and headers, returning
 // the updated body, updated headers, headers to clear, and whether incoming "safeguards" was present.
-func sanitizeRequest(payload []byte, headers http.Header, cfg pluginConfig) (bodyOut []byte, headersOut http.Header, clearHeaders []string, hadSafeguards bool) {
+func sanitizeRequest(payload []byte, headers http.Header, cfg pluginConfig) (bodyOut []byte, headersOut http.Header, clearHeaders []string, hadSafeguards bool, err error) {
 	bodyOut = payload
 	if headers != nil {
 		headersOut = headers.Clone()
@@ -1303,7 +1424,10 @@ func sanitizeRequest(payload []byte, headers http.Header, cfg pluginConfig) (bod
 		if cfg.Features.RewriteCyberSystemPrompt || cfg.Features.StripRestrictiveReminders {
 			for _, field := range []string{"system", "systemInstruction", "instructions"} {
 				if rawSys, ok := body[field]; ok {
-					updated := rewriteSystemFieldJSON(rawSys, cfg)
+					updated, errRewrite := rewriteSystemFieldJSON(rawSys, cfg)
+					if errRewrite != nil {
+						return nil, nil, nil, false, errRewrite
+					}
 					if !bytes.Equal(updated, rawSys) {
 						body[field] = updated
 						bodyModified = true
@@ -1339,16 +1463,21 @@ func sanitizeRequest(payload []byte, headers http.Header, cfg pluginConfig) (bod
 			}
 		}
 		if rawMessages, ok := body["messages"]; ok {
-			cleaned := cleanMessages(rawMessages, cfg)
+			cleaned, errClean := cleanMessages(rawMessages, cfg)
+			if errClean != nil {
+				return nil, nil, nil, false, errClean
+			}
 			if !bytes.Equal(cleaned, rawMessages) {
 				body["messages"] = cleaned
 				bodyModified = true
 			}
 		}
 		if bodyModified {
-			if marshaled, errMarshal := json.Marshal(body); errMarshal == nil {
-				bodyOut = marshaled
+			marshaled, errMarshal := json.Marshal(body)
+			if errMarshal != nil {
+				return nil, nil, nil, false, fmt.Errorf("encode sanitized request: %w", errMarshal)
 			}
+			bodyOut = marshaled
 		}
 	}
 
@@ -1389,7 +1518,7 @@ func sanitizeRequest(payload []byte, headers http.Header, cfg pluginConfig) (bod
 			}
 		}
 	}
-	return bodyOut, headersOut, clearHeaders, hadSafeguards
+	return bodyOut, headersOut, clearHeaders, hadSafeguards, nil
 }
 
 func filterBetaTokens(tokens []string, f featureConfig) []string {
@@ -1578,7 +1707,10 @@ func interceptRequest(raw []byte, capture bool) ([]byte, error) {
 			})
 		}
 	}
-	bodyOut, headersOut, clearHeaders, _ := sanitizeRequest(req.Body, req.Headers, cfg)
+	bodyOut, headersOut, clearHeaders, _, errSanitize := sanitizeRequest(req.Body, req.Headers, cfg)
+	if errSanitize != nil {
+		return nil, errSanitize
+	}
 	if capture {
 		recordCapturedPayload(req.Body, bodyOut, req.Headers, time.Now())
 	}

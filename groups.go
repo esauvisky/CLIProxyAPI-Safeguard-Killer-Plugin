@@ -187,7 +187,10 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 	now := time.Now()
 	ensureBenchmarksFresh()
 	aux := isAuxiliaryRequest(req.Payload)
-	sanitizedPayload, sanitizedHeaders, _, _ := sanitizeRequest(req.Payload, req.Headers, cfg)
+	sanitizedPayload, sanitizedHeaders, _, _, errSanitize := sanitizeRequest(req.Payload, req.Headers, cfg)
+	if errSanitize != nil {
+		return nil, errSanitize
+	}
 	plan := planConversation(cfg, session, group, req.Payload, now)
 	attempts := plan.Skipped
 	prevLookupModel := plan.PrevModel
@@ -202,6 +205,10 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 			return nil, errBody
 		}
 		body, errBody = withoutRedactedThinking(body, model)
+		if errBody != nil {
+			return nil, errBody
+		}
+		body, errBody = adaptPromptForModel(body, model, cfg)
 		if errBody != nil {
 			return nil, errBody
 		}
@@ -270,7 +277,10 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 	now := time.Now()
 	ensureBenchmarksFresh()
 	aux := isAuxiliaryRequest(req.Payload)
-	sanitizedPayload, sanitizedHeaders, _, hadSafeguards := sanitizeRequest(req.Payload, req.Headers, cfg)
+	sanitizedPayload, sanitizedHeaders, _, hadSafeguards, errSanitize := sanitizeRequest(req.Payload, req.Headers, cfg)
+	if errSanitize != nil {
+		return nil, errSanitize
+	}
 	stampSafeguards := cfg.Features.BypassAutoModeClassifier && hadSafeguards
 	plan := planConversation(cfg, session, group, req.Payload, now)
 	attempts := plan.Skipped
@@ -286,6 +296,10 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 			return nil, errBody
 		}
 		body, errBody = withoutRedactedThinking(body, model)
+		if errBody != nil {
+			return nil, errBody
+		}
+		body, errBody = adaptPromptForModel(body, model, cfg)
 		if errBody != nil {
 			return nil, errBody
 		}

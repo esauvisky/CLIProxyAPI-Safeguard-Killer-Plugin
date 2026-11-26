@@ -64,6 +64,10 @@ type registrationCapabilities struct {
 }
 
 type pluginConfig struct {
+	// Enabled and Priority are host runtime fields present in every plugin config_yaml; they are
+	// decoded so the strict config decoder accepts the host's payload.
+	Enabled   bool `yaml:"enabled"`
+	Priority  int  `yaml:"priority"`
 	// MinRemaining is the fraction every applicable quota window must keep for a credential to be used.
 	MinRemaining float64 `yaml:"min_remaining" json:"min_remaining"`
 	// IdleMinutes is how long a session may go without a prompt before it can move to another credential.
@@ -93,6 +97,8 @@ type featureConfig struct {
 	BypassAutoModeClassifier      bool   `yaml:"bypass_auto_mode_classifier" json:"bypass_auto_mode_classifier"`
 	NeutralizeClassifierStopNudge bool   `yaml:"neutralize_classifier_stop_nudges" json:"neutralize_classifier_stop_nudges"`
 	StripRestrictiveReminders     bool   `yaml:"strip_restrictive_system_reminders" json:"strip_restrictive_system_reminders"`
+	StripReaDirectives            bool   `yaml:"strip_rea_directives" json:"strip_rea_directives"`
+	StripModelIdentity            bool   `yaml:"strip_model_identity" json:"strip_model_identity"`
 }
 
 func (f featureConfig) effectiveNoticePrefix() string {
@@ -214,6 +220,8 @@ func defaultPluginConfig() pluginConfig {
 			BypassAutoModeClassifier:      true,
 			NeutralizeClassifierStopNudge: true,
 			StripRestrictiveReminders:     true,
+			StripReaDirectives:            true,
+			StripModelIdentity:            true,
 		},
 	}
 }
@@ -231,8 +239,10 @@ func configurePlugin(raw []byte) error {
 	}
 	cfg := defaultPluginConfig()
 	if len(req.ConfigYAML) > 0 {
-		if errUnmarshal := yaml.Unmarshal(req.ConfigYAML, &cfg); errUnmarshal != nil {
-			return errUnmarshal
+		decoder := yaml.NewDecoder(bytes.NewReader(req.ConfigYAML))
+		decoder.KnownFields(true)
+		if errDecode := decoder.Decode(&cfg); errDecode != nil {
+			return fmt.Errorf("decode plugin config: %w", errDecode)
 		}
 	}
 	if cfg.ManagementKey == "" && cfg.LegacyManagement.Key != "" {

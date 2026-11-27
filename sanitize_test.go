@@ -301,11 +301,9 @@ func TestReminderRulesRemoveListedTypesAndKeepTheRest(t *testing.T) {
 	})
 	out := sanitize(t, body)
 	text := jsonStrings(t, out)
-	requirePresent(t, text, "RULE-ONE", "Today's date is 2026-11-26.", "A brand new reminder type nobody has seen", "GitHub API rate limit exceeded", "fix the build", "next step", "done")
-	requireAbsent(t, text, "# Environment", "Primary working directory", "Bash command sandbox", "Only you see", "You are powered by", "Concise output style", "Proactive output style")
-	if got := strings.Count(text, terseStyleDirective); got != 1 {
-		t.Errorf("terse directive count = %d, want 1", got)
-	}
+	requirePresent(t, text, "RULE-ONE", "Today's date is 2026-11-26.", "A brand new reminder type nobody has seen", "GitHub API rate limit exceeded", "fix the build", "next step", "done",
+		"Concise output style is active. Be concise.", "Proactive output style is active. Execute autonomously.")
+	requireAbsent(t, text, "# Environment", "Primary working directory", "Bash command sandbox", "Only you see", "You are powered by", "Output style: spend as few tokens")
 }
 
 func TestGitStatusReminderKeepsOtherSections(t *testing.T) {

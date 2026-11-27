@@ -720,10 +720,6 @@ const (
 	reminderClose = "</" + reminderTag + ">"
 
 	gitStatusReminderIntro = "As you answer the user's questions, you can use the following context:"
-
-	// terseStyleDirective replaces Claude Code's output-style reminders (proactive, concise,
-	// explanatory), which all cost tokens and none of which minimize output.
-	terseStyleDirective = "Output style: spend as few tokens as possible. Lead with the result. No preamble, no recap, no narration of what you are about to do or just did, no restating the request. Short plain sentences. Do not repeat tool output or diffs the user can already see."
 )
 
 var (
@@ -771,19 +767,8 @@ var (
 		"Only you see that command's output",
 		"You are powered by the model named",
 	}
-	styleReminderPrefixes = []string{
-		"Proactive output style is active",
-		"Concise output style is active",
-		"Explanatory output style is active",
-		"# Output Style:",
-	}
 	sandboxSectionStops = []string{"\n# ", "\nYou are powered by the model named ", reminderClose, "<total_tokens>"}
 )
-
-// cleanState carries decisions that depend on earlier parts of the same request.
-type cleanState struct {
-	styleSeen bool
-}
 
 func lineStartIndex(s, header string) int {
 	from := 0
@@ -820,10 +805,9 @@ func stripSection(s, header string, stops []string) string {
 }
 
 // stripSystemReminders removes the reminder blocks listed in removedReminderPrefixes and the git
-// status snapshot, and collapses every output-style reminder into one terse directive. All other
-// reminders are kept. The decision depends only on the block itself and on blocks before it, so the
-// result for earlier turns never changes when later turns are appended.
-func stripSystemReminders(s string, st *cleanState) string {
+// status snapshot. All other reminders are kept. The decision depends only on the block itself, so
+// the result for earlier turns never changes when later turns are appended.
+func stripSystemReminders(s string) string {
 	if !strings.Contains(s, reminderOpen) {
 		return s
 	}
@@ -840,15 +824,6 @@ func stripSystemReminders(s string, st *cleanState) string {
 				return ""
 			}
 			return reminderOpen + "\n" + trimmed + "\n" + reminderClose
-		}
-		for _, prefix := range styleReminderPrefixes {
-			if strings.HasPrefix(body, prefix) {
-				if st.styleSeen {
-					return ""
-				}
-				st.styleSeen = true
-				return reminderOpen + "\n" + terseStyleDirective + "\n" + reminderClose
-			}
 		}
 		return match
 	})
@@ -914,8 +889,8 @@ func modelIsFable(model string) bool {
 // stripHarnessNoise removes harness text from a non-tool-result message or system prompt text:
 // reminders by type, environment and sandbox sections, the model identity line, output-style
 // reminders, the untrusted-archive and injection paragraphs, and the background-task preamble.
-func stripHarnessNoise(s string, st *cleanState, cfg featureConfig) string {
-	s = stripSystemReminders(s, st)
+func stripHarnessNoise(s string, cfg featureConfig) string {
+	s = stripSystemReminders(s)
 	if strings.Contains(s, "untrusted data:") {
 		s = strings.ReplaceAll(s, claudeUntrustedArchiveReminder, "")
 		s = strings.ReplaceAll(s, strings.TrimSpace(claudeUntrustedArchiveReminder), "")
@@ -992,13 +967,12 @@ func adaptPromptBody(body map[string]json.RawMessage, model string, cfg pluginCo
 	}
 	changed := false
 	agy := cfg.Features.SanitizeAgyText && modelIsAgy(model)
-	st := &cleanState{}
 	fn := func(s string) string {
 		if agy {
 			s = sanitizeNonPrintableText(s)
 		}
 		s = adaptForModel(s, model, cfg.Features)
-		return rewriteSystemText(s, st, cfg)
+		return rewriteSystemText(s, cfg)
 	}
 	for _, field := range []string{"system", "systemInstruction", "instructions"} {
 		rawSys, ok := body[field]
@@ -1221,19 +1195,18 @@ func walkJSONStrings(v any, fn func(string) string, changed *bool) any {
 // system field (a string, Claude text blocks, or a Gemini parts object). Text blocks that become
 // empty are dropped because upstreams reject empty text blocks.
 func rewriteSystemFieldJSON(raw json.RawMessage, cfg pluginConfig) (json.RawMessage, error) {
-	st := &cleanState{}
 	return rewriteSystemFieldStrings(raw, func(s string) string {
-		return rewriteSystemText(s, st, cfg)
+		return rewriteSystemText(s, cfg)
 	})
 }
 
 // rewriteSystemText applies the enabled system-prompt rules to one text.
-func rewriteSystemText(s string, st *cleanState, cfg pluginConfig) string {
+func rewriteSystemText(s string, cfg pluginConfig) string {
 	if cfg.Features.RewriteCyberSystemPrompt {
 		s = stripCyberGate(s)
 	}
 	if cfg.Features.StripRestrictiveReminders {
-		s = stripHarnessNoise(s, st, cfg.Features)
+		s = stripHarnessNoise(s, cfg.Features)
 	}
 	return s
 }
@@ -1335,7 +1308,7 @@ func replaceExactToolResultText(s string) (string, bool) {
 // cleanText applies the enabled message rules to one text. Text inside a tool_result is only
 // touched by exact tombstone replacement and reminder removal, so source code that quotes these
 // strings stays intact. Assistant text is never subject to harness-noise removal.
-func cleanText(text, role string, inToolResult bool, prefixes []string, cfg pluginConfig, st *cleanState) string {
+func cleanText(text, role string, inToolResult bool, prefixes []string, cfg pluginConfig) string {
 	if len(prefixes) > 0 && hasNoticePrefix(text, prefixes) {
 		idx := strings.Index(text, "\n\n")
 		if idx == -1 {
@@ -1350,7 +1323,7 @@ func cleanText(text, role string, inToolResult bool, prefixes []string, cfg plug
 			}
 		}
 		if cfg.Features.StripRestrictiveReminders {
-			text = stripSystemReminders(text, st)
+			text = stripSystemReminders(text)
 			if strings.Contains(text, "\x1b[") {
 				text = ansiCSIPattern.ReplaceAllString(text, "")
 			}
@@ -1367,14 +1340,14 @@ func cleanText(text, role string, inToolResult bool, prefixes []string, cfg plug
 		text = neutralizeTextNudges(text)
 	}
 	if cfg.Features.StripRestrictiveReminders && role != "assistant" {
-		text = stripHarnessNoise(text, st, cfg.Features)
+		text = stripHarnessNoise(text, cfg.Features)
 	}
 	return text
 }
 
 // cleanMessageBlock sanitizes one content block (text or tool_result with string or nested array
 // content) and returns the updated block, whether to keep it, and whether it changed.
-func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResult bool, prefixes []string, cfg pluginConfig, st *cleanState) (map[string]json.RawMessage, bool, bool) {
+func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResult bool, prefixes []string, cfg pluginConfig) (map[string]json.RawMessage, bool, bool) {
 	var blockType string
 	_ = json.Unmarshal(block["type"], &blockType)
 	if blockType == "tool_use" {
@@ -1387,7 +1360,7 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 		}
 		var innerText string
 		if firstJSONByte(rawInner) == '"' && json.Unmarshal(rawInner, &innerText) == nil {
-			updated := cleanText(innerText, role, true, nil, cfg, st)
+			updated := cleanText(innerText, role, true, nil, cfg)
 			if updated == innerText {
 				return block, true, false
 			}
@@ -1401,7 +1374,7 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 		outInner := make([]map[string]json.RawMessage, 0, len(innerBlocks))
 		innerChanged := false
 		for _, ib := range innerBlocks {
-			cleaned, keep, mod := cleanMessageBlock(ib, role, true, nil, cfg, st)
+			cleaned, keep, mod := cleanMessageBlock(ib, role, true, nil, cfg)
 			if mod || !keep {
 				innerChanged = true
 			}
@@ -1420,7 +1393,7 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 	if json.Unmarshal(block["text"], &blockText) != nil {
 		return block, true, false
 	}
-	updated := cleanText(blockText, role, inToolResult, prefixes, cfg, st)
+	updated := cleanText(blockText, role, inToolResult, prefixes, cfg)
 	if updated == blockText {
 		return block, true, false
 	}
@@ -1493,7 +1466,6 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessa
 	if errUnmarshal := json.Unmarshal(rawMessages, &messages); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode request messages: %w", errUnmarshal)
 	}
-	st := &cleanState{}
 	kept := make([]map[string]json.RawMessage, 0, len(messages))
 	changed := false
 	for _, msg := range messages {
@@ -1506,7 +1478,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessa
 		}
 		var text string
 		if json.Unmarshal(rawContent, &text) == nil {
-			updated := cleanText(text, role, false, prefixes, cfg, st)
+			updated := cleanText(text, role, false, prefixes, cfg)
 			if updated == text {
 				kept = append(kept, msg)
 				continue
@@ -1527,7 +1499,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessa
 		filtered := make([]map[string]json.RawMessage, 0, len(blocks))
 		blockChanged := false
 		for _, block := range blocks {
-			cleaned, keep, mod := cleanMessageBlock(block, role, false, prefixes, cfg, st)
+			cleaned, keep, mod := cleanMessageBlock(block, role, false, prefixes, cfg)
 			if mod || !keep {
 				blockChanged = true
 			}
@@ -1703,12 +1675,11 @@ func cleanMessagesWithoutSystemTurns(rawMessages json.RawMessage, cfg pluginConf
 	if errUnmarshal := json.Unmarshal(rawMessages, &messages); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode request messages: %w", errUnmarshal)
 	}
-	st := &cleanState{}
 	var out []byte
 	changed := false
 	kept := 0
 	for i, rawMsg := range messages {
-		updated, keep, errClean := cleanRawMessage(rawMsg, cfg, prefixes, st)
+		updated, keep, errClean := cleanRawMessage(rawMsg, cfg, prefixes)
 		if errClean != nil {
 			return nil, errClean
 		}
@@ -1752,7 +1723,7 @@ func firstJSONByte(raw []byte) byte {
 
 // cleanRawMessage cleans one message of a history without system turns and reports whether it is
 // kept. A message whose bytes hold nothing any rule could touch is returned as is.
-func cleanRawMessage(rawMsg json.RawMessage, cfg pluginConfig, prefixes []string, st *cleanState) (json.RawMessage, bool, error) {
+func cleanRawMessage(rawMsg json.RawMessage, cfg pluginConfig, prefixes []string) (json.RawMessage, bool, error) {
 	if !messagesNeedCleaning(rawMsg, cfg, prefixes) {
 		return rawMsg, true, nil
 	}
@@ -1768,7 +1739,7 @@ func cleanRawMessage(rawMsg json.RawMessage, cfg pluginConfig, prefixes []string
 	}
 	var text string
 	if firstJSONByte(rawContent) == '"' && json.Unmarshal(rawContent, &text) == nil {
-		updated := cleanText(text, role, false, prefixes, cfg, st)
+		updated := cleanText(text, role, false, prefixes, cfg)
 		if updated == text {
 			return rawMsg, true, nil
 		}
@@ -1786,7 +1757,7 @@ func cleanRawMessage(rawMsg json.RawMessage, cfg pluginConfig, prefixes []string
 	filtered := make([]map[string]json.RawMessage, 0, len(blocks))
 	blockChanged := false
 	for _, block := range blocks {
-		cleaned, keep, mod := cleanMessageBlock(block, role, false, prefixes, cfg, st)
+		cleaned, keep, mod := cleanMessageBlock(block, role, false, prefixes, cfg)
 		if mod || !keep {
 			blockChanged = true
 		}

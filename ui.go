@@ -780,8 +780,8 @@ const uiHTML = `<!doctype html>
         <label class="feature-item">
           <input type="checkbox" data-feature="strip_restrictive_system_reminders">
           <span>
-            <span class="feature-title">Strip harness noise (reminders by type, environment, sandbox, output style)</span>
-            <span class="feature-desc">Remove git status, environment, bash sandbox, model identity, latest-models, and command-output reminders, [SYSTEM NOTIFICATION] preambles, and the untrusted-archive and injection paragraphs. Replace Claude Code output-style reminders with one terse-output directive. Every other reminder is kept.</span>
+            <span class="feature-title">Strip harness noise (reminders by type, environment, sandbox)</span>
+            <span class="feature-desc">Remove git status, environment, bash sandbox, model identity, latest-models, and command-output reminders, [SYSTEM NOTIFICATION] preambles, and the untrusted-archive and injection paragraphs. Output-style reminders and every other reminder are kept.</span>
           </span>
         </label>
         <label class="feature-item">

@@ -101,6 +101,7 @@ type featureConfig struct {
 	StripReaDirectives            bool   `yaml:"strip_rea_directives" json:"strip_rea_directives"`
 	StripModelIdentity            bool   `yaml:"strip_model_identity" json:"strip_model_identity"`
 	SanitizeAgyText               bool   `yaml:"sanitize_agy_text" json:"sanitize_agy_text"`
+	HintOversizedReads            bool   `yaml:"hint_oversized_reads" json:"hint_oversized_reads"`
 }
 
 func (f featureConfig) effectiveNoticePrefix() string {
@@ -225,6 +226,7 @@ func defaultPluginConfig() pluginConfig {
 			StripReaDirectives:            true,
 			StripModelIdentity:            true,
 			SanitizeAgyText:               true,
+			HintOversizedReads:            true,
 		},
 	}
 }

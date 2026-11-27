@@ -805,6 +805,13 @@ const uiHTML = `<!doctype html>
             <span class="feature-desc">Per attempt on agy targets, replace non-printable runes (private-use and control characters) with U+FFFD in the system prompt and conversation, so agy's read_file does not reject the staged prompt.txt as binary.</span>
           </span>
         </label>
+        <label class="feature-item">
+          <input type="checkbox" data-feature="hint_oversized_reads">
+          <span>
+            <span class="feature-title">Hint oversized Read results</span>
+            <span class="feature-desc">When Claude Code's Read rejects a file as too large, append a note that a small limit still fails on files with very long lines and that Grep -n plus sed | cut reads them, so models stop retrying smaller limits.</span>
+          </span>
+        </label>
       </div>
       <div class="form-grid" style="margin-top: 14px;" id="noticePrefixForm">
         <label class="field"><span class="cfg-key">Client notice prefix</span>
@@ -1128,6 +1135,7 @@ const FEATURE_KEYS = [
   'strip_rea_directives',
   'strip_model_identity',
   'sanitize_agy_text',
+  'hint_oversized_reads',
 ];
 
 function featuresOf(cfg) {

@@ -277,6 +277,32 @@ func TestSanitizePreservesToolSourceCode(t *testing.T) {
 	requirePresent(t, text, claudeRefusalRetryNudge, claudeToolNotRunClassifier)
 }
 
+func TestOversizedReadResultGetsLongLineHint(t *testing.T) {
+	readErr := "File content (26401 tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file."
+	body := mustJSON(t, map[string]any{
+		"model": "claude-opus-5-5",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "read it"},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": map[string]any{"file_path": "/x.js", "offset": 1, "limit": 130}}}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": "toolu_1", "is_error": true, "content": readErr},
+			}},
+		},
+	})
+	text := jsonStrings(t, sanitize(t, body))
+	requirePresent(t, text, readErr+"\n"+oversizedReadHint)
+
+	cfg := defaultPluginConfig()
+	cfg.Features.HintOversizedReads = false
+	out, _, _, _, err := sanitizeRequest([]byte(body), http.Header{}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(jsonStrings(t, out), oversizedReadHint) {
+		t.Fatalf("hint added with hint_oversized_reads off")
+	}
+}
+
 func TestReminderRulesRemoveListedTypesAndKeepTheRest(t *testing.T) {
 	body := mustJSON(t, map[string]any{
 		"model": "claude-opus-5-5",

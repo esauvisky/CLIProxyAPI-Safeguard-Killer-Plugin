@@ -694,6 +694,7 @@ var (
 	systemNotificationPreamblePattern = regexp.MustCompile(
 		`(?is)\[SYSTEM NOTIFICATION\s*-\s*NOT USER INPUT\][ \t\r\n]*(?:This is an automated background-task event[^\n]*\n)?(?:Do NOT interpret[^\n]*\n)?(?:No human input has been received[^\n]*\n?)?[ \t\r\n]*`,
 	)
+	ansiCSIPattern = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
 	// A reminder is removed when its body starts with one of these. Everything else is kept, so
 	// reminder types added by future Claude Code versions pass through untouched.
@@ -883,7 +884,7 @@ func adaptPromptForModel(payload []byte, model string, cfg pluginConfig) ([]byte
 	if !changed {
 		return payload, nil
 	}
-	marshaled, errMarshal := json.Marshal(body)
+	marshaled, errMarshal := marshalNoEscape(body)
 	if errMarshal != nil {
 		return nil, fmt.Errorf("encode model-adapted request: %w", errMarshal)
 	}
@@ -917,6 +918,9 @@ func modelIsAgy(model string) bool {
 // the model cannot read its own request. Prompt text is meant to be readable, so this is lossless
 // for prose and code; only decorative private-use and control runes change.
 func sanitizeNonPrintableText(s string) string {
+	if strings.Contains(s, "\x1b[") {
+		s = ansiCSIPattern.ReplaceAllString(s, "")
+	}
 	if strings.IndexFunc(s, func(r rune) bool {
 		return r != '\n' && r != '\r' && r != '\t' && !unicode.IsPrint(r)
 	}) == -1 {
@@ -992,6 +996,17 @@ func rewriteSystemText(s string, st *cleanState, cfg pluginConfig) string {
 	return s
 }
 
+// marshalNoEscape encodes v as JSON without escaping <, >, and & into <, >, and &.
+func marshalNoEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
 // rewriteSystemFieldStrings applies fn to every string of a top-level system field and drops text
 // blocks that become empty, since upstreams reject empty text blocks.
 func rewriteSystemFieldStrings(raw json.RawMessage, fn func(string) string) (json.RawMessage, error) {
@@ -1006,13 +1021,11 @@ func rewriteSystemFieldStrings(raw json.RawMessage, fn func(string) string) (jso
 	if !changed {
 		return raw, nil
 	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if errEncode := enc.Encode(value); errEncode != nil {
+	out, errEncode := marshalNoEscape(value)
+	if errEncode != nil {
 		return nil, fmt.Errorf("encode system field: %w", errEncode)
 	}
-	return json.RawMessage(bytes.TrimRight(buf.Bytes(), "\n")), nil
+	return json.RawMessage(out), nil
 }
 
 func containsClassifierNudge(raw []byte) bool {
@@ -1082,6 +1095,9 @@ func cleanText(text, role string, inToolResult bool, prefixes []string, cfg plug
 		}
 		if cfg.Features.StripRestrictiveReminders {
 			text = stripSystemReminders(text, st)
+			if strings.Contains(text, "\x1b[") {
+				text = ansiCSIPattern.ReplaceAllString(text, "")
+			}
 		}
 		if cfg.Features.StripReaDirectives {
 			text = reaDataOnlyPattern.ReplaceAllString(text, "")
@@ -1120,7 +1136,7 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 			if updated == innerText {
 				return block, true, false
 			}
-			block["content"], _ = json.Marshal(strings.TrimSpace(updated))
+			block["content"], _ = marshalNoEscape(strings.TrimSpace(updated))
 			return block, true, true
 		}
 		var innerBlocks []map[string]json.RawMessage
@@ -1141,7 +1157,7 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 		if !innerChanged {
 			return block, true, false
 		}
-		block["content"], _ = json.Marshal(outInner)
+		block["content"], _ = marshalNoEscape(outInner)
 		return block, true, true
 	}
 
@@ -1156,7 +1172,7 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 	if strings.TrimSpace(updated) == "" {
 		return block, false, true
 	}
-	block["text"], _ = json.Marshal(strings.TrimSpace(updated))
+	block["text"], _ = marshalNoEscape(strings.TrimSpace(updated))
 	return block, true, true
 }
 
@@ -1202,7 +1218,7 @@ func messagesNeedCleaning(raw []byte, cfg pluginConfig, prefixes []string) bool 
 		for _, needle := range []string{
 			reminderOpen, "[SYSTEM NOTIFICATION", "# Environment", "## Bash command sandbox",
 			"You are powered by the model named", "Only you see that command's output",
-			"untrusted data:", "prompt-injection attempt:",
+			"untrusted data:", "prompt-injection attempt:", "\x1b[", `\u001b[`,
 		} {
 			if bytes.Contains(raw, []byte(needle)) {
 				return true
@@ -1245,7 +1261,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessa
 			if strings.TrimSpace(updated) == "" {
 				continue
 			}
-			msg["content"], _ = json.Marshal(strings.TrimSpace(updated))
+			msg["content"], _ = marshalNoEscape(strings.TrimSpace(updated))
 			kept = append(kept, msg)
 			continue
 		}
@@ -1270,7 +1286,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessa
 			if len(filtered) == 0 {
 				continue
 			}
-			msg["content"], _ = json.Marshal(filtered)
+			msg["content"], _ = marshalNoEscape(filtered)
 		}
 		kept = append(kept, msg)
 	}
@@ -1281,7 +1297,7 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessa
 	if !changed {
 		return rawMessages, nil
 	}
-	out, errMarshal := json.Marshal(normalized)
+	out, errMarshal := marshalNoEscape(normalized)
 	if errMarshal != nil {
 		return nil, fmt.Errorf("encode request messages: %w", errMarshal)
 	}
@@ -1318,7 +1334,7 @@ func foldSystemTurns(items []map[string]json.RawMessage) ([]map[string]json.RawM
 				changed = true
 				sysText := extractMessageText(items[i]["content"])
 				if strings.Contains(sysText, "<task-notification>") {
-					rawText, _ := json.Marshal(reminderOpen + "\n" + strings.TrimSpace(sysText) + "\n" + reminderClose)
+					rawText, _ := marshalNoEscape(reminderOpen + "\n" + strings.TrimSpace(sysText) + "\n" + reminderClose)
 					pendingTaskReminders = append(pendingTaskReminders, map[string]json.RawMessage{
 						"type": json.RawMessage(`"text"`),
 						"text": rawText,
@@ -1333,13 +1349,13 @@ func foldSystemTurns(items []map[string]json.RawMessage) ([]map[string]json.RawM
 					previous := out[len(out)-1]
 					if text, isText := singleTextContent(previous["content"]); isText && len(blocks) == 1 && blockIsText(blocks[0]) {
 						blockText := extractMessageText(items[i]["content"])
-						previous["content"], _ = json.Marshal(text + "\n\n" + blockText)
+						previous["content"], _ = marshalNoEscape(text + "\n\n" + blockText)
 					} else {
-						previous["content"], _ = json.Marshal(append(contentToBlocks(previous["content"]), blocks...))
+						previous["content"], _ = marshalNoEscape(append(contentToBlocks(previous["content"]), blocks...))
 					}
 				} else {
 					items[i]["role"] = json.RawMessage(`"user"`)
-					items[i]["content"], _ = json.Marshal(blocks)
+					items[i]["content"], _ = marshalNoEscape(blocks)
 					out = append(out, items[i])
 				}
 				continue
@@ -1348,7 +1364,7 @@ func foldSystemTurns(items []map[string]json.RawMessage) ([]map[string]json.RawM
 		if role == "user" && len(pendingTaskReminders) > 0 {
 			blocks := contentToBlocks(items[i]["content"])
 			blocks = append(blocks, pendingTaskReminders...)
-			items[i]["content"], _ = json.Marshal(blocks)
+			items[i]["content"], _ = marshalNoEscape(blocks)
 			pendingTaskReminders = nil
 			changed = true
 		}
@@ -1407,7 +1423,7 @@ func contentToBlocks(raw json.RawMessage) []map[string]json.RawMessage {
 	}
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
-		rawText, _ := json.Marshal(s)
+		rawText, _ := marshalNoEscape(s)
 		return []map[string]json.RawMessage{{
 			"type": json.RawMessage(`"text"`),
 			"text": rawText,
@@ -1459,11 +1475,11 @@ func withoutRedactedThinking(payload []byte, model string) ([]byte, error) {
 		if len(filtered) == 0 {
 			continue
 		}
-		msg["content"], _ = json.Marshal(filtered)
+		msg["content"], _ = marshalNoEscape(filtered)
 		kept = append(kept, msg)
 	}
-	body["messages"], _ = json.Marshal(kept)
-	return json.Marshal(body)
+	body["messages"], _ = marshalNoEscape(kept)
+	return marshalNoEscape(body)
 }
 
 // sanitizeRequest applies the enabled wire adaptations to a request body and headers, returning
@@ -1529,7 +1545,7 @@ func sanitizeRequest(payload []byte, headers http.Header, cfg pluginConfig) (bod
 			}
 		}
 		if bodyModified {
-			marshaled, errMarshal := json.Marshal(body)
+			marshaled, errMarshal := marshalNoEscape(body)
 			if errMarshal != nil {
 				return nil, nil, nil, false, fmt.Errorf("encode sanitized request: %w", errMarshal)
 			}

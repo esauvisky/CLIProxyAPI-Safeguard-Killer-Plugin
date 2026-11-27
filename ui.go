@@ -1387,7 +1387,7 @@ function groupFieldAttr(i, rest) {
 }
 
 const MODE_HINTS = {
-  quality: 'Quality first: score = quality.',
+  quality: 'Quality first: score = quality − first-token latency penalty (0 at 10s or less, up to 10 at 70s+).',
   speed: 'Speed first: score = (2 × speed + quality) ÷ 3.',
 };
 const GROUP_MODES = ['quality', 'speed'];
@@ -1396,6 +1396,16 @@ const GROUP_MODES = ['quality', 'speed'];
 // every enabled model is eligible.
 const SCORE_TOLERANCE = 3;
 const SCORE_TEMPERATURE = 1;
+const LATENCY_FREE_SEC = 10;
+const LATENCY_FULL_SEC = 70;
+const LATENCY_MAX_PENALTY = 10;
+
+function latencyPenalty(m) {
+  const stats = measuredSpeed(m.id);
+  if (!stats || !(stats.samples > 0) || !(stats.first_token_sec > LATENCY_FREE_SEC)) return 0;
+  const frac = (stats.first_token_sec - LATENCY_FREE_SEC) / (LATENCY_FULL_SEC - LATENCY_FREE_SEC);
+  return Math.round(LATENCY_MAX_PENALTY * Math.min(1, frac));
+}
 
 function draftModelScores(g) {
   const out = g.models.map(m => {
@@ -1404,8 +1414,9 @@ function draftModelScores(g) {
     const valid = Number.isFinite(q) && q >= 0 && q <= 100;
     if (m.disabled) return { valid: true, disabled: true };
     if (!valid || !GROUP_MODES.includes(g.mode)) return { valid: false };
-    const score = g.mode === 'quality' ? q : (2 * sp + q) / 3;
-    return { valid: true, disabled: false, score: score, probability: 0, gap: 0, inPool: false };
+    const penalty = g.mode === 'quality' ? latencyPenalty(m) : 0;
+    const score = g.mode === 'quality' ? Math.max(0, q - penalty) : (2 * sp + q) / 3;
+    return { valid: true, disabled: false, score: score, latencyPenalty: penalty, probability: 0, gap: 0, inPool: false };
   });
   let best = -Infinity;
   for (const e of out) if (e.valid && !e.disabled && e.score > best) best = e.score;
@@ -1488,7 +1499,8 @@ function renderScoreCell(e) {
   const windowLabel = e.inPool ? '<span class="badge ok">in pool</span>' : '<span class="badge">out of pool</span>';
   const gap = e.inPool ? '' : '<div class="model-meta">' + e.gap.toFixed(1) + ' below best</div>';
   const reliability = e.reliability && e.reliability < 100 ? '<div class="model-meta">reliability ' + e.reliability.toFixed(0) + '</div>' : '';
-  return '<div class="mono" style="font-size:14px;font-weight:700;">' + e.score.toFixed(1) + '</div>' + windowLabel + gap + reliability;
+  const latency = e.latencyPenalty > 0 ? '<div class="model-meta">−' + e.latencyPenalty.toFixed(0) + ' first-token latency</div>' : '';
+  return '<div class="mono" style="font-size:14px;font-weight:700;">' + e.score.toFixed(1) + '</div>' + windowLabel + gap + reliability + latency;
 }
 
 function renderShareCell(e) {

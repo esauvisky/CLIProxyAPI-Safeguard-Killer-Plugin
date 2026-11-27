@@ -1514,3 +1514,44 @@ func TestSpeedRatingScale(t *testing.T) {
 		}
 	}
 }
+
+func TestQualityModePenalizesFirstTokenLatency(t *testing.T) {
+	const slow = "latency-slow"
+	const fast = "latency-fast"
+	const mid = "latency-mid"
+	const unmeasured = "latency-unmeasured"
+	speedMu.Lock()
+	speedStats[slow] = &modelSpeedStats{Samples: 304, TokensPerSecond: 92, FirstTokenSec: 76}
+	speedStats[fast] = &modelSpeedStats{Samples: 143, TokensPerSecond: 52, FirstTokenSec: 3.9}
+	speedStats[mid] = &modelSpeedStats{Samples: 5, TokensPerSecond: 60, FirstTokenSec: 40}
+	speedMu.Unlock()
+	t.Cleanup(func() {
+		speedMu.Lock()
+		for _, m := range []string{slow, fast, mid} {
+			delete(speedStats, m)
+		}
+		speedMu.Unlock()
+	})
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: []groupModel{
+		{ID: slow, Quality: 58.6}, {ID: fast, Quality: 58.2}, {ID: mid, Quality: 50}, {ID: unmeasured, Quality: 50},
+	}}
+	scores := scoreModels(group)
+	want := map[string][2]float64{slow: {10, 48.6}, fast: {0, 58.2}, mid: {5, 45}, unmeasured: {0, 50}}
+	for _, s := range scores {
+		w := want[s.Model]
+		if s.LatencyPenalty != w[0] || math.Abs(s.Score-w[1]) > 1e-9 {
+			t.Fatalf("%s penalty %v score %v, want %v and %v", s.Model, s.LatencyPenalty, s.Score, w[0], w[1])
+		}
+	}
+	setSelectionProbabilities(scores, "", false)
+	if scores[1].Probability != 1 || scores[0].Probability != 0 {
+		t.Fatalf("selection = %+v, want only the fast model in the pool", scores)
+	}
+
+	group.Mode = groupModeSpeed
+	for _, s := range scoreModels(group) {
+		if s.LatencyPenalty != 0 {
+			t.Fatalf("speed mode applied the quality latency penalty: %+v", s)
+		}
+	}
+}

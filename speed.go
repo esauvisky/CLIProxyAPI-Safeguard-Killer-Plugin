@@ -26,6 +26,12 @@ const (
 	speedFastFirstTokenSec  = 3.0
 	speedSlowFirstTokenSec  = 23.0
 	speedMaxFirstTokenPenal = 20.0
+	// Quality mode subtracts up to qualityLatencyMaxPenalty points from a model whose measured
+	// first-token latency exceeds qualityLatencyFreeSec, reaching the full penalty at
+	// qualityLatencyFullSec, so a model that makes every turn wait a minute stops tying a fast one.
+	qualityLatencyFreeSec    = 10.0
+	qualityLatencyFullSec    = 70.0
+	qualityLatencyMaxPenalty = 10.0
 	// Reliability penalties subtract up to reliabilityMaxPenalty quality points from a model whose
 	// refusal, empty-response, or loop rate reaches reliabilityFullPenaltyRate.
 	reliabilityMaxPenalty      = 15.0
@@ -98,6 +104,19 @@ func measuredModelSpeed(model string) float64 {
 		return speedUnmeasuredRating
 	}
 	return speedRatingWithTTFT(stats.TokensPerSecond, stats.FirstTokenSec)
+}
+
+// firstTokenLatencyPenalty returns the quality points quality mode subtracts for model's measured
+// first-token latency. A model without samples has no measured latency and no penalty.
+func firstTokenLatencyPenalty(model string) float64 {
+	speedMu.RLock()
+	stats := speedStats[model]
+	speedMu.RUnlock()
+	if stats == nil || stats.Samples == 0 || stats.FirstTokenSec <= qualityLatencyFreeSec {
+		return 0
+	}
+	frac := (stats.FirstTokenSec - qualityLatencyFreeSec) / (qualityLatencyFullSec - qualityLatencyFreeSec)
+	return math.Round(qualityLatencyMaxPenalty * math.Min(1, frac))
 }
 
 // reliabilityRating returns the fraction of attempts that succeeded without a refusal, empty

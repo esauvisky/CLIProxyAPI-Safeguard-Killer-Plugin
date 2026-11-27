@@ -171,9 +171,11 @@ type modelScore struct {
 	Quality     float64 `json:"quality"`
 	Speed       float64 `json:"speed,omitempty"`
 	Reliability float64 `json:"reliability,omitempty"`
-	Score       float64 `json:"score"`
-	Probability float64 `json:"probability"`
-	Excluded    string  `json:"excluded,omitempty"`
+	// LatencyPenalty is the quality-mode deduction for measured first-token latency.
+	LatencyPenalty float64 `json:"latency_penalty,omitempty"`
+	Score          float64 `json:"score"`
+	Probability    float64 `json:"probability"`
+	Excluded       string  `json:"excluded,omitempty"`
 }
 
 func scoreModels(group modelGroup) []modelScore {
@@ -184,17 +186,19 @@ func scoreModels(group modelGroup) []modelScore {
 		}
 		quality := qualityRatingWithReliability(model.ID, model.Quality)
 		speed := 0.0
+		latencyPenalty := 0.0
 		var score float64
 		switch group.Mode {
 		case groupModeQuality:
-			score = quality
+			latencyPenalty = firstTokenLatencyPenalty(model.ID)
+			score = math.Max(0, quality-latencyPenalty)
 		case groupModeSpeed:
 			speed = measuredModelSpeed(model.ID)
 			score = (2*speed + quality) / 3
 		default:
 			panic(fmt.Errorf("group %s has invalid mode %q", group.ID, group.Mode))
 		}
-		scores = append(scores, modelScore{Model: model.ID, Quality: model.Quality, Speed: speed, Reliability: reliabilityRating(measuredStats(model.ID)), Score: score})
+		scores = append(scores, modelScore{Model: model.ID, Quality: model.Quality, Speed: speed, Reliability: reliabilityRating(measuredStats(model.ID)), LatencyPenalty: latencyPenalty, Score: score})
 	}
 	return scores
 }

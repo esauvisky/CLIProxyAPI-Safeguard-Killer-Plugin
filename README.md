@@ -54,17 +54,19 @@ Once a model answers, the conversation stays on it:
 - **Session-Scoped Capability Memory:** Models that fail with `no tools`, `not found`, `no vision` (while images are in payload), or `context too long` (until compaction shrinks the payload) are skipped automatically without re-trying.
 
 ### Model Selection (`mode`, `quality`, measured speed)
-Each Smart Group needs an explicit `mode`, and each model in it needs a `quality` rating from `0` to `100`. Higher `quality` is better. Only `speed` mode also scores the measured speed rating; `quality` mode ignores it. The order of `models` has no effect on selection.
+Each Smart Group needs an explicit `mode`, and each model in it needs a `quality` rating from `0` to `100`. Higher `quality` is better. Only `speed` mode scores the measured speed rating; `quality` mode uses only measured first-token latency, as a penalty. The order of `models` has no effect on selection.
 
 | `mode` | UI label | Score |
 | --- | --- | --- |
-| `quality` | Quality first | `quality` |
+| `quality` | Quality first | `quality − latency penalty` |
 | `speed` | Speed first | `(2 × speed + quality) ÷ 3` |
 
 A new conversation, or one reset by compaction, scores every eligible model (excluding refused, capability-incompatible, and unavailable models). Only models within `3` points of the best score stay in the pool, and one is picked by softmax over their scores with temperature `1`. Models farther from the best get no traffic. The pick then stays sticky as described above. When it refuses or becomes unusable, the remaining eligible models are scored the same way.
 
 ### Reliability scoring & cache-warmth bonus
 Configured `quality` is a prior; measured reliability adjusts it. Each model accumulates attempts plus three failure classes observed from real responses: **refusals** (`refusal` / `refusal: *`), **empty responses**, and **loop turns** (a served turn emitting 25 or more tool calls). The failure rate `(refusals + empty + loops) / attempts` subtracts up to `15` quality points at a `0.5` failure rate, so a model that refuses or loops often no longer ties a clean model at the same Artificial Analysis score. Quota, capability, and transient errors do not count against reliability.
+
+In `quality` mode, measured first-token latency (the EWMA learned from served responses) subtracts up to `10` points: none at `10s` or less, rising linearly to the full `10` at `70s` or more. A model that makes every turn wait a minute before any output no longer ties a model that answers in seconds; models without samples are not penalized.
 
 While a conversation's provider prefix cache is live (`cache_read_input_tokens` or `cache_creation_input_tokens` observed on the served model), the pinned model's score receives a `+2` bonus. A competitor must then beat it by more than `2` points before selection invalidates the cache. Compaction clears the bonus.
 

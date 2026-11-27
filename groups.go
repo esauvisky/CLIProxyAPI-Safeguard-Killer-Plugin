@@ -236,13 +236,13 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 			}
 		}
 		attempts = append(attempts, groupAttempt{Model: model, Result: "served", Duration: time.Since(attemptStart)})
+		bodyOut := salvageFencedToolCallsNonStream(resp.Body, effectiveFormat(req.Format, req.SourceFormat))
 		if !aux {
-			recordModelSpeedResponse(model, resp.Body, attemptStart, time.Now())
+			recordModelSpeedResponse(model, bodyOut, attemptStart, time.Now())
 		}
 		recordGroupDecision(group, session, attempts, model, plan.SelectedScores)
-		bodyOut := resp.Body
 		prevModel := recordServed(cfg, session, group.ID, model, prevLookupModel, req.Payload, time.Now())
-		observeConversationUsage(session, group.ID, resp.Body)
+		observeConversationUsage(session, group.ID, bodyOut)
 		if !aux {
 			// Without a session identity every turn looks new, so only identified conversations announce a start.
 			started := session != "" && prevModel == ""

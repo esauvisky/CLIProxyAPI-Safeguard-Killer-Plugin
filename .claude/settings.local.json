@@ -1,0 +1,21 @@
+{
+  "skillOverrides": {
+    "dbs-goal": "off",
+    "define-goal": "off",
+    "docs": "off",
+    "docx": "off",
+    "google-workspace": "off",
+    "import-memory": "off",
+    "morning": "off",
+    "pdf": "off",
+    "playstore": "off",
+    "pptx": "off",
+    "prelude": "off",
+    "skill-creator": "off",
+    "xlsx": "off",
+    "re-android": "off",
+    "refactor-plan": "off",
+    "reverse-engineer-anything": "user-invocable-only",
+    "compress-commits": "user-invocable-only"
+  }
+}

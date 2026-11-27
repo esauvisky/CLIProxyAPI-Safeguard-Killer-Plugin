@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -20,13 +21,26 @@ type streamInterceptResponse struct {
 	DropChunk bool
 }
 
+type claudeRawFrame struct {
+	kind  string
+	start int
+	end   int
+}
+
 type claudeStreamBlock struct {
 	kind   string
 	index  int
 	output int
-	frames []map[string]json.RawMessage
+	frames []claudeRawFrame
+	rawBuf []byte
 	text   strings.Builder
 	sealed bool
+}
+
+func (b *claudeStreamBlock) appendFrame(kind string, payload []byte) {
+	start := len(b.rawBuf)
+	b.rawBuf = append(b.rawBuf, payload...)
+	b.frames = append(b.frames, claudeRawFrame{kind: kind, start: start, end: len(b.rawBuf)})
 }
 
 type claudeStreamState struct {
@@ -86,67 +100,98 @@ func normalizeClaudeStream(requestID string, body []byte) ([]byte, error) {
 		state = &claudeStreamState{}
 		claudeStreams.states[requestID] = state
 	}
-	state.pending = append(state.pending, body...)
+	buf := body
+	if len(state.pending) > 0 {
+		state.pending = append(state.pending, body...)
+		buf = state.pending
+	}
 	var out bytes.Buffer
 	for {
-		end := bytes.IndexByte(state.pending, '\n')
+		end := bytes.IndexByte(buf, '\n')
 		if end < 0 {
 			break
 		}
-		line := bytes.TrimSuffix(state.pending[:end], []byte("\r"))
+		line := buf[:end]
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
 		if len(line) == 0 {
 			if err := state.processFrame(state.frame, &out); err != nil {
 				delete(claudeStreams.states, requestID)
 				return nil, fmt.Errorf("normalize Claude stream %s: %w", requestID, err)
 			}
-			state.frame = nil
+			state.frame = state.frame[:0]
 		} else {
 			state.frame = append(state.frame, line...)
 			state.frame = append(state.frame, '\n')
 		}
-		state.pending = state.pending[end+1:]
+		buf = buf[end+1:]
 	}
-	if len(state.pending) == 0 {
+	if len(buf) == 0 {
 		state.pending = nil
+	} else if len(state.pending) > 0 {
+		state.pending = append(state.pending[:0], buf...)
+	} else {
+		state.pending = append([]byte(nil), buf...)
 	}
 	return out.Bytes(), nil
 }
 
 func (s *claudeStreamState) processFrame(frame []byte, out *bytes.Buffer) error {
-	var data [][]byte
-	for _, line := range bytes.Split(frame, []byte("\n")) {
+	var firstData []byte
+	var extraData [][]byte
+	rem := frame
+	for len(rem) > 0 {
+		var line []byte
+		if nl := bytes.IndexByte(rem, '\n'); nl >= 0 {
+			line = rem[:nl]
+			rem = rem[nl+1:]
+		} else {
+			line = rem
+			rem = nil
+		}
 		if bytes.HasPrefix(line, []byte("data:")) {
-			data = append(data, bytes.TrimPrefix(line[5:], []byte(" ")))
+			d := line[5:]
+			if len(d) > 0 && d[0] == ' ' {
+				d = d[1:]
+			}
+			if firstData == nil {
+				firstData = d
+			} else {
+				if extraData == nil {
+					extraData = [][]byte{firstData}
+				}
+				extraData = append(extraData, d)
+			}
 		}
 	}
-	if len(data) == 0 {
+	if firstData == nil {
 		if len(frame) > 0 {
 			out.Write(frame)
 			out.WriteByte('\n')
 		}
 		return nil
 	}
-	payload := bytes.Join(data, []byte("\n"))
-	var event map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &event); err != nil {
-		return fmt.Errorf("decode SSE data: %w", err)
+	payload := firstData
+	if extraData != nil {
+		payload = bytes.Join(extraData, []byte("\n"))
 	}
 	var fields struct {
-		Type         string
-		Index        int
+		Type         string `json:"type"`
+		Index        int    `json:"index"`
 		ContentBlock struct {
-			Type      string
-			Text      string
-			Signature string
-			Citations []json.RawMessage
+			Type      string            `json:"type"`
+			Text      string            `json:"text"`
+			Signature string            `json:"signature"`
+			Citations []json.RawMessage `json:"citations"`
 		} `json:"content_block"`
 		Delta struct {
-			Type string
-			Text string
-		}
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"delta"`
 	}
 	if err := json.Unmarshal(payload, &fields); err != nil {
-		return fmt.Errorf("decode Claude event: %w", err)
+		return fmt.Errorf("decode SSE data: %w", err)
 	}
 	switch fields.Type {
 	case "content_block_start":
@@ -166,7 +211,7 @@ func (s *claudeStreamState) processFrame(frame []byte, out *bytes.Buffer) error 
 		block := &claudeStreamBlock{kind: kind, index: fields.Index}
 		s.active = block
 		if buffered {
-			block.frames = append(block.frames, event)
+			block.appendFrame(fields.Type, payload)
 			block.text.WriteString(fields.ContentBlock.Text)
 			s.segment = append(s.segment, block)
 			// Signed thinking and annotated text must retain their original block boundaries.
@@ -175,7 +220,7 @@ func (s *claudeStreamState) processFrame(frame []byte, out *bytes.Buffer) error 
 		}
 		block.output = s.next
 		s.next++
-		return emitClaudeStreamEvent(out, event, block.output)
+		return emitClaudeRawOrReindex(out, fields.Type, payload, fields.Index, block.output)
 	case "content_block_delta", "content_block_stop":
 		if s.active == nil {
 			// Mid-stream plugin reload or late stream attachment can join a stream after
@@ -197,7 +242,7 @@ func (s *claudeStreamState) processFrame(frame []byte, out *bytes.Buffer) error 
 		}
 		buffered := len(block.frames) > 0
 		if buffered {
-			block.frames = append(block.frames, event)
+			block.appendFrame(fields.Type, payload)
 			if fields.Type == "content_block_delta" {
 				if block.kind == "text" && fields.Delta.Type == "text_delta" {
 					block.text.WriteString(fields.Delta.Text)
@@ -205,7 +250,7 @@ func (s *claudeStreamState) processFrame(frame []byte, out *bytes.Buffer) error 
 					s.preserve = true
 				}
 			}
-		} else if err := emitClaudeStreamEvent(out, event, block.output); err != nil {
+		} else if err := emitClaudeRawOrReindex(out, fields.Type, payload, fields.Index, block.output); err != nil {
 			return err
 		}
 		if fields.Type == "content_block_stop" {
@@ -221,16 +266,19 @@ func (s *claudeStreamState) processFrame(frame []byte, out *bytes.Buffer) error 
 			return err
 		}
 		if fields.Type == "message_delta" && s.salvagedToolUse {
-			var delta map[string]json.RawMessage
-			if json.Unmarshal(event["delta"], &delta) == nil {
-				delta["stop_reason"] = json.RawMessage(`"tool_use"`)
-				if encodedDelta, err := json.Marshal(delta); err == nil {
-					event["delta"] = encodedDelta
-					if encodedEvent, err := json.Marshal(event); err == nil {
-						out.WriteString("event: message_delta\ndata: ")
-						out.Write(encodedEvent)
-						out.WriteString("\n\n")
-						return nil
+			var event map[string]json.RawMessage
+			if json.Unmarshal(payload, &event) == nil {
+				var delta map[string]json.RawMessage
+				if json.Unmarshal(event["delta"], &delta) == nil {
+					delta["stop_reason"] = json.RawMessage(`"tool_use"`)
+					if encodedDelta, err := json.Marshal(delta); err == nil {
+						event["delta"] = encodedDelta
+						if encodedEvent, err := json.Marshal(event); err == nil {
+							out.WriteString("event: message_delta\ndata: ")
+							out.Write(encodedEvent)
+							out.WriteString("\n\n")
+							return nil
+						}
 					}
 				}
 			}
@@ -254,14 +302,15 @@ func (s *claudeStreamState) flush(out *bytes.Buffer) error {
 		for _, block := range s.segment {
 			if block.kind == "text" && block.sealed && len(block.frames) > 0 && strings.Contains(block.text.String(), "```tool_calls") {
 				if calls, prefix, suffix, ok := extractFencedToolCalls(block.text.String()); ok {
-					if err := s.emitSalvagedToolCalls(out, block.frames[0], calls, prefix, suffix); err != nil {
+					firstText := block.rawBuf[block.frames[0].start:block.frames[0].end]
+					if err := s.emitSalvagedToolCalls(out, firstText, calls, prefix, suffix); err != nil {
 						return err
 					}
 					continue
 				}
 			}
-			for _, event := range block.frames {
-				if err := emitClaudeStreamEvent(out, event, s.next); err != nil {
+			for _, f := range block.frames {
+				if err := emitClaudeRawOrReindex(out, f.kind, block.rawBuf[f.start:f.end], block.index, s.next); err != nil {
 					return err
 				}
 			}
@@ -269,17 +318,17 @@ func (s *claudeStreamState) flush(out *bytes.Buffer) error {
 		}
 	} else {
 		var text strings.Builder
-		var firstText map[string]json.RawMessage
+		var firstText []byte
 		for _, block := range s.segment {
 			if block.kind == "text" {
 				if firstText == nil {
-					firstText = block.frames[0]
+					firstText = block.rawBuf[block.frames[0].start:block.frames[0].end]
 				}
 				text.WriteString(block.text.String())
 				continue
 			}
-			for _, event := range block.frames {
-				if err := emitClaudeStreamEvent(out, event, s.next); err != nil {
+			for _, f := range block.frames {
+				if err := emitClaudeRawOrReindex(out, f.kind, block.rawBuf[f.start:f.end], block.index, s.next); err != nil {
 					return err
 				}
 			}
@@ -301,7 +350,7 @@ func (s *claudeStreamState) flush(out *bytes.Buffer) error {
 	return nil
 }
 
-func (s *claudeStreamState) emitSalvagedToolCalls(out *bytes.Buffer, firstText map[string]json.RawMessage, calls []salvagedToolCall, prefix, suffix string) error {
+func (s *claudeStreamState) emitSalvagedToolCalls(out *bytes.Buffer, firstText []byte, calls []salvagedToolCall, prefix, suffix string) error {
 	if strings.TrimSpace(prefix) != "" {
 		if err := s.emitMergedTextBlock(out, firstText, strings.TrimRight(prefix, " \t\r\n")); err != nil {
 			return err
@@ -352,19 +401,19 @@ func (s *claudeStreamState) emitSalvagedToolCalls(out *bytes.Buffer, firstText m
 	return nil
 }
 
-func (s *claudeStreamState) emitMergedTextBlock(out *bytes.Buffer, firstText map[string]json.RawMessage, text string) error {
+func (s *claudeStreamState) emitMergedTextBlock(out *bytes.Buffer, firstText []byte, text string) error {
+	var startEvent map[string]json.RawMessage
+	if err := json.Unmarshal(firstText, &startEvent); err != nil {
+		return fmt.Errorf("decode text block start: %w", err)
+	}
 	var content map[string]json.RawMessage
-	if err := json.Unmarshal(firstText["content_block"], &content); err != nil {
+	if err := json.Unmarshal(startEvent["content_block"], &content); err != nil {
 		return fmt.Errorf("decode text block: %w", err)
 	}
 	content["text"] = json.RawMessage(`""`)
 	encoded, err := json.Marshal(content)
 	if err != nil {
 		return err
-	}
-	startEvent := make(map[string]json.RawMessage, len(firstText))
-	for k, v := range firstText {
-		startEvent[k] = v
 	}
 	startEvent["content_block"] = encoded
 	if err := emitClaudeStreamEvent(out, startEvent, s.next); err != nil {
@@ -387,8 +436,24 @@ func (s *claudeStreamState) emitMergedTextBlock(out *bytes.Buffer, firstText map
 	return nil
 }
 
+func emitClaudeRawOrReindex(out *bytes.Buffer, kind string, payload []byte, srcIndex, dstIndex int) error {
+	if srcIndex == dstIndex && bytes.Contains(payload, []byte(`"index"`)) {
+		out.WriteString("event: ")
+		out.WriteString(kind)
+		out.WriteString("\ndata: ")
+		out.Write(payload)
+		out.WriteString("\n\n")
+		return nil
+	}
+	var event map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &event); err != nil {
+		return fmt.Errorf("decode SSE data: %w", err)
+	}
+	return emitClaudeStreamEvent(out, event, dstIndex)
+}
+
 func emitClaudeStreamEvent(out *bytes.Buffer, event map[string]json.RawMessage, index int) error {
-	event["index"] = json.RawMessage(fmt.Sprintf("%d", index))
+	event["index"] = json.RawMessage(strconv.Itoa(index))
 	payload, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("encode Claude event: %w", err)

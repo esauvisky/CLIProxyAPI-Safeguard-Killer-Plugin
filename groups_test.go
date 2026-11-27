@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -202,17 +204,57 @@ func TestExecuteGroupStreamForwardsChunks(t *testing.T) {
 	}
 }
 
-func TestWithModelKeepsBodiesWithoutModelField(t *testing.T) {
-	out, errSet := withModel([]byte(`{"contents":[]}`), "m")
+func TestAttemptBodyKeepsBodiesWithoutModelField(t *testing.T) {
+	cfg := defaultPluginConfig()
+	out, errSet := attemptBody([]byte(`{"contents":[]}`), "m", cfg)
 	if errSet != nil || string(out) != `{"contents":[]}` {
-		t.Fatalf("withModel = %s, %v", out, errSet)
+		t.Fatalf("attemptBody = %s, %v", out, errSet)
 	}
-	out, errSet = withModel([]byte(`{"model":"old","fallbacks":"default"}`), "new")
+	out, errSet = attemptBody([]byte(`{"model":"old","fallbacks":"default"}`), "new", cfg)
 	if errSet != nil || string(out) != `{"fallbacks":"default","model":"new"}` {
-		t.Fatalf("withModel changed fields besides model = %s, %v", out, errSet)
+		t.Fatalf("attemptBody changed fields besides model = %s, %v", out, errSet)
 	}
-	if _, errSet := withModel([]byte(`not json`), "m"); errSet == nil {
-		t.Fatalf("withModel(non-JSON) error = nil")
+	if _, errSet := attemptBody([]byte(`not json`), "m", cfg); errSet == nil {
+		t.Fatalf("attemptBody(non-JSON) error = nil")
+	}
+}
+
+func TestSanitizeHistoryNonPrintableMatchesTreeWalk(t *testing.T) {
+	cases := []string{
+		`[{"role":"user","content":"plain"}]`,
+		`[{"role":"user","content":"\u001b[32mgreen\u001b[0m and \u0007 bell"}]`,
+		`[{"role":"user","content":[{"type":"text","text":"ok  glyph"},{"type":"text","text":"\u0001"}]}]`,
+		`[{"role":"user","content":"tab\tnew\nline \"q\" \\ \/ é ✓"}]`,
+		`[{"role":"user","content":[{"type":"tool_result","content":"\u001b[1m\u001b[0m"}]}]`,
+		`[{"role":"user","content":"  "}, {"k\u0001":"v"}]`,
+		string(makeMultiTurnBenchPayload(true)),
+	}
+	for _, raw := range cases {
+		if raw[0] == '{' {
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(raw), &body); err != nil {
+				t.Fatal(err)
+			}
+			raw = string(body["messages"])
+		}
+		got, errGot := sanitizeHistoryNonPrintable(json.RawMessage(raw))
+		want, errWant := rewriteSystemFieldStrings(json.RawMessage(raw), sanitizeNonPrintableText)
+		if errGot != nil || errWant != nil {
+			t.Fatalf("errors %v / %v for %s", errGot, errWant, raw)
+		}
+		var gotV, wantV any
+		if err := json.Unmarshal(got, &gotV); err != nil {
+			t.Fatalf("invalid output %s: %v", got, err)
+		}
+		if err := json.Unmarshal(want, &wantV); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(gotV, wantV) {
+			t.Fatalf("mismatch for %s\n got %s\nwant %s", raw, got, want)
+		}
+		if bytes.Equal(want, json.RawMessage(raw)) && !bytes.Equal(got, json.RawMessage(raw)) {
+			t.Fatalf("clean history changed bytes: %s -> %s", raw, got)
+		}
 	}
 }
 

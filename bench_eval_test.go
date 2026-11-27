@@ -410,3 +410,130 @@ func BenchmarkQualityMetricsCorpus(b *testing.B) {
 		}
 	}
 }
+
+func makeMultiTurnBenchPayload(dirtyToolResults bool) []byte {
+	var msgs []map[string]any
+	for i := 0; i < 20; i++ {
+		toolContent := "file1.go\ndir\nok\n"
+		if dirtyToolResults {
+			toolContent = "\x1b[32mfile1.go\x1b[0m\n\x1b[34mdir\x1b[0m\nIcon="
+		}
+		msgs = append(msgs,
+			map[string]any{"role": "user", "content": reminder("# Environment\n - Primary working directory: /x") + "run test"},
+			map[string]any{"role": "assistant", "content": []any{
+				map[string]any{"type": "text", "text": defaultNoticePrefix + "`a` → `b`\n\nok"},
+				map[string]any{"type": "tool_use", "id": fmt.Sprintf("t_%d", i), "name": "Bash", "input": map[string]any{"command": "ls --color=always"}},
+			}},
+			map[string]any{"role": "user", "content": []any{
+				map[string]any{"type": "tool_result", "tool_use_id": fmt.Sprintf("t_%d", i), "content": toolContent},
+			}},
+		)
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"model":    "groups/speed-first",
+		"system":   []any{map[string]any{"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude.\n" + testCyberGate}},
+		"messages": msgs,
+	})
+	return payload
+}
+
+func BenchmarkSanitizeRequestMultiTurn(b *testing.B) {
+	cfg := defaultPluginConfig()
+	payload := makeMultiTurnBenchPayload(true)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, _, _, err := sanitizeRequest(payload, http.Header{}, cfg); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkAdaptPromptForModel(b *testing.B) {
+	cfg := defaultPluginConfig()
+	dirtySan, _, _, _, err := sanitizeRequest(makeMultiTurnBenchPayload(true), http.Header{}, cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	cleanSan, _, _, _, err := sanitizeRequest(makeMultiTurnBenchPayload(false), http.Header{}, cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		model   string
+		payload []byte
+	}{
+		{"agy-dirty", "agy/gemini-4-neon", dirtySan},
+		{"agy-clean", "agy/gemini-4-neon", cleanSan},
+		{"non-claude", "kimi-k3.1-pro", cleanSan},
+		{"claude-fable", "claude-fable-5-2", cleanSan},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(len(tc.payload)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := adaptPromptForModel(tc.payload, tc.model, cfg); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkNormalizeClaudeStream200Deltas(b *testing.B) {
+	var frames []map[string]any
+	frames = append(frames, map[string]any{"type": "message_start", "message": map[string]any{"id": "msg_1", "role": "assistant"}})
+	frames = append(frames, streamTestStart(0, map[string]any{"type": "thinking", "thinking": ""}))
+	for i := 0; i < 100; i++ {
+		frames = append(frames, streamTestDelta(0, map[string]any{"type": "thinking_delta", "thinking": "reasoning token "}))
+	}
+	frames = append(frames, streamTestStop(0))
+	frames = append(frames, streamTestStart(1, map[string]any{"type": "text", "text": ""}))
+	for i := 0; i < 100; i++ {
+		frames = append(frames, streamTestDelta(1, map[string]any{"type": "text_delta", "text": "answer token "}))
+	}
+	frames = append(frames, streamTestStop(1))
+	frames = append(frames,
+		map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 200}},
+		map[string]any{"type": "message_stop"},
+	)
+	chunks := make([][]byte, len(frames))
+	totalBytes := 0
+	for i, f := range frames {
+		raw, _ := json.Marshal(f)
+		chunks[i] = append(append([]byte("event: "+f["type"].(string)+"\ndata: "), raw...), []byte("\n\n")...)
+		totalBytes += len(chunks[i])
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(totalBytes))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		const id = "bench-stream"
+		for _, ch := range chunks {
+			if _, err := normalizeClaudeStream(id, ch); err != nil {
+				b.Fatal(err)
+			}
+		}
+		cleanupClaudeStream(id)
+	}
+}
+
+func BenchmarkForwardStreamChunkHooks(b *testing.B) {
+	deltaChunk := []byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello world token \"}}\n\n")
+	seenIDs := make(map[string]bool)
+	toolIDs := make(map[string]bool)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(deltaChunk) * 200))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 200; j++ {
+			_ = outputTokensFromChunk(deltaChunk)
+			collectToolUseIDsFromChunk(deltaChunk, toolIDs)
+			observeConversationUsage("", "", deltaChunk)
+			_ = processStreamSafeguardChunk(deltaChunk, seenIDs, true)
+		}
+	}
+}

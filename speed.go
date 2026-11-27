@@ -316,6 +316,9 @@ func recordModelSpeedResponse(model string, body []byte, started, finished time.
 // outputTokensFromChunk finds the largest output-token count in a response body or SSE chunk. Stream
 // usage is cumulative, so taking the largest avoids double counting incremental usage frames.
 func outputTokensFromChunk(chunk []byte) int {
+	if !bytes.Contains(chunk, []byte(`"usage"`)) && !bytes.Contains(chunk, []byte(`"usageMetadata"`)) {
+		return 0
+	}
 	maxTokens := 0
 	for _, raw := range responseJSONLines(chunk) {
 		if tokens := outputTokensFromJSON(raw); tokens > maxTokens {

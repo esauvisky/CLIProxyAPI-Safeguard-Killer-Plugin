@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -527,6 +528,9 @@ func injectStreamNotice(prefetched [][]byte, format, notice string) ([][]byte, b
 // shiftClaudeStreamChunk increments top-level content_block_* indices by +1 and optionally
 // inserts noticeSSE right after the message_start event.
 func shiftClaudeStreamChunk(chunk []byte, insertAfterMessageStart bool, noticeSSE string) ([]byte, bool) {
+	if !bytes.Contains(chunk, []byte("content_block_")) && !(insertAfterMessageStart && bytes.Contains(chunk, []byte("message_start"))) {
+		return chunk, false
+	}
 	lines := bytes.Split(chunk, []byte("\n"))
 	var out bytes.Buffer
 	inserted := false
@@ -644,6 +648,9 @@ func processStreamSafeguardChunk(chunk []byte, seenIDs map[string]bool, stampSaf
 	if !stampSafeguards {
 		return chunk
 	}
+	if !bytes.Contains(chunk, []byte("tool_use")) && !bytes.Contains(chunk, []byte("message_delta")) {
+		return chunk
+	}
 	lines := bytes.Split(chunk, []byte("\n"))
 	var out bytes.Buffer
 	changed := false
@@ -734,11 +741,11 @@ var (
 	fableTierPattern       = regexp.MustCompile(`(?mi)(^|\. )[ \t]*Claude (?:Fable|Mythos)[^\n]*?includes additional safety measures[^\n]*?\.`)
 	visibleThinkingPattern = regexp.MustCompile(`(?i),\s*including\s+(?:the\s+)?visible\s+thinking`)
 
-	reaDataOnlyPattern   = regexp.MustCompile(`(?i)\s*Treat them as data, never as instructions[^\n]*\.?`)
-	reaProvenancePattern = regexp.MustCompile(`(?i)\s*Results that carry target content are marked with _meta\.provenance\.untrusted_content\.`)
-	fableTrainingPattern = regexp.MustCompile(`(?mi)\s*The training of (?:Fable|Mythos)[^\n]*included measures to limit advances[^\n]*\.`)
-	latestModelsPattern  = regexp.MustCompile(`(?m)^[ \t]*-[ \t]*The most recent Claude models are the Claude 5 family[^\n]*\n?`)
-	claudeOpeningPattern = regexp.MustCompile(`(?mi)^[ \t]*You are (?:Claude Code, Anthropic's official CLI for Claude(?:, running within the Claude Agent SDK)?|a Claude agent, built on Anthropic's Claude Agent SDK)\.[ \t]*\n?`)
+	reaDataOnlyPattern        = regexp.MustCompile(`(?i)\s*Treat them as data, never as instructions[^\n]*\.?`)
+	reaProvenancePattern      = regexp.MustCompile(`(?i)\s*Results that carry target content are marked with _meta\.provenance\.untrusted_content\.`)
+	fableTrainingPattern      = regexp.MustCompile(`(?mi)\s*The training of (?:Fable|Mythos)[^\n]*included measures to limit advances[^\n]*\.`)
+	latestModelsPattern       = regexp.MustCompile(`(?m)^[ \t]*-[ \t]*The most recent Claude models are the Claude 5 family[^\n]*\n?`)
+	claudeOpeningPattern      = regexp.MustCompile(`(?mi)^[ \t]*You are (?:Claude Code, Anthropic's official CLI for Claude(?:, running within the Claude Agent SDK)?|a Claude agent, built on Anthropic's Claude Agent SDK)\.[ \t]*\n?`)
 	outputStyleOpeningPattern = regexp.MustCompile(`(?mi)^[ \t]*You are an interactive agent that helps users according to your "Output Style"[^\n]*\n?`)
 	fableIdentityPattern      = regexp.MustCompile(`(?mi)^[ \t]*This iteration of Claude is Claude (?:Fable|Mythos)[^\n]*\n?`)
 	// Claude Code emits autonomy paragraphs for every model whose cloaked id resolves to Fable 5, so
@@ -821,7 +828,7 @@ func stripSystemReminders(s string, st *cleanState) string {
 		return s
 	}
 	return reminderPattern.ReplaceAllStringFunc(s, func(match string) string {
-		body := strings.TrimSpace(reminderPattern.FindStringSubmatch(match)[1])
+		body := strings.TrimSpace(match[len(reminderOpen) : len(match)-len(reminderClose)])
 		for _, prefix := range removedReminderPrefixes {
 			if strings.HasPrefix(body, prefix) {
 				return ""
@@ -850,11 +857,45 @@ func stripSystemReminders(s string, st *cleanState) string {
 // stripCyberGate deletes the cyber/dual-use gate paragraph, the Fable tier blurb, and the
 // visible-thinking clause from a system prompt text.
 func stripCyberGate(s string) string {
-	s = cyberGatePattern.ReplaceAllString(s, "")
-	s = cyberGateTailPattern.ReplaceAllString(s, "")
-	s = fableTierPattern.ReplaceAllString(s, "$1")
-	s = fableTrainingPattern.ReplaceAllString(s, "")
-	return visibleThinkingPattern.ReplaceAllString(s, "")
+	if containsASCIIFold(s, "security testing") {
+		s = cyberGatePattern.ReplaceAllString(s, "")
+	}
+	if containsASCIIFold(s, "dual-use security tools") {
+		s = cyberGateTailPattern.ReplaceAllString(s, "")
+	}
+	if containsASCIIFold(s, "includes additional safety measures") {
+		s = fableTierPattern.ReplaceAllString(s, "$1")
+	}
+	if containsASCIIFold(s, "included measures to limit advances") {
+		s = fableTrainingPattern.ReplaceAllString(s, "")
+	}
+	if containsASCIIFold(s, "visible") && containsASCIIFold(s, "thinking") {
+		s = visibleThinkingPattern.ReplaceAllString(s, "")
+	}
+	return s
+}
+
+// containsASCIIFold reports whether s contains lowerNeedle, an ASCII lowercase literal, ignoring
+// ASCII case. It gates case-insensitive regexes so texts without their literal skip the regex scan.
+func containsASCIIFold(s, lowerNeedle string) bool {
+	n := len(lowerNeedle)
+	for i := 0; i+n <= len(s); i++ {
+		j := 0
+		for j < n {
+			b := s[i+j]
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			if b != lowerNeedle[j] {
+				break
+			}
+			j++
+		}
+		if j == n {
+			return true
+		}
+	}
+	return false
 }
 
 // modelIsClaude reports whether a target model id belongs to Anthropic, which includes the cloaked
@@ -875,20 +916,47 @@ func modelIsFable(model string) bool {
 // reminders, the untrusted-archive and injection paragraphs, and the background-task preamble.
 func stripHarnessNoise(s string, st *cleanState, cfg featureConfig) string {
 	s = stripSystemReminders(s, st)
-	s = strings.ReplaceAll(s, claudeUntrustedArchiveReminder, "")
-	s = strings.ReplaceAll(s, strings.TrimSpace(claudeUntrustedArchiveReminder), "")
-	s = strings.ReplaceAll(s, claudeReaInjectionDirective, "")
+	if strings.Contains(s, "untrusted data:") {
+		s = strings.ReplaceAll(s, claudeUntrustedArchiveReminder, "")
+		s = strings.ReplaceAll(s, strings.TrimSpace(claudeUntrustedArchiveReminder), "")
+	}
+	if strings.Contains(s, "prompt-injection attempt:") {
+		s = strings.ReplaceAll(s, claudeReaInjectionDirective, "")
+	}
 	if cfg.StripReaDirectives {
+		s = stripReaDirectives(s)
+	}
+	if strings.Contains(s, "# Environment") {
+		s = envBlockPattern.ReplaceAllString(s, "")
+	}
+	if strings.Contains(s, "The most recent Claude models are the Claude 5 family") {
+		s = latestModelsPattern.ReplaceAllString(s, "")
+	}
+	s = stripSection(s, "## Bash command sandbox", sandboxSectionStops)
+	if strings.Contains(s, "You are powered by the model named ") {
+		s = poweredByPattern.ReplaceAllString(s, "")
+	}
+	if strings.Contains(s, "Only you see that command's output") {
+		s = onlyYouSeeOutputLine.ReplaceAllString(s, "")
+	}
+	if containsASCIIFold(s, "[system notification") {
+		s = systemNotificationPreamblePattern.ReplaceAllString(s, "")
+	}
+	if containsASCIIFold(s, reminderOpen) {
+		s = emptyReminderPattern.ReplaceAllString(s, "")
+	}
+	return s
+}
+
+// stripReaDirectives removes rea's data-only and provenance sentences.
+func stripReaDirectives(s string) string {
+	if containsASCIIFold(s, "never as instructions") {
 		s = reaDataOnlyPattern.ReplaceAllString(s, "")
+	}
+	if containsASCIIFold(s, "_meta.provenance.untrusted_content") {
 		s = reaProvenancePattern.ReplaceAllString(s, "")
 	}
-	s = envBlockPattern.ReplaceAllString(s, "")
-	s = latestModelsPattern.ReplaceAllString(s, "")
-	s = stripSection(s, "## Bash command sandbox", sandboxSectionStops)
-	s = poweredByPattern.ReplaceAllString(s, "")
-	s = onlyYouSeeOutputLine.ReplaceAllString(s, "")
-	s = systemNotificationPreamblePattern.ReplaceAllString(s, "")
-	return emptyReminderPattern.ReplaceAllString(s, "")
+	return s
 }
 
 // adaptForModel rewrites prompt text that Claude Code composes for a specific model: the Claude Code
@@ -902,10 +970,31 @@ func adaptPromptForModel(payload []byte, model string, cfg pluginConfig) ([]byte
 	if errUnmarshal := json.Unmarshal(payload, &body); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode group request body: %w", errUnmarshal)
 	}
+	changed, errAdapt := adaptPromptBody(body, model, cfg)
+	if errAdapt != nil {
+		return nil, errAdapt
+	}
+	if !changed {
+		return payload, nil
+	}
+	marshaled, errMarshal := marshalNoEscape(body)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("encode model-adapted request: %w", errMarshal)
+	}
+	return marshaled, nil
+}
+
+// adaptPromptBody applies adaptPromptForModel's rewrites to an already-decoded request body in
+// place and reports whether any field changed.
+func adaptPromptBody(body map[string]json.RawMessage, model string, cfg pluginConfig) (bool, error) {
+	if !cfg.Features.StripModelIdentity && !cfg.Features.SanitizeAgyText {
+		return false, nil
+	}
 	changed := false
+	agy := cfg.Features.SanitizeAgyText && modelIsAgy(model)
 	st := &cleanState{}
 	fn := func(s string) string {
-		if cfg.Features.SanitizeAgyText && modelIsAgy(model) {
+		if agy {
 			s = sanitizeNonPrintableText(s)
 		}
 		s = adaptForModel(s, model, cfg.Features)
@@ -918,37 +1007,122 @@ func adaptPromptForModel(payload []byte, model string, cfg pluginConfig) ([]byte
 		}
 		updated, errRewrite := rewriteSystemFieldStrings(rawSys, fn)
 		if errRewrite != nil {
-			return nil, errRewrite
+			return false, errRewrite
 		}
 		if !bytes.Equal(updated, rawSys) {
 			body[field] = updated
 			changed = true
 		}
 	}
-	if cfg.Features.SanitizeAgyText && modelIsAgy(model) {
-		for _, field := range []string{"messages", "input", "contents"} {
-			rawHistory, ok := body[field]
-			if !ok {
-				continue
-			}
-			updated, errRewrite := rewriteSystemFieldStrings(rawHistory, sanitizeNonPrintableText)
-			if errRewrite != nil {
-				return nil, errRewrite
-			}
-			if !bytes.Equal(updated, rawHistory) {
-				body[field] = updated
-				changed = true
-			}
+	if !agy {
+		return changed, nil
+	}
+	for _, field := range []string{"messages", "input", "contents"} {
+		rawHistory, ok := body[field]
+		if !ok {
+			continue
+		}
+		updated, errRewrite := sanitizeHistoryNonPrintable(rawHistory)
+		if errRewrite != nil {
+			return false, errRewrite
+		}
+		if !bytes.Equal(updated, rawHistory) {
+			body[field] = updated
+			changed = true
 		}
 	}
-	if !changed {
-		return payload, nil
+	return changed, nil
+}
+
+// sanitizeHistoryNonPrintable applies sanitizeNonPrintableText to every string value of a history
+// field. It scans string literals in place, so a clean history is returned without decoding and a
+// dirty one only re-encodes the strings that change. When a non-empty string would end up
+// whitespace-only, the text block holding it must be dropped, so the field goes through the
+// tree walker that implements that rule.
+func sanitizeHistoryNonPrintable(raw json.RawMessage) (json.RawMessage, error) {
+	var out []byte
+	lastCopy := 0
+	for i := 0; i < len(raw); {
+		q := bytes.IndexByte(raw[i:], '"')
+		if q < 0 {
+			break
+		}
+		start := i + q
+		end := start + 1
+		for end < len(raw) && raw[end] != '"' {
+			if raw[end] == '\\' {
+				end++
+			}
+			end++
+		}
+		if end >= len(raw) {
+			return nil, fmt.Errorf("decode history field: unterminated string at offset %d", start)
+		}
+		end++
+		i = end
+		next := end
+		for next < len(raw) && (raw[next] == ' ' || raw[next] == '\t' || raw[next] == '\n' || raw[next] == '\r') {
+			next++
+		}
+		if next < len(raw) && raw[next] == ':' {
+			continue
+		}
+		inner := raw[start+1 : end-1]
+		if !jsonStringNeedsPrintableCheck(inner) {
+			continue
+		}
+		var s string
+		if errDecode := json.Unmarshal(raw[start:end], &s); errDecode != nil {
+			return nil, fmt.Errorf("decode history string: %w", errDecode)
+		}
+		cleaned := sanitizeNonPrintableText(s)
+		if s != "" && strings.TrimSpace(cleaned) == "" {
+			return rewriteSystemFieldStrings(raw, sanitizeNonPrintableText)
+		}
+		if cleaned == s {
+			continue
+		}
+		encoded, errEncode := marshalNoEscape(cleaned)
+		if errEncode != nil {
+			return nil, fmt.Errorf("encode history string: %w", errEncode)
+		}
+		out = append(out, raw[lastCopy:start]...)
+		out = append(out, encoded...)
+		lastCopy = end
 	}
-	marshaled, errMarshal := marshalNoEscape(body)
-	if errMarshal != nil {
-		return nil, fmt.Errorf("encode model-adapted request: %w", errMarshal)
+	if out == nil {
+		return raw, nil
 	}
-	return marshaled, nil
+	return append(out, raw[lastCopy:]...), nil
+}
+
+// jsonStringNeedsPrintableCheck reports whether the body of a JSON string literal could hold a
+// rune sanitizeNonPrintableText replaces, or could be whitespace-only. Escapes other than the
+// plain ASCII ones, control bytes, and any non-ASCII byte qualify; ordinary text does not.
+func jsonStringNeedsPrintableCheck(inner []byte) bool {
+	blank := true
+	for i := 0; i < len(inner); i++ {
+		b := inner[i]
+		switch {
+		case b >= utf8.RuneSelf || b < 0x20 || b == 0x7f:
+			return true
+		case b == '\\':
+			i++
+			if i >= len(inner) {
+				return true
+			}
+			switch inner[i] {
+			case 'n', 'r', 't':
+			case '"', '\\', '/':
+				blank = false
+			default:
+				return true
+			}
+		case b != ' ':
+			blank = false
+		}
+	}
+	return blank && len(inner) > 0
 }
 
 func adaptForModel(s, model string, cfg featureConfig) string {
@@ -956,12 +1130,20 @@ func adaptForModel(s, model string, cfg featureConfig) string {
 		return s
 	}
 	if !modelIsClaude(model) {
-		s = claudeOpeningPattern.ReplaceAllString(s, "")
-		s = outputStyleOpeningPattern.ReplaceAllString(s, "")
-		s = autonomyParagraphPattern.ReplaceAllString(s, "")
-		s = autonomyEndingPattern.ReplaceAllString(s, "")
+		if containsASCIIFold(s, "anthropic's") {
+			s = claudeOpeningPattern.ReplaceAllString(s, "")
+		}
+		if containsASCIIFold(s, "output style") {
+			s = outputStyleOpeningPattern.ReplaceAllString(s, "")
+		}
+		if strings.Contains(s, "You are operating autonomously.") {
+			s = autonomyParagraphPattern.ReplaceAllString(s, "")
+		}
+		if strings.Contains(s, "Before ending your turn, check your last paragraph.") {
+			s = autonomyEndingPattern.ReplaceAllString(s, "")
+		}
 	}
-	if !modelIsFable(model) {
+	if !modelIsFable(model) && containsASCIIFold(s, "this iteration of claude is claude") {
 		s = fableIdentityPattern.ReplaceAllString(s, "")
 	}
 	return s
@@ -1088,16 +1270,24 @@ func rewriteSystemFieldStrings(raw json.RawMessage, fn func(string) string) (jso
 	return json.RawMessage(out), nil
 }
 
+var classifierNudgeNeedles = [][]byte{
+	[]byte(claudeRefusalRetryNudge),
+	[]byte(strings.ReplaceAll(claudeRefusalRetryNudge, "—", `\u2014`)),
+	[]byte(claudeRetryNudgeMidGeneration),
+	[]byte(claudeToolNotRunClassifier),
+	[]byte(claudeToolInterruptedClassifier),
+	[]byte("<interrupted-output>"),
+}
+
+var restrictiveReminderNeedles = [][]byte{
+	[]byte(reminderOpen), []byte("[SYSTEM NOTIFICATION"), []byte("# Environment"), []byte("## Bash command sandbox"),
+	[]byte("You are powered by the model named"), []byte("Only you see that command's output"),
+	[]byte("untrusted data:"), []byte("prompt-injection attempt:"), []byte("\x1b["), []byte(`\u001b[`),
+}
+
 func containsClassifierNudge(raw []byte) bool {
-	for _, needle := range []string{
-		claudeRefusalRetryNudge,
-		strings.ReplaceAll(claudeRefusalRetryNudge, "—", `\u2014`),
-		claudeRetryNudgeMidGeneration,
-		claudeToolNotRunClassifier,
-		claudeToolInterruptedClassifier,
-		"<interrupted-output>",
-	} {
-		if bytes.Contains(raw, []byte(needle)) {
+	for _, needle := range classifierNudgeNeedles {
+		if bytes.Contains(raw, needle) {
 			return true
 		}
 	}
@@ -1118,6 +1308,9 @@ func stripRefusedInterruptedOutput(s string) string {
 }
 
 func neutralizeTextNudges(s string) string {
+	if !strings.Contains(s, "interrupted") && !strings.Contains(s, "safety classifier") {
+		return s
+	}
 	s = strings.ReplaceAll(s, claudeRefusalRetryNudge, claudeRefusalReplacement)
 	s = strings.ReplaceAll(s, claudeRetryNudgeMidGeneration, claudeRefusalReplacement)
 	s = strings.ReplaceAll(s, claudeToolNotRunClassifier, claudeToolNotRunReplacement)
@@ -1127,6 +1320,9 @@ func neutralizeTextNudges(s string) string {
 }
 
 func replaceExactToolResultText(s string) (string, bool) {
+	if !strings.Contains(s, "tool call was interrupted") {
+		return s, false
+	}
 	switch strings.TrimSpace(s) {
 	case claudeToolNotRunClassifier:
 		return claudeToolNotRunReplacement, true
@@ -1160,8 +1356,7 @@ func cleanText(text, role string, inToolResult bool, prefixes []string, cfg plug
 			}
 		}
 		if cfg.Features.StripReaDirectives {
-			text = reaDataOnlyPattern.ReplaceAllString(text, "")
-			text = reaProvenancePattern.ReplaceAllString(text, "")
+			text = stripReaDirectives(text)
 		}
 		return text
 	}
@@ -1191,7 +1386,7 @@ func cleanMessageBlock(block map[string]json.RawMessage, role string, inToolResu
 			return block, true, false
 		}
 		var innerText string
-		if json.Unmarshal(rawInner, &innerText) == nil {
+		if firstJSONByte(rawInner) == '"' && json.Unmarshal(rawInner, &innerText) == nil {
 			updated := cleanText(innerText, role, true, nil, cfg, st)
 			if updated == innerText {
 				return block, true, false
@@ -1275,12 +1470,8 @@ func messagesNeedCleaning(raw []byte, cfg pluginConfig, prefixes []string) bool 
 		return true
 	}
 	if cfg.Features.StripRestrictiveReminders {
-		for _, needle := range []string{
-			reminderOpen, "[SYSTEM NOTIFICATION", "# Environment", "## Bash command sandbox",
-			"You are powered by the model named", "Only you see that command's output",
-			"untrusted data:", "prompt-injection attempt:", "\x1b[", `\u001b[`,
-		} {
-			if bytes.Contains(raw, []byte(needle)) {
+		for _, needle := range restrictiveReminderNeedles {
+			if bytes.Contains(raw, needle) {
 				return true
 			}
 		}
@@ -1294,6 +1485,9 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessa
 	prefixes := activeNoticePrefixes(cfg)
 	if !messagesNeedCleaning(rawMessages, cfg, prefixes) {
 		return rawMessages, nil
+	}
+	if !bytes.Contains(rawMessages, []byte(`"role":"system"`)) && !bytes.Contains(rawMessages, []byte(`"role": "system"`)) {
+		return cleanMessagesWithoutSystemTurns(rawMessages, cfg, prefixes)
 	}
 	var messages []map[string]json.RawMessage
 	if errUnmarshal := json.Unmarshal(rawMessages, &messages); errUnmarshal != nil {
@@ -1362,6 +1556,116 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessa
 		return nil, fmt.Errorf("encode request messages: %w", errMarshal)
 	}
 	return out, nil
+}
+
+// cleanMessagesWithoutSystemTurns is cleanMessages for a history with no role="system" turn, where
+// foldSystemTurns has nothing to fold. Messages carrying no cleanable text keep their exact bytes
+// and are never decoded; only messages that change are re-encoded.
+func cleanMessagesWithoutSystemTurns(rawMessages json.RawMessage, cfg pluginConfig, prefixes []string) (json.RawMessage, error) {
+	var messages []json.RawMessage
+	if errUnmarshal := json.Unmarshal(rawMessages, &messages); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode request messages: %w", errUnmarshal)
+	}
+	st := &cleanState{}
+	var out []byte
+	changed := false
+	kept := 0
+	for i, rawMsg := range messages {
+		updated, keep, errClean := cleanRawMessage(rawMsg, cfg, prefixes, st)
+		if errClean != nil {
+			return nil, errClean
+		}
+		if !keep || !bytes.Equal(updated, rawMsg) {
+			if !changed {
+				out = append(make([]byte, 0, len(rawMessages)), '[')
+				for j, prev := range messages[:i] {
+					if j > 0 {
+						out = append(out, ',')
+					}
+					out = append(out, prev...)
+				}
+				kept = i
+				changed = true
+			}
+		}
+		if !changed || !keep {
+			continue
+		}
+		if kept > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, updated...)
+		kept++
+	}
+	if !changed {
+		return rawMessages, nil
+	}
+	return append(out, ']'), nil
+}
+
+// firstJSONByte returns the first non-whitespace byte of raw, telling a JSON string from an array
+// without a failing decode.
+func firstJSONByte(raw []byte) byte {
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	if len(trimmed) == 0 {
+		return 0
+	}
+	return trimmed[0]
+}
+
+// cleanRawMessage cleans one message of a history without system turns and reports whether it is
+// kept. A message whose bytes hold nothing any rule could touch is returned as is.
+func cleanRawMessage(rawMsg json.RawMessage, cfg pluginConfig, prefixes []string, st *cleanState) (json.RawMessage, bool, error) {
+	if !messagesNeedCleaning(rawMsg, cfg, prefixes) {
+		return rawMsg, true, nil
+	}
+	var msg map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(rawMsg, &msg); errUnmarshal != nil {
+		return nil, false, fmt.Errorf("decode request message: %w", errUnmarshal)
+	}
+	var role string
+	_ = json.Unmarshal(msg["role"], &role)
+	rawContent, ok := msg["content"]
+	if !ok {
+		return rawMsg, true, nil
+	}
+	var text string
+	if firstJSONByte(rawContent) == '"' && json.Unmarshal(rawContent, &text) == nil {
+		updated := cleanText(text, role, false, prefixes, cfg, st)
+		if updated == text {
+			return rawMsg, true, nil
+		}
+		if strings.TrimSpace(updated) == "" {
+			return nil, false, nil
+		}
+		msg["content"], _ = marshalNoEscape(strings.TrimSpace(updated))
+		encoded, errMarshal := marshalNoEscape(msg)
+		return encoded, true, errMarshal
+	}
+	var blocks []map[string]json.RawMessage
+	if json.Unmarshal(rawContent, &blocks) != nil {
+		return rawMsg, true, nil
+	}
+	filtered := make([]map[string]json.RawMessage, 0, len(blocks))
+	blockChanged := false
+	for _, block := range blocks {
+		cleaned, keep, mod := cleanMessageBlock(block, role, false, prefixes, cfg, st)
+		if mod || !keep {
+			blockChanged = true
+		}
+		if keep {
+			filtered = append(filtered, cleaned)
+		}
+	}
+	if !blockChanged {
+		return rawMsg, true, nil
+	}
+	if len(filtered) == 0 {
+		return nil, false, nil
+	}
+	msg["content"], _ = marshalNoEscape(filtered)
+	encoded, errMarshal := marshalNoEscape(msg)
+	return encoded, true, errMarshal
 }
 
 // foldSystemTurns removes ordinary mid-conversation role="system" turns, which Anthropic rejects,
@@ -1498,20 +1802,33 @@ func contentToBlocks(raw json.RawMessage) []map[string]json.RawMessage {
 // models are the ones whose id starts with "claude-", which includes the cloaked
 // "claude-fable-5-dd-" ids; provider-prefixed ids such as "agy/claude-..." are not Anthropic.
 func withoutRedactedThinking(payload []byte, model string) ([]byte, error) {
-	if strings.HasPrefix(strings.ToLower(model), "claude-") || !bytes.Contains(payload, []byte(`"redacted_thinking"`)) {
+	if modelIsClaude(model) || !bytes.Contains(payload, []byte(`"redacted_thinking"`)) {
 		return payload, nil
 	}
 	var body map[string]json.RawMessage
 	if errUnmarshal := json.Unmarshal(payload, &body); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode group request body: %w", errUnmarshal)
 	}
-	rawMessages, ok := body["messages"]
-	if !ok {
+	changed, errStrip := stripRedactedThinking(body, model)
+	if errStrip != nil {
+		return nil, errStrip
+	}
+	if !changed {
 		return payload, nil
+	}
+	return marshalNoEscape(body)
+}
+
+// stripRedactedThinking is withoutRedactedThinking on an already-decoded request body, editing
+// its messages in place.
+func stripRedactedThinking(body map[string]json.RawMessage, model string) (bool, error) {
+	rawMessages, ok := body["messages"]
+	if modelIsClaude(model) || !ok || !bytes.Contains(rawMessages, []byte(`"redacted_thinking"`)) {
+		return false, nil
 	}
 	var messages []map[string]json.RawMessage
 	if errUnmarshal := json.Unmarshal(rawMessages, &messages); errUnmarshal != nil {
-		return nil, fmt.Errorf("decode group request messages: %w", errUnmarshal)
+		return false, fmt.Errorf("decode group request messages: %w", errUnmarshal)
 	}
 	kept := make([]map[string]json.RawMessage, 0, len(messages))
 	for _, msg := range messages {
@@ -1538,8 +1855,12 @@ func withoutRedactedThinking(payload []byte, model string) ([]byte, error) {
 		msg["content"], _ = marshalNoEscape(filtered)
 		kept = append(kept, msg)
 	}
-	body["messages"], _ = marshalNoEscape(kept)
-	return marshalNoEscape(body)
+	encoded, errMarshal := marshalNoEscape(kept)
+	if errMarshal != nil {
+		return false, fmt.Errorf("encode group request messages: %w", errMarshal)
+	}
+	body["messages"] = encoded
+	return true, nil
 }
 
 // sanitizeRequest applies the enabled wire adaptations to a request body and headers, returning
@@ -1929,6 +2250,26 @@ func checkNonStreamResponse(body []byte) (error, string) {
 		return fmt.Errorf("empty response (no text or tool calls)"), salvaged
 	}
 	return nil, ""
+}
+
+// streamRefusalNeedles are the JSON tokens every refusal or error that inspectPayload reports
+// carries: error objects, refusal stop reasons and blocks, content filters, and Gemini block or
+// finish reasons.
+var streamRefusalNeedles = [][]byte{
+	[]byte(`"error"`), []byte(`"refusal"`), []byte(`"sensitive"`), []byte(`content_filter`), []byte(`blockReason`),
+	[]byte(`"SAFETY"`), []byte(`"RECITATION"`), []byte(`"PROHIBITED_CONTENT"`), []byte(`"SPII"`), []byte(`"BLOCKLIST"`), []byte(`"IMAGE_SAFETY"`),
+}
+
+// streamChunkRefusal returns inspectStreamChunk's refusal for a chunk, skipping the JSON decode for
+// chunks that carry none of the tokens a refusal needs.
+func streamChunkRefusal(payload []byte) string {
+	for _, needle := range streamRefusalNeedles {
+		if bytes.Contains(payload, needle) {
+			refusal, _, _, _, _ := inspectStreamChunk(payload)
+			return refusal
+		}
+	}
+	return ""
 }
 
 // inspectStreamChunk inspects all JSON objects in an SSE or raw-JSON stream chunk.

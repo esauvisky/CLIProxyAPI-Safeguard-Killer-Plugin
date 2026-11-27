@@ -200,15 +200,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		return nil, plan.Err
 	}
 	for model, available := plan.nextModel(rand.Float64()); available; model, available = plan.nextModel(rand.Float64()) {
-		body, errBody := withModel(sanitizedPayload, model)
-		if errBody != nil {
-			return nil, errBody
-		}
-		body, errBody = withoutRedactedThinking(body, model)
-		if errBody != nil {
-			return nil, errBody
-		}
-		body, errBody = adaptPromptForModel(body, model, cfg)
+		body, errBody := attemptBody(sanitizedPayload, model, cfg)
 		if errBody != nil {
 			return nil, errBody
 		}
@@ -298,15 +290,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		return nil, plan.Err
 	}
 	for model, available := plan.nextModel(rand.Float64()); available; model, available = plan.nextModel(rand.Float64()) {
-		body, errBody := withModel(sanitizedPayload, model)
-		if errBody != nil {
-			return nil, errBody
-		}
-		body, errBody = withoutRedactedThinking(body, model)
-		if errBody != nil {
-			return nil, errBody
-		}
-		body, errBody = adaptPromptForModel(body, model, cfg)
+		body, errBody := attemptBody(sanitizedPayload, model, cfg)
 		if errBody != nil {
 			return nil, errBody
 		}
@@ -420,7 +404,7 @@ func forwardStream(source, target, callbackID string, prefetched [][]byte, sourc
 			collectToolUseIDsFromChunk(chunk.Payload, toolUseIDs)
 			observeConversationUsage(session, group.ID, chunk.Payload)
 			if checkRefusal {
-				if refusal, _, _, _, _ := inspectStreamChunk(chunk.Payload); refusal != "" {
+				if refusal := streamChunkRefusal(chunk.Payload); refusal != "" {
 					advanceConversationOnRefusal(session, group, model, time.Now())
 				}
 			}
@@ -548,20 +532,30 @@ func skipReason(cfg pluginConfig, model string, now time.Time) (string, error) {
 	return "no usable credentials: " + strings.Join(excluded, ", "), nil
 }
 
-// withModel sets the top-level "model" field on the already-sanitized group payload.
-// Protocols that carry the model only in the path (Gemini) have no "model" field and are passed
-// through unchanged.
-func withModel(payload []byte, model string) ([]byte, error) {
+// attemptBody builds one attempt's request in a single decode/encode pass: the top-level model,
+// redacted_thinking hidden from non-Claude targets, and the model-keyed prompt adaptations.
+func attemptBody(payload []byte, model string, cfg pluginConfig) ([]byte, error) {
 	var body map[string]json.RawMessage
 	if errUnmarshal := json.Unmarshal(payload, &body); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode group request body: %w", errUnmarshal)
 	}
-	if _, ok := body["model"]; !ok {
+	changed := false
+	if _, ok := body["model"]; ok {
+		body["model"], _ = marshalNoEscape(model)
+		changed = true
+	}
+	stripped, errStrip := stripRedactedThinking(body, model)
+	if errStrip != nil {
+		return nil, errStrip
+	}
+	adapted, errAdapt := adaptPromptBody(body, model, cfg)
+	if errAdapt != nil {
+		return nil, errAdapt
+	}
+	if !changed && !stripped && !adapted {
 		return payload, nil
 	}
-	encoded, _ := json.Marshal(model)
-	body["model"] = encoded
-	return json.Marshal(body)
+	return marshalNoEscape(body)
 }
 
 func groupFailure(group modelGroup, attempts []groupAttempt, lastErr error) error {

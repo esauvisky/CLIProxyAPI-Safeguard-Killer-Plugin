@@ -26,12 +26,26 @@ const (
 	speedFastFirstTokenSec  = 3.0
 	speedSlowFirstTokenSec  = 23.0
 	speedMaxFirstTokenPenal = 20.0
+	// Reliability penalties subtract up to reliabilityMaxPenalty quality points from a model whose
+	// refusal, empty-response, or loop rate reaches reliabilityFullPenaltyRate.
+	reliabilityMaxPenalty      = 15.0
+	reliabilityFullPenaltyRate = 0.5
+	// A served turn emitting this many tool calls is counted as a loop turn: the real sessions that
+	// stalled ran 25+ calls per turn on flash models repeating searches.
+	loopLoopToolThreshold = 25
 )
 
+// modelSpeedStats carries throughput and empirical reliability learned from completed responses.
+// Reliability events (refusals, empty responses, loop turns) are counted against Attempts so each
+// rate is a fraction of the requests the model actually answered or was asked to answer.
 type modelSpeedStats struct {
 	Samples         int       `json:"samples,omitempty"`
 	TokensPerSecond float64   `json:"tokens_per_second,omitempty"`
 	FirstTokenSec   float64   `json:"first_token_sec,omitempty"`
+	Attempts        int       `json:"attempts,omitempty"`
+	Refusals        int       `json:"refusals,omitempty"`
+	EmptyResponses  int       `json:"empty_responses,omitempty"`
+	LoopTurns       int       `json:"loop_turns,omitempty"`
 	LastMeasured    time.Time `json:"last_measured,omitempty"`
 }
 
@@ -39,7 +53,12 @@ type modelSpeedSnapshot struct {
 	Samples         int       `json:"samples"`
 	TokensPerSecond float64   `json:"tokens_per_second,omitempty"`
 	FirstTokenSec   float64   `json:"first_token_sec,omitempty"`
+	Attempts        int       `json:"attempts,omitempty"`
+	Refusals        int       `json:"refusals,omitempty"`
+	EmptyResponses  int       `json:"empty_responses,omitempty"`
+	LoopTurns       int       `json:"loop_turns,omitempty"`
 	Rating          float64   `json:"rating"`
+	Reliability     float64   `json:"reliability"`
 	LastMeasured    time.Time `json:"last_measured,omitempty"`
 }
 
@@ -81,6 +100,153 @@ func measuredModelSpeed(model string) float64 {
 	return speedRatingWithTTFT(stats.TokensPerSecond, stats.FirstTokenSec)
 }
 
+// reliabilityRating returns the fraction of attempts that succeeded without a refusal, empty
+// response, or loop turn, mapped to a 0-100 rating. A model with no attempts yet is neutral (100).
+func reliabilityRating(stats *modelSpeedStats) float64 {
+	if stats == nil || stats.Attempts == 0 {
+		return 100
+	}
+	failures := stats.Refusals + stats.EmptyResponses + stats.LoopTurns
+	successRate := 1 - float64(failures)/float64(stats.Attempts)
+	return math.Round(100 * math.Max(0, math.Min(1, successRate)))
+}
+
+// reliabilityPenalty subtracts up to reliabilityMaxPenalty quality points proportional to the
+// model's failure rate, so a model that refuses or loops often no longer ties a clean model at the
+// same Artificial Analysis quality.
+func reliabilityPenalty(stats *modelSpeedStats) float64 {
+	if stats == nil || stats.Attempts == 0 {
+		return 0
+	}
+	failures := stats.Refusals + stats.EmptyResponses + stats.LoopTurns
+	rate := float64(failures) / float64(stats.Attempts)
+	return math.Round(reliabilityMaxPenalty * math.Min(1, math.Max(0, rate/reliabilityFullPenaltyRate)))
+}
+
+// qualityRatingWithReliability applies the reliability penalty to a configured quality rating.
+func qualityRatingWithReliability(model string, quality float64) float64 {
+	speedMu.RLock()
+	stats := speedStats[model]
+	speedMu.RUnlock()
+	return math.Max(0, quality-reliabilityPenalty(stats))
+}
+
+// recordModelReliabilityEvent counts one failure class against the model's attempt total.
+func recordModelReliabilityEvent(model, kind string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	speedMu.Lock()
+	stats := speedStats[model]
+	if stats == nil {
+		stats = &modelSpeedStats{}
+		speedStats[model] = stats
+	}
+	stats.Attempts++
+	switch kind {
+	case "refusal":
+		stats.Refusals++
+	case "empty":
+		stats.EmptyResponses++
+	case "loop":
+		stats.LoopTurns++
+	}
+	speedMu.Unlock()
+	savePersistedSessions()
+}
+
+// recordModelReliabilityFailure classifies an attempt error into a reliability event: refusals and
+// empty responses count against quality, while quota, capability, and transient errors do not.
+func recordModelReliabilityFailure(model string, errDetail string) {
+	summary := summarizeAttemptReason(errDetail)
+	switch {
+	case summary == "empty response":
+		recordModelReliabilityEvent(model, "empty")
+	case summary == "refusal" || strings.HasPrefix(summary, "refusal:"):
+		recordModelReliabilityEvent(model, "refusal")
+	}
+}
+
+// recordModelAttempt counts one completed attempt with no failure class against the model's total.
+func recordModelAttempt(model string) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	speedMu.Lock()
+	stats := speedStats[model]
+	if stats == nil {
+		stats = &modelSpeedStats{}
+		speedStats[model] = stats
+	}
+	stats.Attempts++
+	speedMu.Unlock()
+	savePersistedSessions()
+}
+
+// recordModelServedTurn counts a served turn: an attempt plus a loop class when the turn emitted
+// loopLoopToolThreshold or more tool calls, matching the runaway loops found across real sessions.
+func recordModelServedTurn(model string, toolCount int) {
+	if toolCount >= loopLoopToolThreshold {
+		recordModelReliabilityEvent(model, "loop")
+		return
+	}
+	recordModelAttempt(model)
+}
+
+// toolUseCountInResponse counts structured tool_use blocks in a completed response body. It walks
+// Claude, OpenAI, and Gemini envelope shapes; only structured tool blocks count, so a text reply
+// mentioning tools does not inflate the loop tally.
+func toolUseCountInResponse(body []byte) int {
+	var msg struct {
+		Content json.RawMessage `json:"content"`
+		Choices []struct {
+			Message *struct {
+				Content   json.RawMessage `json:"content"`
+				ToolCalls []any           `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+		Response *struct {
+			Candidates []geminiCandidate `json:"candidates"`
+		} `json:"response"`
+		Candidates []geminiCandidate `json:"candidates"`
+	}
+	if json.Unmarshal(bytes.TrimSpace(body), &msg) != nil {
+		return 0
+	}
+	count := 0
+	for _, block := range contentToBlocks(msg.Content) {
+		var typ string
+		if json.Unmarshal(block["type"], &typ) == nil && (typ == "tool_use" || typ == "server_tool_use") {
+			count++
+		}
+	}
+	for _, choice := range msg.Choices {
+		if choice.Message != nil {
+			count += len(choice.Message.ToolCalls)
+			for _, block := range contentToBlocks(choice.Message.Content) {
+				var typ string
+				if json.Unmarshal(block["type"], &typ) == nil && typ == "tool_use" {
+					count++
+				}
+			}
+		}
+	}
+	candidates := msg.Candidates
+	if msg.Response != nil {
+		candidates = append(candidates, msg.Response.Candidates...)
+	}
+	for _, cand := range candidates {
+		for _, part := range cand.Content.Parts {
+			if part.FunctionCall != nil {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 func speedStatsSnapshot() map[string]modelSpeedSnapshot {
 	speedMu.RLock()
 	defer speedMu.RUnlock()
@@ -93,7 +259,12 @@ func speedStatsSnapshot() map[string]modelSpeedSnapshot {
 			Samples:         stats.Samples,
 			TokensPerSecond: stats.TokensPerSecond,
 			FirstTokenSec:   stats.FirstTokenSec,
+			Attempts:        stats.Attempts,
+			Refusals:        stats.Refusals,
+			EmptyResponses:  stats.EmptyResponses,
+			LoopTurns:       stats.LoopTurns,
 			Rating:          speedRatingWithTTFT(stats.TokensPerSecond, stats.FirstTokenSec),
+			Reliability:     reliabilityRating(stats),
 			LastMeasured:    stats.LastMeasured,
 		}
 	}

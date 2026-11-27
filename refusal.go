@@ -577,7 +577,67 @@ func shiftClaudeStreamChunk(chunk []byte, insertAfterMessageStart bool, noticeSS
 	return out.Bytes(), inserted
 }
 
-// collectToolUseIDsFromChunk extracts tool_use block IDs from an SSE or JSON stream chunk and adds
+// collectToolUseIDsFromChunk records every tool_use block id emitted by a stream chunk so the
+// loop tally counts distinct calls rather than repeated content_block_start frames.
+func collectToolUseIDsFromChunk(chunk []byte, ids map[string]bool) {
+	if !bytes.Contains(chunk, []byte("tool_use")) && !bytes.Contains(chunk, []byte("tool_calls")) && !bytes.Contains(chunk, []byte("functionCall")) {
+		return
+	}
+	for _, raw := range responseJSONLines(chunk) {
+		var obj struct {
+			Type         string          `json:"type"`
+			ContentBlock json.RawMessage `json:"content_block"`
+			Content      json.RawMessage `json:"content"`
+			Choices      []struct {
+				Message *struct {
+					ToolCalls []struct {
+						ID string `json:"id"`
+					} `json:"tool_calls"`
+				} `json:"message"`
+			} `json:"choices"`
+			Candidates []geminiCandidate `json:"candidates"`
+		}
+		if json.Unmarshal(raw, &obj) != nil {
+			continue
+		}
+		if obj.Type == "content_block_start" && len(obj.ContentBlock) > 0 {
+			var cb struct {
+				Type string `json:"type"`
+				ID   string `json:"id"`
+			}
+			if json.Unmarshal(obj.ContentBlock, &cb) == nil && (cb.Type == "tool_use" || cb.Type == "server_tool_use") && cb.ID != "" {
+				ids[cb.ID] = true
+			}
+		}
+		for _, block := range contentToBlocks(obj.Content) {
+			var typ string
+			var id string
+			if json.Unmarshal(block["type"], &typ) == nil && json.Unmarshal(block["id"], &id) == nil && (typ == "tool_use" || typ == "server_tool_use") && id != "" {
+				ids[id] = true
+			}
+		}
+		for _, choice := range obj.Choices {
+			if choice.Message != nil {
+				for _, call := range choice.Message.ToolCalls {
+					if call.ID != "" {
+						ids[call.ID] = true
+					}
+				}
+			}
+		}
+		for _, cand := range obj.Candidates {
+			for _, part := range cand.Content.Parts {
+				if fc, ok := part.FunctionCall.(map[string]any); ok {
+					if name, _ := fc["name"].(string); name != "" {
+						ids["gemini:"+name] = true
+					}
+				}
+			}
+		}
+	}
+}
+
+// processStreamSafeguardChunk extracts tool_use block IDs from an SSE or JSON stream chunk and adds
 // them to seenIDs; when a message_delta event is present and stampSafeguards is true, it injects
 // safeguard_results marking all seen tool_use IDs as "not_flagged".
 func processStreamSafeguardChunk(chunk []byte, seenIDs map[string]bool, stampSafeguards bool) []byte {

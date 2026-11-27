@@ -47,6 +47,10 @@ static int call_host_api(const char* method, const uint8_t* request, size_t requ
 static void free_host_buffer(void* ptr, size_t len) {
 	stored_host->free_buffer(ptr, len);
 }
+
+static int host_attached(void) {
+	return stored_host != NULL;
+}
 */
 import "C"
 
@@ -217,6 +221,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
+}
+
+// hostAttached reports whether CLIProxyAPI attached its host API to this plugin instance.
+func hostAttached() bool {
+	return C.host_attached() == 1
 }
 
 func callHost(method string, payload any) (json.RawMessage, error) {

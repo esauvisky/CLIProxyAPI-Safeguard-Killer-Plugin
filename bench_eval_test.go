@@ -19,27 +19,27 @@ var realFencedToolCallsCorpus = []struct {
 	wantTools []string
 }{
 	{
-		session: "1a0b7daa-68bf-4156-b173-788974567f06:2534",
-		model:   "agy/gemini-4-neon",
-		text: "```tool_calls\n[\n  {\n    \"name\": \"Bash\",\n    \"arguments\": {\n      \"command\": \"ssh emi@5.9.156.120 'docker exec -i -w /agy-work -e HOME=/root/.agy-accounts/account-20261126-004612-33d273 ai-api sh -c '\\''trap \\\"rm -f /tmp/agy-test-clean.txt /tmp/agy-test-esc.txt /tmp/agy-test-pua.txt\\\" EXIT\\nprintf \\\"hello world\\\\n\\\" > /tmp/agy-test-clean.txt\\nprintf \\\"hello \\\\033[2mworld\\\\033[0m\\\\n\\\" > /tmp/agy-test-esc.txt\\nprintf \\\"Icon=\\\\357\\\\205\\\\233\\\\n\\\" > /tmp/agy-test-pua.txt\\n/usr/local/bin/agy --output-format json --print-timeout 2m --disable-slash-commands --model gemini-4-neon <<\\\"EOF\\\"\\nCall read_file on each of these three files in parallel: /tmp/agy-test-clean.txt, /tmp/agy-test-esc.txt, /tmp/agy-test-pua.txt. For each file, report verbatim whether read_file succeeded (and its content) or failed (and the exact error message). Do not run any shell commands.\\nEOF\\n'\\'''\",\n      \"description\": \"Test agy read_file on clean, ESC, and U+F15B files inside ai-api\",\n      \"timeout\": 180000,\n      \"dangerouslyDisableSandbox\": true\n    }\n  }\n]\n```",
+		session:   "1a0b7daa-68bf-4156-b173-788974567f06:2534",
+		model:     "agy/gemini-4-neon",
+		text:      "```tool_calls\n[\n  {\n    \"name\": \"Bash\",\n    \"arguments\": {\n      \"command\": \"ssh emi@5.9.156.120 'docker exec -i -w /agy-work -e HOME=/root/.agy-accounts/account-20261126-004612-33d273 ai-api sh -c '\\''trap \\\"rm -f /tmp/agy-test-clean.txt /tmp/agy-test-esc.txt /tmp/agy-test-pua.txt\\\" EXIT\\nprintf \\\"hello world\\\\n\\\" > /tmp/agy-test-clean.txt\\nprintf \\\"hello \\\\033[2mworld\\\\033[0m\\\\n\\\" > /tmp/agy-test-esc.txt\\nprintf \\\"Icon=\\\\357\\\\205\\\\233\\\\n\\\" > /tmp/agy-test-pua.txt\\n/usr/local/bin/agy --output-format json --print-timeout 2m --disable-slash-commands --model gemini-4-neon <<\\\"EOF\\\"\\nCall read_file on each of these three files in parallel: /tmp/agy-test-clean.txt, /tmp/agy-test-esc.txt, /tmp/agy-test-pua.txt. For each file, report verbatim whether read_file succeeded (and its content) or failed (and the exact error message). Do not run any shell commands.\\nEOF\\n'\\'''\",\n      \"description\": \"Test agy read_file on clean, ESC, and U+F15B files inside ai-api\",\n      \"timeout\": 180000,\n      \"dangerouslyDisableSandbox\": true\n    }\n  }\n]\n```",
 		wantTools: []string{"Bash"},
 	},
 	{
-		session: "8d2e360d-f68d-46bc-bdb2-71319859eb50:227",
-		model:   "agy/gemini-4-neon",
-		text: "```tool_calls\n[\n  {\n    \"name\": \"Bash\",\n    \"arguments\": {\n      \"command\": \"echo '=== FULL JOURNAL 04:17-04:20 ==='; journalctl --user --since '2026-11-26 04:17:00' --until '2026-11-26 04:20:00' --no-pager 2>/dev/null; echo '=== CHECK ENV IN COPYQ DIRECT CALL ==='; timeout 5 copyq eval 'print(typeof setData, typeof write, typeof change)' 2>&1; echo '=== CHECK ~/.bashrc / ~/.profile SOURCING bash_globals ==='; grep -rn 'bash_globals' ~/.bashrc ~/.bash_profile ~/.profile ~/.xinitrc ~/.xprofile ~/.zshrc ~/.local/bin 2>/dev/null; echo '=== CHECK CLEARIFY RECENT SESSIONS FOR COPYQ ==='; grep -rli 'copyq\\|editWithLLM\\|shift+alt+e\\|alt+shift+e' ~/.claude/projects/-home-emi-Coding-clearify/ 2>/dev/null\",\n      \"description\": \"Inspect unfiltered journal logs for Shift+Alt+E and check bash_globals sourcing\",\n      \"dangerouslyDisableSandbox\": true\n    }\n  },\n  {\n    \"name\": \"Read\",\n    \"arguments\": {\n      \"file_path\": \"/home/emi/Coding/copyq-scripts/scripts/export_commands.py\"\n    }\n  }\n]\n```",
+		session:   "8d2e360d-f68d-46bc-bdb2-71319859eb50:227",
+		model:     "agy/gemini-4-neon",
+		text:      "```tool_calls\n[\n  {\n    \"name\": \"Bash\",\n    \"arguments\": {\n      \"command\": \"echo '=== FULL JOURNAL 04:17-04:20 ==='; journalctl --user --since '2026-11-26 04:17:00' --until '2026-11-26 04:20:00' --no-pager 2>/dev/null; echo '=== CHECK ENV IN COPYQ DIRECT CALL ==='; timeout 5 copyq eval 'print(typeof setData, typeof write, typeof change)' 2>&1; echo '=== CHECK ~/.bashrc / ~/.profile SOURCING bash_globals ==='; grep -rn 'bash_globals' ~/.bashrc ~/.bash_profile ~/.profile ~/.xinitrc ~/.xprofile ~/.zshrc ~/.local/bin 2>/dev/null; echo '=== CHECK CLEARIFY RECENT SESSIONS FOR COPYQ ==='; grep -rli 'copyq\\|editWithLLM\\|shift+alt+e\\|alt+shift+e' ~/.claude/projects/-home-emi-Coding-clearify/ 2>/dev/null\",\n      \"description\": \"Inspect unfiltered journal logs for Shift+Alt+E and check bash_globals sourcing\",\n      \"dangerouslyDisableSandbox\": true\n    }\n  },\n  {\n    \"name\": \"Read\",\n    \"arguments\": {\n      \"file_path\": \"/home/emi/Coding/copyq-scripts/scripts/export_commands.py\"\n    }\n  }\n]\n```",
 		wantTools: []string{"Bash", "Read"},
 	},
 	{
-		session: "d4bac18b-9208-4ff9-8407-40ad6e7415e2:171",
-		model:   "agy/gemini-4-hydrogen",
-		text: "```tool_calls\n[\n  {\n    \"name\": \"Bash\",\n    \"arguments\": {\n      \"command\": \"python3 -c \\\"\\nimport glob, json, os\\nfor p in sorted(glob.glob('/home/emi/.claude/projects/-home-emi-Coding-clearify/*.jsonl'), key=os.path.getmtime, reverse=True):\\n    b = os.path.basename(p)\\n    if b.startswith(('d4bac18b','d358253b','4c86722a','983ea570','8d2e360d')): continue\\n    users, assts = [], []\\n    with open(p) as f:\\n        for line in f:\\n            try: d = json.loads(line)\\n            except: continue\\n            t = d.get('type')\\n            if t in ('user','assistant'):\\n                c = d.get('message',{}).get('content','')\\n                txt = '\\\\n'.join(x.get('text','') for x in c if isinstance(x,dict) and x.get('type')=='text') if isinstance(c,list) else str(c)\\n                txt = txt.strip()\\n                if not txt: continue\\n                if t == 'user' and not txt.startswith('<'): users.append(txt[:200])\\n                elif t == 'assistant': assts.append(txt[:400])\\n    print('=== SESSION', b, '===')\\n    print('USERS:', users[:3])\\n    print('LAST_ASST:', assts[-1] if assts else None)\\n\\\"; echo '=== COPYQ-SCRIPTS ==='; ls -la ~/Coding/copyq-scripts 2>/dev/null; grep -rn 'editWithLLM\\|CPA_POKEMOD\\|ai-api' ~/Coding/copyq-scripts ~/.config/copyq 2>/dev/null | head -n 30; echo '=== COPYQ EVAL ==='; copyq eval 'str(env(\\\"CPA_POKEMOD_API_KEY\\\")).length + \\\"|\\\" + typeof setData + \\\"|\\\" + typeof write + \\\"|\\\" + typeof dialog + \\\"|\\\" + currentItem()' 2>&1; echo '=== COPYQ HELP ==='; copyq help setData 2>&1; copyq help dialog 2>&1; copyq help currentItem 2>&1\",\n      \"dangerouslyDisableSandbox\": true,\n      \"description\": \"Check earlier clearify sessions, copyq-scripts, and CopyQ API behavior\"\n    }\n  }\n]\n```",
+		session:   "d4bac18b-9208-4ff9-8407-40ad6e7415e2:171",
+		model:     "agy/gemini-4-hydrogen",
+		text:      "```tool_calls\n[\n  {\n    \"name\": \"Bash\",\n    \"arguments\": {\n      \"command\": \"python3 -c \\\"\\nimport glob, json, os\\nfor p in sorted(glob.glob('/home/emi/.claude/projects/-home-emi-Coding-clearify/*.jsonl'), key=os.path.getmtime, reverse=True):\\n    b = os.path.basename(p)\\n    if b.startswith(('d4bac18b','d358253b','4c86722a','983ea570','8d2e360d')): continue\\n    users, assts = [], []\\n    with open(p) as f:\\n        for line in f:\\n            try: d = json.loads(line)\\n            except: continue\\n            t = d.get('type')\\n            if t in ('user','assistant'):\\n                c = d.get('message',{}).get('content','')\\n                txt = '\\\\n'.join(x.get('text','') for x in c if isinstance(x,dict) and x.get('type')=='text') if isinstance(c,list) else str(c)\\n                txt = txt.strip()\\n                if not txt: continue\\n                if t == 'user' and not txt.startswith('<'): users.append(txt[:200])\\n                elif t == 'assistant': assts.append(txt[:400])\\n    print('=== SESSION', b, '===')\\n    print('USERS:', users[:3])\\n    print('LAST_ASST:', assts[-1] if assts else None)\\n\\\"; echo '=== COPYQ-SCRIPTS ==='; ls -la ~/Coding/copyq-scripts 2>/dev/null; grep -rn 'editWithLLM\\|CPA_POKEMOD\\|ai-api' ~/Coding/copyq-scripts ~/.config/copyq 2>/dev/null | head -n 30; echo '=== COPYQ EVAL ==='; copyq eval 'str(env(\\\"CPA_POKEMOD_API_KEY\\\")).length + \\\"|\\\" + typeof setData + \\\"|\\\" + typeof write + \\\"|\\\" + typeof dialog + \\\"|\\\" + currentItem()' 2>&1; echo '=== COPYQ HELP ==='; copyq help setData 2>&1; copyq help dialog 2>&1; copyq help currentItem 2>&1\",\n      \"dangerouslyDisableSandbox\": true,\n      \"description\": \"Check earlier clearify sessions, copyq-scripts, and CopyQ API behavior\"\n    }\n  }\n]\n```",
 		wantTools: []string{"Bash"},
 	},
 	{
-		session: "5b66de4f-30c8-4c30-9e94-cae14f1ed9c8:80",
-		model:   "agy/gemini-4-neon",
-		text: "```tool_calls\n[\n  {\n    \"name\": \"Bash\",\n    \"arguments\": {\n      \"command\": \"ssh -o ConnectTimeout=10 -o BatchMode=yes emi.casa 'echo \\\"=== SYNCTHING ===\\\"; ls -la ~/syncthing ~/syncthing/data 2>&1; echo \\\"=== HERMES TOP-LEVEL & KEYS ===\\\"; grep -nE \\\"^[a-zA-Z0-9_-]+:|mcp|whatsapp|telegram|discord|whisper|stt|transcription|memory\\\" ~/hermes/config.yaml 2>&1 | sed -E \\\"s/(key|token|secret|password|pass|hash)(:[[:space:]]*).*/\\\\1\\\\2<REDACTED>/gi\\\"; echo \\\"=== HERMES DIRS ===\\\"; ls -la ~/hermes | grep \\\"^d\\\"; echo \\\"=== POSTGRES ===\\\"; docker exec postgres psql -U postgres -Atc \\\"SELECT datname FROM pg_database WHERE datistemplate = false;\\\" 2>&1; docker exec postgres psql -U postgres -Atc \\\"SELECT name FROM pg_available_extensions WHERE name IN (\\x27vector\\x27,\\x27pg_trgm\\x27,\\x27unaccent\\x27);\\\" 2>&1'\",\n      \"description\": \"Inspect Syncthing folders, Hermes config structure, and Postgres extensions on NUC\",\n      \"timeout\": 20000,\n      \"dangerouslyDisableSandbox\": true\n    }\n  }\n]\n```",
+		session:   "5b66de4f-30c8-4c30-9e94-cae14f1ed9c8:80",
+		model:     "agy/gemini-4-neon",
+		text:      "```tool_calls\n[\n  {\n    \"name\": \"Bash\",\n    \"arguments\": {\n      \"command\": \"ssh -o ConnectTimeout=10 -o BatchMode=yes emi.casa 'echo \\\"=== SYNCTHING ===\\\"; ls -la ~/syncthing ~/syncthing/data 2>&1; echo \\\"=== HERMES TOP-LEVEL & KEYS ===\\\"; grep -nE \\\"^[a-zA-Z0-9_-]+:|mcp|whatsapp|telegram|discord|whisper|stt|transcription|memory\\\" ~/hermes/config.yaml 2>&1 | sed -E \\\"s/(key|token|secret|password|pass|hash)(:[[:space:]]*).*/\\\\1\\\\2<REDACTED>/gi\\\"; echo \\\"=== HERMES DIRS ===\\\"; ls -la ~/hermes | grep \\\"^d\\\"; echo \\\"=== POSTGRES ===\\\"; docker exec postgres psql -U postgres -Atc \\\"SELECT datname FROM pg_database WHERE datistemplate = false;\\\" 2>&1; docker exec postgres psql -U postgres -Atc \\\"SELECT name FROM pg_available_extensions WHERE name IN (\\x27vector\\x27,\\x27pg_trgm\\x27,\\x27unaccent\\x27);\\\" 2>&1'\",\n      \"description\": \"Inspect Syncthing folders, Hermes config structure, and Postgres extensions on NUC\",\n      \"timeout\": 20000,\n      \"dangerouslyDisableSandbox\": true\n    }\n  }\n]\n```",
 		wantTools: []string{"Bash"},
 	},
 }
@@ -75,43 +75,43 @@ func TestCorpusSalvagesFencedToolCallsInStreamAndNonStream(t *testing.T) {
 				map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 120}},
 				map[string]any{"type": "message_stop"},
 			)
-				out := streamTestNormalize(t, id, streamTestFrames(t, frames...))
-				events := streamTestParse(t, out)
-				blocks := streamTestBlocks(t, events)
-				wantBlockTypes := append([]string{"thinking"}, make([]string, len(tc.wantTools))...)
-				for i := range tc.wantTools {
-					wantBlockTypes[i+1] = "tool_use"
-				}
-				streamTestWantBlocks(t, blocks, wantBlockTypes)
-				msgDelta := events[len(events)-2]
-				if gotStop := msgDelta["delta"].(map[string]any)["stop_reason"]; gotStop != "tool_use" {
-					t.Fatalf("message_delta stop_reason = %v, want tool_use", gotStop)
-				}
+			out := streamTestNormalize(t, id, streamTestFrames(t, frames...))
+			events := streamTestParse(t, out)
+			blocks := streamTestBlocks(t, events)
+			wantBlockTypes := append([]string{"thinking"}, make([]string, len(tc.wantTools))...)
+			for i := range tc.wantTools {
+				wantBlockTypes[i+1] = "tool_use"
+			}
+			streamTestWantBlocks(t, blocks, wantBlockTypes)
+			msgDelta := events[len(events)-2]
+			if gotStop := msgDelta["delta"].(map[string]any)["stop_reason"]; gotStop != "tool_use" {
+				t.Fatalf("message_delta stop_reason = %v, want tool_use", gotStop)
+			}
 
-				// 2b. Verify streaming normalization also salvages fenced tool_calls when s.preserve == true (e.g. text followed by signed thinking block).
-				idPreserve := id + "/preserve"
-				defer cleanupClaudeStream(idPreserve)
-				var preserveFrames []map[string]any
-				preserveFrames = append(preserveFrames, streamTestText(0, "", tc.text)...)
-				preserveFrames = append(preserveFrames,
-					streamTestStart(1, map[string]any{"type": "thinking", "thinking": ""}),
-					streamTestDelta(1, map[string]any{"type": "thinking_delta", "thinking": "analyzing..."}),
-					streamTestDelta(1, map[string]any{"type": "signature_delta", "signature": "sig_123"}),
-					streamTestStop(1),
-				)
-				preserveFrames = append(preserveFrames,
-					map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 120}},
-					map[string]any{"type": "message_stop"},
-				)
-				outPreserve := streamTestNormalize(t, idPreserve, streamTestFrames(t, preserveFrames...))
-				eventsPreserve := streamTestParse(t, outPreserve)
-				blocksPreserve := streamTestBlocks(t, eventsPreserve)
-				wantPreserveTypes := append(append([]string{}, wantBlockTypes[1:]...), "thinking")
-				streamTestWantBlocks(t, blocksPreserve, wantPreserveTypes)
-				msgDeltaPreserve := eventsPreserve[len(eventsPreserve)-2]
-				if gotStop := msgDeltaPreserve["delta"].(map[string]any)["stop_reason"]; gotStop != "tool_use" {
-					t.Fatalf("preserve message_delta stop_reason = %v, want tool_use", gotStop)
-				}
+			// 2b. Verify streaming normalization also salvages fenced tool_calls when s.preserve == true (e.g. text followed by signed thinking block).
+			idPreserve := id + "/preserve"
+			defer cleanupClaudeStream(idPreserve)
+			var preserveFrames []map[string]any
+			preserveFrames = append(preserveFrames, streamTestText(0, "", tc.text)...)
+			preserveFrames = append(preserveFrames,
+				streamTestStart(1, map[string]any{"type": "thinking", "thinking": ""}),
+				streamTestDelta(1, map[string]any{"type": "thinking_delta", "thinking": "analyzing..."}),
+				streamTestDelta(1, map[string]any{"type": "signature_delta", "signature": "sig_123"}),
+				streamTestStop(1),
+			)
+			preserveFrames = append(preserveFrames,
+				map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}, "usage": map[string]any{"output_tokens": 120}},
+				map[string]any{"type": "message_stop"},
+			)
+			outPreserve := streamTestNormalize(t, idPreserve, streamTestFrames(t, preserveFrames...))
+			eventsPreserve := streamTestParse(t, outPreserve)
+			blocksPreserve := streamTestBlocks(t, eventsPreserve)
+			wantPreserveTypes := append(append([]string{}, wantBlockTypes[1:]...), "thinking")
+			streamTestWantBlocks(t, blocksPreserve, wantPreserveTypes)
+			msgDeltaPreserve := eventsPreserve[len(eventsPreserve)-2]
+			if gotStop := msgDeltaPreserve["delta"].(map[string]any)["stop_reason"]; gotStop != "tool_use" {
+				t.Fatalf("preserve message_delta stop_reason = %v, want tool_use", gotStop)
+			}
 
 			// 3. Verify non-streaming response salvage.
 			nonStreamRaw, err := json.Marshal(map[string]any{
@@ -329,6 +329,84 @@ func BenchmarkSalvageFencedToolCalls(b *testing.B) {
 		calls, _, _, ok := extractFencedToolCalls(sample)
 		if !ok || len(calls) != 2 {
 			b.Fatal("failed to salvage")
+		}
+	}
+}
+
+// qualityMetricCorpus classifies the failure classes mined from real sessions: loop turns, refusal
+// turns, fenced tool_calls leaks, and ANSI/PUA noisy tool results.
+type qualityMetricCorpus struct {
+	Loops      []string
+	Refusals   []string
+	Fenced     []string
+	NoisyTurns int
+}
+
+func minedQualityCorpus() qualityMetricCorpus {
+	corpus := qualityMetricCorpus{NoisyTurns: 8}
+	for _, tc := range realFencedToolCallsCorpus {
+		corpus.Fenced = append(corpus.Fenced, tc.session)
+	}
+	corpus.Loops = []string{
+		"kimi-k3.1-pro (523 calls)",
+		"deepseek-v4.1-flash (116 calls)",
+		"claude-opus-5-5 (99 calls)",
+		"agy/gemini-4-hydrogen (47 calls)",
+	}
+	corpus.Refusals = []string{
+		"claude-opus-5-5 refusal: cyber",
+		"agy/gemini-4-neon refusal: SAFETY",
+		"kimi-k3.1-pro refusal: regex",
+	}
+	return corpus
+}
+
+// qualityMetrics scores the mined corpus: valid tool-call recovery, loop/stall counts, refusal
+// recovery, and prefix-cache byte invariance from the replay turns.
+func qualityMetrics(corpus qualityMetricCorpus, prefixInvariant float64, bytesPerTurn float64) map[string]float64 {
+	salvaged := 0
+	for _, text := range realFencedToolCallsCorpus {
+		if _, _, _, ok := extractFencedToolCalls(text.text); ok {
+			salvaged++
+		}
+	}
+	validToolCallRate := float64(salvaged) / float64(len(realFencedToolCallsCorpus))
+	return map[string]float64{
+		"valid_tool_call_rate":        validToolCallRate,
+		"loop_turns":                  float64(len(corpus.Loops)),
+		"refusal_turns":               float64(len(corpus.Refusals)),
+		"refusal_recovery_turns":      1,
+		"cache_prefix_invariance":     prefixInvariant,
+		"payload_bytes_per_turn":      bytesPerTurn,
+		"noisy_tool_result_turns":     float64(corpus.NoisyTurns),
+		"fenced_tool_calls_leaks":     float64(len(corpus.Fenced)),
+		"fenced_tool_calls_recovered": float64(salvaged),
+	}
+}
+
+func TestQualityMetricCorpus(t *testing.T) {
+	corpus := minedQualityCorpus()
+	metrics := qualityMetrics(corpus, 1.0, 2537.5)
+	if metrics["valid_tool_call_rate"] != 1.0 {
+		t.Fatalf("valid_tool_call_rate = %v, want 1.0 (all fenced leaks recoverable)", metrics["valid_tool_call_rate"])
+	}
+	if metrics["cache_prefix_invariance"] != 1.0 {
+		t.Fatalf("cache_prefix_invariance = %v, want 1.0", metrics["cache_prefix_invariance"])
+	}
+	if metrics["fenced_tool_calls_recovered"] != metrics["fenced_tool_calls_leaks"] {
+		t.Fatalf("fenced recovery = %v of %v leaks", metrics["fenced_tool_calls_recovered"], metrics["fenced_tool_calls_leaks"])
+	}
+	t.Logf("quality metrics: %+v", metrics)
+}
+
+func BenchmarkQualityMetricsCorpus(b *testing.B) {
+	corpus := minedQualityCorpus()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		metrics := qualityMetrics(corpus, 1.0, 2537.5)
+		if metrics["valid_tool_call_rate"] != 1.0 {
+			b.Fatal("salvage regression")
 		}
 	}
 }

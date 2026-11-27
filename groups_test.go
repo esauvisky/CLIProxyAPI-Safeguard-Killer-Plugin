@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
@@ -1287,6 +1288,77 @@ func TestSpeedModeScoresMeasuredSpeed(t *testing.T) {
 	quality := scoreModels(modelGroup{ID: "g", Mode: groupModeQuality, Models: models})
 	if quality[1].Score <= quality[0].Score {
 		t.Fatalf("quality mode must ignore measured speed: %+v", quality)
+	}
+}
+
+func TestReliabilityPenaltyAndCacheWarmth(t *testing.T) {
+	const clean = "reliability-clean"
+	const noisy = "reliability-noisy"
+	speedMu.Lock()
+	speedStats[clean] = &modelSpeedStats{Samples: 1, TokensPerSecond: 100, Attempts: 10}
+	speedStats[noisy] = &modelSpeedStats{Samples: 1, TokensPerSecond: 100, Attempts: 10, Refusals: 5}
+	speedMu.Unlock()
+	t.Cleanup(func() {
+		speedMu.Lock()
+		delete(speedStats, clean)
+		delete(speedStats, noisy)
+		speedMu.Unlock()
+	})
+
+	models := []groupModel{{ID: noisy, Quality: 80}, {ID: clean, Quality: 80}}
+	scores := scoreModels(modelGroup{ID: "g", Mode: groupModeQuality, Models: models})
+	if scores[0].Score != 65 || scores[1].Score != 80 {
+		t.Fatalf("reliability scores = %+v, want noisy 65 and clean 80", scores)
+	}
+	if scores[0].Reliability != 50 || scores[1].Reliability != 100 {
+		t.Fatalf("reliability ratings = %+v, want 50 and 100", scores)
+	}
+
+	// Cache-warmth bonus: a pinned model at equal score survives selection when its prefix cache is live.
+	resetHostState(t)
+	cfg := defaultPluginConfig()
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: []groupModel{{ID: "a", Quality: 80}, {ID: "b", Quality: 82}}}
+	now := time.Now()
+	payload := []byte(`{"messages":[{"role":"user","content":"work"}]}`)
+	recordServed(cfg, "session", group.ID, "a", "", payload, now)
+	stateMu.Lock()
+	groupStates["session\x00"+group.ID].CacheWarm = true
+	stateMu.Unlock()
+	plan := planConversation(cfg, "session", group, payload, now)
+	if plan.Err != nil || !plan.Sticky || plan.Scores[0].Score != 82 {
+		t.Fatalf("cache-warm plan = %+v, want pinned model boosted to 82", plan)
+	}
+	if model, ok := plan.nextModel(0); !ok || model != "a" {
+		t.Fatalf("cache-warm draw = %q, %v, want pinned model a", model, ok)
+	}
+}
+
+func TestToolUseCountAndLoopTurn(t *testing.T) {
+	claudeBody := []byte(`{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"tool_use","id":"t2","name":"Read","input":{}}],"stop_reason":"tool_use"}`)
+	if got := toolUseCountInResponse(claudeBody); got != 2 {
+		t.Fatalf("claude tool count = %d, want 2", got)
+	}
+	openaiBody := []byte(`{"choices":[{"message":{"content":[],"tool_calls":[{"id":"c1"},{"id":"c2"},{"id":"c3"}]}}]}`)
+	if got := toolUseCountInResponse(openaiBody); got != 3 {
+		t.Fatalf("openai tool count = %d, want 3", got)
+	}
+	const model = "loop-count-model"
+	t.Cleanup(func() {
+		speedMu.Lock()
+		delete(speedStats, model)
+		speedMu.Unlock()
+	})
+	loopBody := []byte(`{"content":[`)
+	for i := 0; i < loopLoopToolThreshold; i++ {
+		loopBody = append(loopBody, []byte(`{"type":"tool_use","id":"t`+fmt.Sprintf("%d", i)+`"},`)...)
+	}
+	loopBody = append(loopBody, []byte(`{"type":"text","text":"done"}],"stop_reason":"tool_use"}`)...)
+	recordModelServedTurn(model, toolUseCountInResponse(loopBody))
+	speedMu.RLock()
+	stats := speedStats[model]
+	speedMu.RUnlock()
+	if stats.Attempts != 1 || stats.LoopTurns != 1 || reliabilityRating(stats) != 0 {
+		t.Fatalf("loop stats = %+v, want 1 attempt and 1 loop turn", stats)
 	}
 }
 

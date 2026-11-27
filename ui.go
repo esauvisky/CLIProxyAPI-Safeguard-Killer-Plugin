@@ -1456,8 +1456,9 @@ function renderSpeedCell(model) {
     '</div>';
   }
   const stats = speed.stats;
+  const reliability = (stats.attempts > 0) ? ' · reliability ' + stats.reliability + ' (' + stats.refusals + ' refusal, ' + stats.empty_responses + ' empty, ' + stats.loop_turns + ' loop)' : '';
   const detail = Math.round(stats.tokens_per_second) + ' tok/s · ' + stats.samples + ' sample' + (stats.samples === 1 ? '' : 's') +
-    (stats.first_token_sec > 0 ? ' · ' + stats.first_token_sec.toFixed(2) + 's first token' : '');
+    (stats.first_token_sec > 0 ? ' · ' + stats.first_token_sec.toFixed(2) + 's first token' : '') + reliability;
   return '<div class="speed-cell">' +
     '<div class="speed-head"><span class="mono">' + speed.rating + '</span> <span class="subtle small">/ 100</span></div>' +
     '<span class="meter"><span class="meter-fill" style="width:' + width + '%"></span></span>' +
@@ -1470,7 +1471,8 @@ function renderScoreCell(e) {
   if (e.disabled) return '<span class="badge">disabled</span>';
   const windowLabel = e.inPool ? '<span class="badge ok">in pool</span>' : '<span class="badge">out of pool</span>';
   const gap = e.inPool ? '' : '<div class="model-meta">' + e.gap.toFixed(1) + ' below best</div>';
-  return '<div class="mono" style="font-size:14px;font-weight:700;">' + e.score.toFixed(1) + '</div>' + windowLabel + gap;
+  const reliability = e.reliability && e.reliability < 100 ? '<div class="model-meta">reliability ' + e.reliability.toFixed(0) + '</div>' : '';
+  return '<div class="mono" style="font-size:14px;font-weight:700;">' + e.score.toFixed(1) + '</div>' + windowLabel + gap + reliability;
 }
 
 function renderShareCell(e) {

@@ -220,6 +220,9 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if errCall != nil {
 			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error(), Duration: time.Since(attemptStart)})
 			recordConversationFailure(session, group.ID, model, errCall.Error(), req.Payload, time.Now())
+			if !aux {
+				recordModelReliabilityFailure(model, errCall.Error())
+			}
 			lastErr = errCall
 			continue
 		}
@@ -231,6 +234,9 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 			if errRefusal, salvaged := checkNonStreamResponse(resp.Body); errRefusal != nil {
 				attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errRefusal.Error(), Duration: time.Since(attemptStart), Salvaged: salvaged})
 				recordConversationFailure(session, group.ID, model, errRefusal.Error(), req.Payload, time.Now())
+				if !aux {
+					recordModelReliabilityFailure(model, errRefusal.Error())
+				}
 				lastErr = errRefusal
 				continue
 			}
@@ -239,6 +245,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		bodyOut := salvageFencedToolCallsNonStream(resp.Body, effectiveFormat(req.Format, req.SourceFormat))
 		if !aux {
 			recordModelSpeedResponse(model, bodyOut, attemptStart, time.Now())
+			recordModelServedTurn(model, toolUseCountInResponse(bodyOut))
 		}
 		recordGroupDecision(group, session, attempts, model, plan.SelectedScores)
 		prevModel := recordServed(cfg, session, group.ID, model, prevLookupModel, req.Payload, time.Now())
@@ -311,6 +318,9 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if errCall != nil {
 			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error(), Duration: time.Since(attemptStart)})
 			recordConversationFailure(session, group.ID, model, errCall.Error(), req.Payload, time.Now())
+			if !aux {
+				recordModelReliabilityFailure(model, errCall.Error())
+			}
 			lastErr = errCall
 			continue
 		}
@@ -322,6 +332,9 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if errPrefetch != nil {
 			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errPrefetch.Error(), Duration: time.Since(attemptStart), Salvaged: salvaged})
 			recordConversationFailure(session, group.ID, model, errPrefetch.Error(), req.Payload, time.Now())
+			if !aux {
+				recordModelReliabilityFailure(model, errPrefetch.Error())
+			}
 			lastErr = errPrefetch
 			continue
 		}
@@ -353,6 +366,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 // forwardStream flushes prefetched chunks and copies the remainder of the target model's stream.
 func forwardStream(source, target, callbackID string, prefetched [][]byte, sourceDone, shiftIndices, stampSafeguards, checkRefusal bool, session string, group modelGroup, model string, attemptStart time.Time, measureSpeed bool) {
 	seenToolIDs := make(map[string]bool)
+	toolUseIDs := make(map[string]bool)
 	firstOutput := time.Time{}
 	outputTokens := 0
 	observeSpeed := func(payload []byte) {
@@ -370,9 +384,13 @@ func forwardStream(source, target, callbackID string, prefetched [][]byte, sourc
 		if measureSpeed && outputTokens > 0 && !firstOutput.IsZero() {
 			recordModelSpeedSample(model, outputTokens, attemptStart, firstOutput, time.Now())
 		}
+		if measureSpeed {
+			recordModelServedTurn(model, len(toolUseIDs))
+		}
 	}
 	for _, payload := range prefetched {
 		observeSpeed(payload)
+		collectToolUseIDsFromChunk(payload, toolUseIDs)
 		payload = processStreamSafeguardChunk(payload, seenToolIDs, stampSafeguards)
 		if _, errEmit := hostCall(methodHostStreamEmit, hostStreamEmit{StreamID: target, Payload: payload, HostCallbackID: callbackID}); errEmit != nil {
 			if !sourceDone {
@@ -399,6 +417,7 @@ func forwardStream(source, target, callbackID string, prefetched [][]byte, sourc
 		}
 		if len(chunk.Payload) > 0 {
 			observeSpeed(chunk.Payload)
+			collectToolUseIDsFromChunk(chunk.Payload, toolUseIDs)
 			observeConversationUsage(session, group.ID, chunk.Payload)
 			if checkRefusal {
 				if refusal, _, _, _, _ := inspectStreamChunk(chunk.Payload); refusal != "" {

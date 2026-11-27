@@ -147,12 +147,16 @@ func logRoutingLocked(group modelGroup, key, event, detail string) {
 const (
 	modelScoreTolerance   = 3.0
 	modelScoreTemperature = 1.0
+	// CacheWarmBonus lifts the pinned model's score while its provider prefix cache is live, so a
+	// competitor must beat it by more than the bonus before selection invalidates the cache.
+	cacheWarmBonus = 2.0
 )
 
 type modelScore struct {
 	Model       string  `json:"model"`
 	Quality     float64 `json:"quality"`
 	Speed       float64 `json:"speed,omitempty"`
+	Reliability float64 `json:"reliability,omitempty"`
 	Score       float64 `json:"score"`
 	Probability float64 `json:"probability"`
 	Excluded    string  `json:"excluded,omitempty"`
@@ -164,22 +168,29 @@ func scoreModels(group modelGroup) []modelScore {
 		if model.Disabled {
 			continue
 		}
+		quality := qualityRatingWithReliability(model.ID, model.Quality)
+		speed := 0.0
 		var score float64
 		switch group.Mode {
 		case groupModeQuality:
-			score = model.Quality
+			score = quality
 		case groupModeSpeed:
+			speed = measuredModelSpeed(model.ID)
+			score = (2*speed + quality) / 3
 		default:
 			panic(fmt.Errorf("group %s has invalid mode %q", group.ID, group.Mode))
 		}
-		speed := 0.0
-		if group.Mode == groupModeSpeed {
-			speed = measuredModelSpeed(model.ID)
-			score = (2*speed + model.Quality) / 3
-		}
-		scores = append(scores, modelScore{Model: model.ID, Quality: model.Quality, Speed: speed, Score: score})
+		scores = append(scores, modelScore{Model: model.ID, Quality: model.Quality, Speed: speed, Reliability: reliabilityRating(measuredStats(model.ID)), Score: score})
 	}
 	return scores
+}
+
+// measuredStats returns the reliability counters for model, or nil when nothing was recorded.
+func measuredStats(model string) *modelSpeedStats {
+	speedMu.RLock()
+	stats := speedStats[model]
+	speedMu.RUnlock()
+	return stats
 }
 
 // Selection only happens at conversation boundaries or when the pinned model is unusable.
@@ -227,6 +238,9 @@ func planConversation(cfg pluginConfig, session string, group modelGroup, payloa
 			plan.Skipped = append(plan.Skipped, groupAttempt{Model: candidate.Model, Result: "skipped: " + candidate.Excluded})
 		} else if candidate.Model == active {
 			plan.Sticky = true
+			if state != nil && state.CacheWarm {
+				candidate.Score += cacheWarmBonus
+			}
 		}
 	}
 	setSelectionProbabilities(plan.Scores, active, plan.Sticky)

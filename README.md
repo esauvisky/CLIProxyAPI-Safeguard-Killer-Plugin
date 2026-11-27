@@ -61,7 +61,12 @@ Each Smart Group needs an explicit `mode`, and each model in it needs a `quality
 
 A new conversation, or one reset by compaction, scores every eligible model (excluding refused, capability-incompatible, and unavailable models). Only models within `3` points of the best score stay in the pool, and one is picked by softmax over their scores with temperature `1`. Models farther from the best get no traffic. The pick then stays sticky as described above. When it refuses or becomes unusable, the remaining eligible models are scored the same way.
 
-Every group decision logs `mode` and `model_scores` (`model`, `quality`, `speed`, `score`, `probability`, `excluded`). The **Recent Decisions** tab and the conversation trail show these for each pick.
+### Reliability scoring & cache-warmth bonus
+Configured `quality` is a prior; measured reliability adjusts it. Each model accumulates attempts plus three failure classes observed from real responses: **refusals** (`refusal` / `refusal: *`), **empty responses**, and **loop turns** (a served turn emitting 25 or more tool calls). The failure rate `(refusals + empty + loops) / attempts` subtracts up to `15` quality points at a `0.5` failure rate, so a model that refuses or loops often no longer ties a clean model at the same Artificial Analysis score. Quota, capability, and transient errors do not count against reliability.
+
+While a conversation's provider prefix cache is live (`cache_read_input_tokens` or `cache_creation_input_tokens` observed on the served model), the pinned model's score receives a `+2` bonus. A competitor must then beat it by more than `2` points before selection invalidates the cache. Compaction clears the bonus.
+
+Every group decision logs `mode` and `model_scores` (`model`, `quality`, `speed`, `reliability`, `score`, `probability`, `excluded`). The **Recent Decisions** tab, the conversation trail, and the speed cell show these for each pick.
 
 ---
 

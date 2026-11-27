@@ -22,6 +22,10 @@ const (
 	speedUnmeasuredRating = 50.0
 	// Each completed response moves the per-model EWMA by a quarter of the new sample.
 	speedSampleWeight = 0.25
+	// First-token latency above 3s starts penalizing speed rating, up to 20 points at 23s+.
+	speedFastFirstTokenSec  = 3.0
+	speedSlowFirstTokenSec  = 23.0
+	speedMaxFirstTokenPenal = 20.0
 )
 
 type modelSpeedStats struct {
@@ -53,6 +57,18 @@ func speedRating(tokensPerSecond float64) float64 {
 	return math.Round(100 * math.Min(1, math.Max(0, frac)))
 }
 
+// speedRatingWithTTFT combines output throughput (0-100) with a bounded penalty when first-token
+// latency exceeds speedFastFirstTokenSec so interactive turns in speed mode prefer responsive models.
+func speedRatingWithTTFT(tokensPerSecond, firstTokenSec float64) float64 {
+	base := speedRating(tokensPerSecond)
+	if base <= 0 || firstTokenSec <= speedFastFirstTokenSec || math.IsNaN(firstTokenSec) || math.IsInf(firstTokenSec, 0) {
+		return base
+	}
+	frac := (firstTokenSec - speedFastFirstTokenSec) / (speedSlowFirstTokenSec - speedFastFirstTokenSec)
+	penalty := math.Round(speedMaxFirstTokenPenal * math.Min(1, math.Max(0, frac)))
+	return math.Max(0, base-penalty)
+}
+
 // measuredModelSpeed returns the learned rating, or a neutral 50 until a model completes a request
 // with usage data. Missing usage is not a failure: some upstreams never report output tokens.
 func measuredModelSpeed(model string) float64 {
@@ -62,7 +78,7 @@ func measuredModelSpeed(model string) float64 {
 	if stats == nil || stats.Samples == 0 || stats.TokensPerSecond <= 0 {
 		return speedUnmeasuredRating
 	}
-	return speedRating(stats.TokensPerSecond)
+	return speedRatingWithTTFT(stats.TokensPerSecond, stats.FirstTokenSec)
 }
 
 func speedStatsSnapshot() map[string]modelSpeedSnapshot {
@@ -77,7 +93,7 @@ func speedStatsSnapshot() map[string]modelSpeedSnapshot {
 			Samples:         stats.Samples,
 			TokensPerSecond: stats.TokensPerSecond,
 			FirstTokenSec:   stats.FirstTokenSec,
-			Rating:          speedRating(stats.TokensPerSecond),
+			Rating:          speedRatingWithTTFT(stats.TokensPerSecond, stats.FirstTokenSec),
 			LastMeasured:    stats.LastMeasured,
 		}
 	}

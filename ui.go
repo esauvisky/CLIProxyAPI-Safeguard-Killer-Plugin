@@ -812,6 +812,13 @@ const uiHTML = `<!doctype html>
             <span class="feature-desc">When Claude Code's Read rejects a file as too large, append a note that a small limit still fails on files with very long lines and that Grep -n plus sed | cut reads them, so models stop retrying smaller limits.</span>
           </span>
         </label>
+        <label class="feature-item">
+          <input type="checkbox" data-feature="flag_repeated_tool_calls">
+          <span>
+            <span class="feature-title">Flag repeated tool calls</span>
+            <span class="feature-desc">When a tool call repeats an earlier call of the same user turn with identical input and identical output, append a note to that tool result saying nothing changed, so models stop polling or re-reading in circles.</span>
+          </span>
+        </label>
       </div>
       <div class="form-grid" style="margin-top: 14px;" id="noticePrefixForm">
         <label class="field"><span class="cfg-key">Client notice prefix</span>
@@ -1136,6 +1143,7 @@ const FEATURE_KEYS = [
   'strip_model_identity',
   'sanitize_agy_text',
   'hint_oversized_reads',
+  'flag_repeated_tool_calls',
 ];
 
 function featuresOf(cfg) {

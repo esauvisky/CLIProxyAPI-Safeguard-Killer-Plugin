@@ -1571,6 +1571,143 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessa
 	return out, nil
 }
 
+// repeatedToolCallNote is appended to a tool_result whose call and output both match an earlier
+// call in the same user turn, so the model sees that repeating it produced nothing new.
+const repeatedToolCallNote = "[Note: this exact call already ran earlier in this turn and returned identical output. Nothing changed. Use the earlier result or take a different step instead of repeating it.]"
+
+// flagRepeatedToolCalls appends repeatedToolCallNote to every tool_result that repeats an earlier
+// call of the same user turn with the same name, input and output. Turns reset at each message
+// the user typed. The note depends only on the block and earlier messages, so a message keeps its
+// bytes when later turns are appended and the prompt cache prefix stays stable.
+func flagRepeatedToolCalls(rawMessages json.RawMessage) (json.RawMessage, error) {
+	if !bytes.Contains(rawMessages, []byte(`"tool_result"`)) {
+		return rawMessages, nil
+	}
+	var messages []json.RawMessage
+	if errUnmarshal := json.Unmarshal(rawMessages, &messages); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode request messages: %w", errUnmarshal)
+	}
+	type toolBlock struct {
+		Type      string          `json:"type"`
+		ID        string          `json:"id"`
+		Name      string          `json:"name"`
+		Input     json.RawMessage `json:"input"`
+		ToolUseID string          `json:"tool_use_id"`
+		Content   json.RawMessage `json:"content"`
+	}
+	type toolMessage struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	calls := make(map[string]string)
+	seen := make(map[string]bool)
+	changed := false
+	for i, rawMsg := range messages {
+		var msg toolMessage
+		if errUnmarshal := json.Unmarshal(rawMsg, &msg); errUnmarshal != nil {
+			return nil, fmt.Errorf("decode request message: %w", errUnmarshal)
+		}
+		if firstJSONByte(msg.Content) != '[' {
+			if msg.Role == "user" {
+				seen = make(map[string]bool)
+			}
+			continue
+		}
+		var blocks []toolBlock
+		if errUnmarshal := json.Unmarshal(msg.Content, &blocks); errUnmarshal != nil {
+			return nil, fmt.Errorf("decode message content: %w", errUnmarshal)
+		}
+		if msg.Role == "assistant" {
+			for _, block := range blocks {
+				if block.Type == "tool_use" {
+					calls[block.ID] = block.Name + "\x00" + string(block.Input)
+				}
+			}
+			continue
+		}
+		hasResult := false
+		var repeated []int
+		for j, block := range blocks {
+			if block.Type != "tool_result" {
+				continue
+			}
+			hasResult = true
+			call, ok := calls[block.ToolUseID]
+			if !ok {
+				continue
+			}
+			key := call + "\x00" + string(block.Content)
+			if seen[key] {
+				repeated = append(repeated, j)
+			}
+			seen[key] = true
+		}
+		if !hasResult && msg.Role == "user" {
+			seen = make(map[string]bool)
+			continue
+		}
+		if len(repeated) == 0 {
+			continue
+		}
+		updated, errNote := noteRepeatedToolResults(rawMsg, repeated)
+		if errNote != nil {
+			return nil, errNote
+		}
+		messages[i] = updated
+		changed = true
+	}
+	if !changed {
+		return rawMessages, nil
+	}
+	return marshalNoEscape(messages)
+}
+
+// noteRepeatedToolResults appends repeatedToolCallNote to the content of the given tool_result
+// blocks of one message, as a trailing paragraph for string content or a trailing text block.
+func noteRepeatedToolResults(rawMsg json.RawMessage, indexes []int) (json.RawMessage, error) {
+	var msg map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(rawMsg, &msg); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode request message: %w", errUnmarshal)
+	}
+	var blocks []map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(msg["content"], &blocks); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode message content: %w", errUnmarshal)
+	}
+	for _, j := range indexes {
+		block := blocks[j]
+		var text string
+		var errEncode error
+		switch firstJSONByte(block["content"]) {
+		case '"':
+			if errUnmarshal := json.Unmarshal(block["content"], &text); errUnmarshal != nil {
+				return nil, fmt.Errorf("decode tool_result content: %w", errUnmarshal)
+			}
+			block["content"], errEncode = marshalNoEscape(strings.TrimRight(text, "\n") + "\n\n" + repeatedToolCallNote)
+		case '[':
+			var inner []json.RawMessage
+			if errUnmarshal := json.Unmarshal(block["content"], &inner); errUnmarshal != nil {
+				return nil, fmt.Errorf("decode tool_result content: %w", errUnmarshal)
+			}
+			note, errNote := marshalNoEscape(map[string]string{"type": "text", "text": repeatedToolCallNote})
+			if errNote != nil {
+				return nil, errNote
+			}
+			block["content"], errEncode = marshalNoEscape(append(inner, note))
+		default:
+			block["content"], errEncode = marshalNoEscape(repeatedToolCallNote)
+		}
+		if errEncode != nil {
+			return nil, fmt.Errorf("encode tool_result content: %w", errEncode)
+		}
+	}
+	encoded, errEncode := marshalNoEscape(blocks)
+	if errEncode != nil {
+		return nil, fmt.Errorf("encode message content: %w", errEncode)
+	}
+	msg["content"] = encoded
+	return marshalNoEscape(msg)
+}
+
 // cleanMessagesWithoutSystemTurns is cleanMessages for a history with no role="system" turn, where
 // foldSystemTurns has nothing to fold. Messages carrying no cleanable text keep their exact bytes
 // and are never decoded; only messages that change are re-encoded.
@@ -1932,6 +2069,12 @@ func sanitizeRequest(payload []byte, headers http.Header, cfg pluginConfig) (bod
 			cleaned, errClean := cleanMessages(rawMessages, cfg)
 			if errClean != nil {
 				return nil, nil, nil, false, errClean
+			}
+			if cfg.Features.FlagRepeatedToolCalls {
+				cleaned, errClean = flagRepeatedToolCalls(cleaned)
+				if errClean != nil {
+					return nil, nil, nil, false, errClean
+				}
 			}
 			if !bytes.Equal(cleaned, rawMessages) {
 				body["messages"] = cleaned

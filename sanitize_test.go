@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -516,4 +517,63 @@ func TestAssistantRefusalsAndNarrationAreKept(t *testing.T) {
 	if got := len(sanitizedMessages(t, out)); got != 5 {
 		t.Fatalf("messages = %d, want 5 untouched", got)
 	}
+}
+
+func TestFlagRepeatedToolCalls(t *testing.T) {
+	call := func(id string) map[string]any {
+		return map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "tool_use", "id": id, "name": "Read", "input": map[string]any{"file_path": "/tmp/out.txt"}}}}
+	}
+	result := func(id, out string) map[string]any {
+		return map[string]any{"role": "user", "content": []any{map[string]any{"type": "tool_result", "tool_use_id": id, "content": out}}}
+	}
+	turns := []any{
+		map[string]any{"role": "user", "content": "check the job"},
+		call("a"), result("a", "running"),
+		call("b"), result("b", "running"),
+		call("c"), result("c", "done"),
+		map[string]any{"role": "user", "content": "check again"},
+		call("d"), result("d", "done"),
+		call("e"), result("e", "done"),
+	}
+	var prev []map[string]json.RawMessage
+	for n := 3; n <= len(turns); n++ {
+		out := sanitize(t, mustJSON(t, map[string]any{"model": "m", "messages": turns[:n]}))
+		msgs := sanitizedMessages(t, out)
+		for i := range prev {
+			if !bytes.Equal(mustMarshal(t, prev[i]), mustMarshal(t, msgs[i])) {
+				t.Fatalf("prefix %d changed when message %d was appended", i, n)
+			}
+		}
+		prev = msgs
+	}
+	flagged := map[int]bool{}
+	for i, m := range prev {
+		if bytes.Contains(m["content"], []byte("this exact call already ran")) {
+			flagged[i] = true
+		}
+	}
+	want := map[int]bool{4: true, 11: true}
+	if !reflect.DeepEqual(flagged, want) {
+		t.Fatalf("flagged messages %v, want %v", flagged, want)
+	}
+
+	cfg := defaultPluginConfig()
+	cfg.Features.FlagRepeatedToolCalls = false
+	body := mustJSON(t, map[string]any{"model": "m", "messages": turns})
+	out, _, _, _, err := sanitizeRequest([]byte(body), http.Header{}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(out, []byte("this exact call already ran")) {
+		t.Fatalf("note added with flag_repeated_tool_calls off")
+	}
+}
+
+func mustMarshal(t *testing.T, v any) []byte {
+	t.Helper()
+	out, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }

@@ -46,10 +46,7 @@ const (
 
 // Claude Code's Read rejects a result over its token cap, and models retry with a smaller line
 // limit that still fails when the file has very long lines.
-const (
-	claudeOversizedReadError = "exceeds maximum allowed tokens"
-	oversizedReadHint        = "If a small limit still exceeds the cap, the file has very long lines (minified code or embedded data), so fewer lines will not fit. Find the lines with Grep -n, then read them with Bash: sed -n 'START,ENDp' FILE | cut -c1-300."
-)
+const claudeOversizedReadError = "exceeds maximum allowed tokens"
 
 var refusalTaintHeaders = []string{
 	"x-is-refusal-fallback",
@@ -1365,9 +1362,6 @@ func cleanText(text, role string, inToolResult bool, prefixes []string, cfg plug
 		if cfg.Features.StripReaDirectives {
 			text = stripReaDirectives(text)
 		}
-		if cfg.Features.HintOversizedReads && strings.HasPrefix(strings.TrimSpace(text), "File content (") && strings.Contains(text, claudeOversizedReadError) {
-			text = strings.TrimSpace(text) + "\n" + oversizedReadHint
-		}
 		return text
 	}
 	if cfg.Features.RewriteCyberSystemPrompt && (role == "system" || role == "developer") {
@@ -1479,9 +1473,6 @@ func messagesNeedCleaning(raw []byte, cfg pluginConfig, prefixes []string) bool 
 	if cfg.Features.NeutralizeClassifierStopNudge && containsClassifierNudge(raw) {
 		return true
 	}
-	if cfg.Features.HintOversizedReads && bytes.Contains(raw, []byte(claudeOversizedReadError)) {
-		return true
-	}
 	if cfg.Features.StripRestrictiveReminders {
 		for _, needle := range restrictiveReminderNeedles {
 			if bytes.Contains(raw, needle) {
@@ -1575,11 +1566,20 @@ func cleanMessages(rawMessages json.RawMessage, cfg pluginConfig) (json.RawMessa
 // call in the same user turn, so the model sees that repeating it produced nothing new.
 const repeatedToolCallNote = "[Note: this exact call already ran earlier in this turn and returned identical output. Nothing changed. Use the earlier result or take a different step instead of repeating it.]"
 
-// flagRepeatedToolCalls appends repeatedToolCallNote to every tool_result that repeats an earlier
-// call of the same user turn with the same name, input and output. Turns reset at each message
-// the user typed. The note depends only on the block and earlier messages, so a message keeps its
-// bytes when later turns are appended and the prompt cache prefix stays stable.
-func flagRepeatedToolCalls(rawMessages json.RawMessage) (json.RawMessage, error) {
+// Claude Code's Read reads 2000 lines when the call sets no limit.
+const claudeReadDefaultLimit = 2000
+
+type toolCall struct {
+	Name  string
+	Input json.RawMessage
+}
+
+// annotateToolResults appends notes to tool_result blocks: repeatedToolCallNote to a result that
+// repeats an earlier call of the same user turn with the same name, input and output, and a
+// ready-to-run command to a Read rejected for exceeding the token cap. Turns reset at each
+// message the user typed. A note depends only on its block and earlier messages, so a message
+// keeps its bytes when later turns are appended and the prompt cache prefix stays stable.
+func annotateToolResults(rawMessages json.RawMessage, features featureConfig) (json.RawMessage, error) {
 	if !bytes.Contains(rawMessages, []byte(`"tool_result"`)) {
 		return rawMessages, nil
 	}
@@ -1599,7 +1599,7 @@ func flagRepeatedToolCalls(rawMessages json.RawMessage) (json.RawMessage, error)
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	}
-	calls := make(map[string]string)
+	calls := make(map[string]toolCall)
 	seen := make(map[string]bool)
 	changed := false
 	for i, rawMsg := range messages {
@@ -1620,13 +1620,13 @@ func flagRepeatedToolCalls(rawMessages json.RawMessage) (json.RawMessage, error)
 		if msg.Role == "assistant" {
 			for _, block := range blocks {
 				if block.Type == "tool_use" {
-					calls[block.ID] = block.Name + "\x00" + string(block.Input)
+					calls[block.ID] = toolCall{Name: block.Name, Input: block.Input}
 				}
 			}
 			continue
 		}
 		hasResult := false
-		var repeated []int
+		notes := make(map[int]string)
 		for j, block := range blocks {
 			if block.Type != "tool_result" {
 				continue
@@ -1636,20 +1636,31 @@ func flagRepeatedToolCalls(rawMessages json.RawMessage) (json.RawMessage, error)
 			if !ok {
 				continue
 			}
-			key := call + "\x00" + string(block.Content)
-			if seen[key] {
-				repeated = append(repeated, j)
+			var parts []string
+			if features.HintOversizedReads && call.Name == "Read" && bytes.Contains(block.Content, []byte(claudeOversizedReadError)) {
+				hint, errHint := oversizedReadCommand(call.Input)
+				if errHint != nil {
+					return nil, errHint
+				}
+				parts = append(parts, hint)
+			}
+			key := call.Name + "\x00" + string(call.Input) + "\x00" + string(block.Content)
+			if features.FlagRepeatedToolCalls && seen[key] {
+				parts = append(parts, repeatedToolCallNote)
 			}
 			seen[key] = true
+			if len(parts) > 0 {
+				notes[j] = strings.Join(parts, "\n\n")
+			}
 		}
 		if !hasResult && msg.Role == "user" {
 			seen = make(map[string]bool)
 			continue
 		}
-		if len(repeated) == 0 {
+		if len(notes) == 0 {
 			continue
 		}
-		updated, errNote := noteRepeatedToolResults(rawMsg, repeated)
+		updated, errNote := noteToolResults(rawMsg, notes)
 		if errNote != nil {
 			return nil, errNote
 		}
@@ -1662,9 +1673,33 @@ func flagRepeatedToolCalls(rawMessages json.RawMessage) (json.RawMessage, error)
 	return marshalNoEscape(messages)
 }
 
-// noteRepeatedToolResults appends repeatedToolCallNote to the content of the given tool_result
-// blocks of one message, as a trailing paragraph for string content or a trailing text block.
-func noteRepeatedToolResults(rawMsg json.RawMessage, indexes []int) (json.RawMessage, error) {
+// oversizedReadCommand builds the note for a Read rejected by the token cap: the same lines
+// through sed with every line cut to 300 characters, and the grep form for locating lines. Files
+// that hit the cap at a small limit hold very long lines (base64 blobs, minified code), which cut
+// shortens while keeping the code around them readable.
+func oversizedReadCommand(rawInput json.RawMessage) (string, error) {
+	var input struct {
+		FilePath string `json:"file_path"`
+		Offset   int    `json:"offset"`
+		Limit    int    `json:"limit"`
+	}
+	if errUnmarshal := json.Unmarshal(rawInput, &input); errUnmarshal != nil {
+		return "", fmt.Errorf("decode Read input: %w", errUnmarshal)
+	}
+	start := max(input.Offset, 1)
+	limit := input.Limit
+	if limit <= 0 {
+		limit = claudeReadDefaultLimit
+	}
+	path := "'" + strings.ReplaceAll(input.FilePath, "'", `'\''`) + "'"
+	return fmt.Sprintf("[Note: a smaller limit will not fit either: this file has very long lines (embedded data or minified code). "+
+		"Read these lines with long lines cut short using Bash: sed -n '%d,%dp' %s | cut -c1-300\n"+
+		"To find lines first: grep -n 'PATTERN' %s | cut -c1-300]", start, start+limit-1, path, path), nil
+}
+
+// noteToolResults appends each note to the content of its tool_result block in one message, as
+// a trailing paragraph for string content or a trailing text block for block content.
+func noteToolResults(rawMsg json.RawMessage, notes map[int]string) (json.RawMessage, error) {
 	var msg map[string]json.RawMessage
 	if errUnmarshal := json.Unmarshal(rawMsg, &msg); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode request message: %w", errUnmarshal)
@@ -1673,7 +1708,7 @@ func noteRepeatedToolResults(rawMsg json.RawMessage, indexes []int) (json.RawMes
 	if errUnmarshal := json.Unmarshal(msg["content"], &blocks); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode message content: %w", errUnmarshal)
 	}
-	for _, j := range indexes {
+	for j, note := range notes {
 		block := blocks[j]
 		var text string
 		var errEncode error
@@ -1682,19 +1717,19 @@ func noteRepeatedToolResults(rawMsg json.RawMessage, indexes []int) (json.RawMes
 			if errUnmarshal := json.Unmarshal(block["content"], &text); errUnmarshal != nil {
 				return nil, fmt.Errorf("decode tool_result content: %w", errUnmarshal)
 			}
-			block["content"], errEncode = marshalNoEscape(strings.TrimRight(text, "\n") + "\n\n" + repeatedToolCallNote)
+			block["content"], errEncode = marshalNoEscape(strings.TrimRight(text, "\n") + "\n\n" + note)
 		case '[':
 			var inner []json.RawMessage
 			if errUnmarshal := json.Unmarshal(block["content"], &inner); errUnmarshal != nil {
 				return nil, fmt.Errorf("decode tool_result content: %w", errUnmarshal)
 			}
-			note, errNote := marshalNoEscape(map[string]string{"type": "text", "text": repeatedToolCallNote})
+			noteBlock, errNote := marshalNoEscape(map[string]string{"type": "text", "text": note})
 			if errNote != nil {
 				return nil, errNote
 			}
-			block["content"], errEncode = marshalNoEscape(append(inner, note))
+			block["content"], errEncode = marshalNoEscape(append(inner, noteBlock))
 		default:
-			block["content"], errEncode = marshalNoEscape(repeatedToolCallNote)
+			block["content"], errEncode = marshalNoEscape(note)
 		}
 		if errEncode != nil {
 			return nil, fmt.Errorf("encode tool_result content: %w", errEncode)
@@ -2070,8 +2105,8 @@ func sanitizeRequest(payload []byte, headers http.Header, cfg pluginConfig) (bod
 			if errClean != nil {
 				return nil, nil, nil, false, errClean
 			}
-			if cfg.Features.FlagRepeatedToolCalls {
-				cleaned, errClean = flagRepeatedToolCalls(cleaned)
+			if cfg.Features.FlagRepeatedToolCalls || cfg.Features.HintOversizedReads {
+				cleaned, errClean = annotateToolResults(cleaned, cfg.Features)
 				if errClean != nil {
 					return nil, nil, nil, false, errClean
 				}

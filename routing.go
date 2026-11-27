@@ -60,10 +60,10 @@ func (s *conversationState) skipReasonLocked(model string, payload []byte) strin
 		delete(s.Failures, model)
 		return ""
 	case "context_too_long":
+		// Kept while the payload is smaller: the model failed at AtBytes and fails there again.
 		if f.AtBytes > 0 && len(payload) >= f.AtBytes {
 			return f.Reason
 		}
-		delete(s.Failures, model)
 		return ""
 	case "refusal":
 		if f.Reason == "empty response" {
@@ -90,6 +90,20 @@ func (s *conversationState) conversationCompactedLocked(payload []byte) bool {
 	}
 	messageCount := payloadMessageCount(payload)
 	return messageCount > 0 && messageCount*2 <= s.LastMessageCount
+}
+
+// contextLimitFailures keeps the context_too_long failures across a compaction reset. Each one
+// only applies while the payload is at least the size that failed, so after a real compaction the
+// model is usable again, and a request misread as compaction cannot route the full history back to
+// a model that rejected it.
+func contextLimitFailures(failures map[string]*conversationFailure) map[string]*conversationFailure {
+	kept := make(map[string]*conversationFailure)
+	for model, f := range failures {
+		if f.Kind == "context_too_long" {
+			kept[model] = f
+		}
+	}
+	return kept
 }
 
 func payloadMessageCount(payload []byte) int {
@@ -206,7 +220,7 @@ func planConversation(cfg pluginConfig, session string, group modelGroup, payloa
 			beforeBytes, beforeMessages := state.LastPayloadBytes, state.LastMessageCount
 			plan.Compacted = true
 			state.Current = ""
-			state.Failures = make(map[string]*conversationFailure)
+			state.Failures = contextLimitFailures(state.Failures)
 			state.CacheWarm = false
 			state.LastPayloadBytes = len(payload)
 			state.LastMessageCount = payloadMessageCount(payload)
@@ -597,7 +611,8 @@ func classifyAttemptFailure(rawDetail string) string {
 }
 
 // isAuxiliaryRequest reports whether the request is a background helper call (such as Claude Code's
-// away_summary recap, prompt_suggestion, session rename, or agent_summary) where injecting a
+// away_summary recap, prompt_suggestion, session rename, agent_summary, or the agent-state
+// notification classifier) where injecting a
 // human-facing router banner would corrupt the caller's parsed output.
 func isAuxiliaryRequest(payload []byte) bool {
 	for _, marker := range []string{
@@ -607,6 +622,7 @@ func isAuxiliaryRequest(payload []byte) bool {
 		"most recent action in 3-5 words using present tense (-ing).",
 		"Never consult the advisor tool.",
 		"Your task is to create a detailed summary of the conversation",
+		"Read the tail of what the agent just said and decide which of four states it's in",
 	} {
 		if bytes.Contains(payload, []byte(marker)) {
 			return true

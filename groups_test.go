@@ -426,6 +426,7 @@ func TestGroupSessionKeySeparatesConversations(t *testing.T) {
 		{"wrapped metadata", `{"request":{"metadata":{"user_id":"{\"session_id\":\"child\",\"parent_id\":\"parent\"}"}}}`, "claude:child"},
 		{"host without client identity", `{"messages":[]}`, "shared-host"},
 		{"helper conversation", `{"metadata":{"user_id":"user_abc_session_parent"},"messages":[{"role":"user","content":"Your task is to create a detailed summary of the conversation"}]}`, "claude:parent\x00auxiliary"},
+		{"agent-state classifier", `{"metadata":{"user_id":"user_abc_session_parent"},"system":[{"type":"text","text":"A user kicked off a Claude Code agent to do a coding task and walked away. Read the tail of what the agent just said and decide which of four states it's in, so the system knows whether to notify the user."}],"messages":[{"role":"user","content":"tail"}]}`, "claude:parent\x00auxiliary"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -573,6 +574,40 @@ func TestProgrammaticCompactionResetAndCapabilitySkips(t *testing.T) {
 	plan4 := planConversation(cfg, sess, group, compactedPayload, now.Add(25*time.Minute))
 	if plan4.Err != nil || !plan4.Compacted || plan4.Sticky || plan4.PrevModel != "" || plan4.Scores[0].Probability != 1 || len(plan4.Skipped) != 0 {
 		t.Fatalf("plan4 after compaction = %+v, want compaction and m1 selected", plan4)
+	}
+}
+
+func TestContextLimitFailureSurvivesCompactionReset(t *testing.T) {
+	resetHostState(t)
+	cfg := defaultPluginConfig()
+	group := modelGroup{ID: "smart", Name: "Smart", Mode: groupModeQuality, Models: ratedGroupModels("big", "small")}
+	cfg.Groups = []modelGroup{group}
+	now := time.Now()
+	sess := "claude:sess-context"
+	history := func(n int, size int) []byte {
+		parts := make([]string, n)
+		for i := range parts {
+			parts[i] = `{"role":"user","content":"` + strings.Repeat("a", size) + `"}`
+		}
+		return []byte(`{"messages":[` + strings.Join(parts, ",") + `]}`)
+	}
+	full := history(40, 4*1024)
+	if got := summarizeAttemptReason(`host callback host.model.execute_stream: {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1093210 tokens > 1000000 maximum"}}`); got != "context too long" {
+		t.Fatalf("prompt-too-long summary = %q", got)
+	}
+	recordServed(cfg, sess, group.ID, "small", "", full, now)
+	recordConversationFailure(sess, group.ID, "big", `{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 1093210 tokens > 1000000 maximum"}}`, full, now)
+
+	side := history(1, 1024)
+	if plan := planConversation(cfg, sess, group, side, now.Add(time.Minute)); !plan.Compacted {
+		t.Fatalf("side plan = %+v, want the shrink read as compaction", plan)
+	}
+	plan := planConversation(cfg, sess, group, full, now.Add(2*time.Minute))
+	if plan.Scores[0].Excluded == "" || plan.Scores[0].Probability != 0 {
+		t.Fatalf("full history after reset = %+v, want big still skipped for context", plan.Scores)
+	}
+	if plan := planConversation(cfg, sess, group, side, now.Add(3*time.Minute)); plan.Scores[0].Excluded != "" {
+		t.Fatalf("small payload = %+v, want big usable again", plan.Scores)
 	}
 }
 

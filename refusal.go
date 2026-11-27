@@ -238,7 +238,7 @@ func summarizeAttemptReason(detail string) string {
 		return "insufficient quota"
 	case strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, `"code": 429`) || strings.Contains(lower, `"code":429`) || strings.Contains(lower, "rate limit"):
 		return "rate limited"
-	case strings.Contains(lower, "largest context window") || strings.Contains(lower, "context_length_exceeded"):
+	case strings.Contains(lower, "largest context window") || strings.Contains(lower, "context_length_exceeded") || strings.Contains(lower, "prompt is too long"):
 		return "context too long"
 	case strings.Contains(lower, "carries an image") || strings.Contains(lower, "accepts text only") || strings.Contains(lower, "image input is not supported"):
 		return "no vision"

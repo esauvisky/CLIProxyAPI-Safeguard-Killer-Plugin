@@ -615,8 +615,8 @@ func classifyAttemptFailure(rawDetail string) string {
 }
 
 // isAuxiliaryRequest reports whether the request is a background helper call (such as Claude Code's
-// away_summary recap, prompt_suggestion, session rename, agent_summary, or the agent-state
-// notification classifier) where injecting a
+// away_summary recap, prompt_suggestion, session rename, agent_summary, the agent-state
+// notification classifier, or the WebFetch page summarizer) where injecting a
 // human-facing router banner would corrupt the caller's parsed output.
 func isAuxiliaryRequest(payload []byte) bool {
 	for _, marker := range []string{
@@ -627,6 +627,8 @@ func isAuxiliaryRequest(payload []byte) bool {
 		"Never consult the advisor tool.",
 		"Your task is to create a detailed summary of the conversation",
 		"Read the tail of what the agent just said and decide which of four states it's in",
+		"Provide a concise response based only on the content above. In your response:",
+		"Provide a concise response based on the content above. Include relevant details, code examples, and documentation excerpts as needed.",
 	} {
 		if bytes.Contains(payload, []byte(marker)) {
 			return true

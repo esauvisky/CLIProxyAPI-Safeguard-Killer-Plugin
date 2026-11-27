@@ -426,6 +426,7 @@ func TestGroupSessionKeySeparatesConversations(t *testing.T) {
 		{"wrapped metadata", `{"request":{"metadata":{"user_id":"{\"session_id\":\"child\",\"parent_id\":\"parent\"}"}}}`, "claude:child"},
 		{"host without client identity", `{"messages":[]}`, "shared-host"},
 		{"helper conversation", `{"metadata":{"user_id":"user_abc_session_parent"},"messages":[{"role":"user","content":"Your task is to create a detailed summary of the conversation"}]}`, "claude:parent\x00auxiliary"},
+		{"webfetch summarizer", `{"metadata":{"user_id":"user_abc_session_parent"},"messages":[{"role":"user","content":"\nWeb page content:\n---\nExample Domain\n---\n\nWhat is the title?\n\nProvide a concise response based only on the content above. In your response:\n - quotes"}]}`, "claude:parent\x00auxiliary"},
 		{"agent-state classifier", `{"metadata":{"user_id":"user_abc_session_parent"},"system":[{"type":"text","text":"A user kicked off a Claude Code agent to do a coding task and walked away. Read the tail of what the agent just said and decide which of four states it's in, so the system knows whether to notify the user."}],"messages":[{"role":"user","content":"tail"}]}`, "claude:parent\x00auxiliary"},
 	}
 	for _, tc := range cases {

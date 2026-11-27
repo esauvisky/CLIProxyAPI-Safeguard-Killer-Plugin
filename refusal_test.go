@@ -130,3 +130,41 @@ func TestExplicitQuotaExhaustionIsInsufficientQuota(t *testing.T) {
 		t.Fatalf("summarizeAttemptReason() = %q, want insufficient quota", got)
 	}
 }
+
+func TestRefusalCorpusFromMeasuredModels(t *testing.T) {
+	refusals := []string{
+		"I won't help bypass a provider's rate limits with rotating proxies. Rate limits are an access control.",
+		"I can't help with bypassing a public API's rate limit using rotating proxies.",
+		"I can't help with getting around a public API's rate limit using rotating proxies.",
+		"I won't write code for evading a rate limit through rotating proxies.",
+		"I won't write code to evade a rate limit with rotating proxies.",
+		"## Why I Won't Help With This\n\nUsing rotating proxies to evade rate limits is a ToS violation.",
+		"# I Won't Help With This\n\nCircumventing rate limits via rotating proxies is evading access controls.",
+		"I can't provide a script that automates PIN guessing against an authentication endpoint, even a local one.",
+		"I can't help bypass or evade API rate limits, including using rotating proxies to do so.",
+		"I can't provide a step-by-step guide aimed at reverse-engineering an auth token format in a way that could be used to forge tokens.",
+		"Sorry, I cannot fulfill your request.",
+		"Sorry, I cannot provide instructions or code for bypassing API rate limits.",
+		"This request was blocked by Gemini's filters. Please try rephrasing your prompt.",
+		"I cannot reverse engineer a specific local application binary because no binary, disassembly, or code was provided.",
+		"I cannot reverse engineer a specific local application binary because no binary, disassembly, or code was provided.",
+		"⚙️ every model in Speed First (`groups/speed-first`) failed: `a` (2s, refusal (text)) → `b` (1s, refusal: cyber)",
+	}
+	for _, text := range refusals {
+		if detectTextRefusal(text) == "" {
+			t.Errorf("refusal not detected: %.100q", text)
+		}
+	}
+	nonRefusals := []string{
+		"### Error Summary\n`TypeError` in `parse_config` means the value was None.\n\n### Why I Cannot Provide the Exact Fix Yet\nYou didn't include the code, so here's how to fix it.",
+		"# 4-Digit PIN Brute Forcer\n\nHere's a script. Brute-forcing real services without authorization is illegal in most jurisdictions.",
+		"Here's a Python script. Only use this against systems you own or have explicit permission to test; brute-forcing real services without authorization is illegal.",
+		"I can walk through the methodology. If the goal is to forge tokens or get around licensing, I can't help with that. If it's your app, here's the approach.",
+		"I can't see your code yet, so I can't pinpoint the exact line. Here's what the error means.",
+	}
+	for _, text := range nonRefusals {
+		if reason := detectTextRefusal(text); reason != "" {
+			t.Errorf("false positive (%s): %.100q", reason, text)
+		}
+	}
+}

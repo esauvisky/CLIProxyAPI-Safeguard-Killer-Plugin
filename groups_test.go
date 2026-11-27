@@ -206,15 +206,15 @@ func TestExecuteGroupStreamForwardsChunks(t *testing.T) {
 
 func TestAttemptBodyKeepsBodiesWithoutModelField(t *testing.T) {
 	cfg := defaultPluginConfig()
-	out, errSet := attemptBody([]byte(`{"contents":[]}`), "m", cfg)
+	out, errSet := attemptBody([]byte(`{"contents":[]}`), "m", cfg, "")
 	if errSet != nil || string(out) != `{"contents":[]}` {
 		t.Fatalf("attemptBody = %s, %v", out, errSet)
 	}
-	out, errSet = attemptBody([]byte(`{"model":"old","fallbacks":"default"}`), "new", cfg)
+	out, errSet = attemptBody([]byte(`{"model":"old","fallbacks":"default"}`), "new", cfg, "")
 	if errSet != nil || string(out) != `{"fallbacks":"default","model":"new"}` {
 		t.Fatalf("attemptBody changed fields besides model = %s, %v", out, errSet)
 	}
-	if _, errSet := attemptBody([]byte(`not json`), "m", cfg); errSet == nil {
+	if _, errSet := attemptBody([]byte(`not json`), "m", cfg, ""); errSet == nil {
 		t.Fatalf("attemptBody(non-JSON) error = nil")
 	}
 }
@@ -325,13 +325,13 @@ func TestExecuteGroupStreamFallsThroughSafeguardRefusalAndRemembersSession(t *te
 	if !strings.Contains(streamOut, "Here is the answer.") {
 		t.Fatalf("emitted stream = %q, want answer from abliterated", streamOut)
 	}
-	if !strings.Contains(streamOut, "`glm-5.3-uncensored` (0s, refusal: cyber) → `deepseek-v4.1-flash-uncensored` (0s, refusal: regex) → using `abliterated` from here onwards") {
+	if !strings.Contains(streamOut, "`glm-5.3-uncensored` (0s, refusal: cyber) → `glm-5.3-uncensored` (0s, refusal: cyber) → `deepseek-v4.1-flash-uncensored` (0s, refusal: regex) → `deepseek-v4.1-flash-uncensored` (0s, refusal: regex) → using `abliterated` from here onwards") {
 		t.Fatalf("emitted stream missing fallback notice: %q", streamOut)
 	}
-	if strings.Join(openedModels, ",") != "glm-5.3-uncensored,deepseek-v4.1-flash-uncensored,abliterated" {
+	if strings.Join(openedModels, ",") != "glm-5.3-uncensored,glm-5.3-uncensored,deepseek-v4.1-flash-uncensored,deepseek-v4.1-flash-uncensored,abliterated" {
 		t.Fatalf("openedModels = %v", openedModels)
 	}
-	if strings.Join(closedStreams, ",") != "src-glm-5.3-uncensored,src-deepseek-v4.1-flash-uncensored" {
+	if strings.Join(closedStreams, ",") != "src-glm-5.3-uncensored,src-glm-5.3-uncensored,src-deepseek-v4.1-flash-uncensored,src-deepseek-v4.1-flash-uncensored" {
 		t.Fatalf("closedStreams = %v", closedStreams)
 	}
 	if strings.Contains(lastNudgeBody, "Do not produce that content again") || !strings.Contains(lastNudgeBody, claudeRefusalReplacement) {
@@ -1374,7 +1374,7 @@ func TestReliabilityPenaltyAndCacheWarmth(t *testing.T) {
 	const noisy = "reliability-noisy"
 	speedMu.Lock()
 	speedStats[clean] = &modelSpeedStats{Samples: 1, TokensPerSecond: 100, Attempts: 10}
-	speedStats[noisy] = &modelSpeedStats{Samples: 1, TokensPerSecond: 100, Attempts: 10, Refusals: 5}
+	speedStats[noisy] = &modelSpeedStats{Samples: 1, TokensPerSecond: 100, Attempts: 10, Refusals: 6}
 	speedMu.Unlock()
 	t.Cleanup(func() {
 		speedMu.Lock()
@@ -1385,10 +1385,10 @@ func TestReliabilityPenaltyAndCacheWarmth(t *testing.T) {
 
 	models := []groupModel{{ID: noisy, Quality: 80}, {ID: clean, Quality: 80}}
 	scores := scoreModels(modelGroup{ID: "g", Mode: groupModeQuality, Models: models})
-	if scores[0].Score != 65 || scores[1].Score != 80 {
-		t.Fatalf("reliability scores = %+v, want noisy 65 and clean 80", scores)
+	if scores[0].Score != 60 || scores[1].Score != 80 {
+		t.Fatalf("reliability scores = %+v, want noisy 60 and clean 80", scores)
 	}
-	if scores[0].Reliability != 50 || scores[1].Reliability != 100 {
+	if scores[0].Reliability != 40 || scores[1].Reliability != 100 {
 		t.Fatalf("reliability ratings = %+v, want 50 and 100", scores)
 	}
 
@@ -1554,5 +1554,120 @@ func TestQualityModePenalizesFirstTokenLatency(t *testing.T) {
 		if s.LatencyPenalty != 0 {
 			t.Fatalf("speed mode applied the quality latency penalty: %+v", s)
 		}
+	}
+}
+
+func TestRefusalRetryContinuesFromSalvagedDraft(t *testing.T) {
+	resetHostState(t)
+	var bodies []string
+	var tried []string
+	fakeHost(t, []string{"glm-5.3-uncensored", "abliterated"}, func(method string, payload any) (json.RawMessage, error) {
+		if method != methodHostModelExecute {
+			t.Fatalf("unexpected host call %s", method)
+		}
+		req := payload.(hostModelRequest)
+		tried = append(tried, req.Model)
+		bodies = append(bodies, string(req.Body))
+		if req.Model == "glm-5.3-uncensored" && len(tried) == 1 {
+			body := []byte(`{"content":[{"type":"thinking","thinking":"draft reasoning"},{"type":"text","text":"partial draft"}],"stop_reason":"refusal","stop_details":{"category":"cyber"}}`)
+			return json.Marshal(hostModelResponse{StatusCode: 200, Body: body})
+		}
+		return json.Marshal(hostModelResponse{StatusCode: 200, Body: []byte(`{"content":[{"type":"text","text":"served by ` + req.Model + `"}],"served":"` + req.Model + `"}`)})
+	}, "only-cred")
+	setQuota(t, "only-cred", quotaWindow{Name: "daily", Remaining: 1, ResetAt: time.Now().Add(time.Hour)})
+
+	raw, errExec := executeGroup([]byte(`{"Model":"uncensored-models","SourceFormat":"openai","Format":"openai","Payload":"`+b64(`{"model":"uncensored-models","messages":[{"role":"user","content":"solve"}]}`)+`","host_callback_id":"cb"}`), groupConfig())
+	if errExec != nil {
+		t.Fatalf("executeGroup() error = %v", errExec)
+	}
+	var resp executorResponse
+	decodeOK(t, raw, &resp)
+	if strings.Join(tried, ",") != "glm-5.3-uncensored,glm-5.3-uncensored" {
+		t.Fatalf("tried = %v, want one retry on the refused model", tried)
+	}
+	if len(bodies) != 2 || !strings.Contains(bodies[1], continuationInstruction) || !strings.Contains(bodies[1], "partial draft") || strings.Contains(bodies[1], `"solve"}],"model"`) {
+		t.Fatalf("retry body did not carry the visible draft: %v", bodies)
+	}
+	if !strings.Contains(string(resp.Payload), "`glm-5.3-uncensored` was cut off; partial draft:") {
+		t.Fatalf("served payload lost the salvaged draft: %s", resp.Payload)
+	}
+}
+
+func TestRefusalRetryStopsAfterOneAttempt(t *testing.T) {
+	resetHostState(t)
+	var tried []string
+	fakeHost(t, []string{"glm-5.3-uncensored", "abliterated"}, func(method string, payload any) (json.RawMessage, error) {
+		if method != methodHostModelExecute {
+			t.Fatalf("unexpected host call %s", method)
+		}
+		req := payload.(hostModelRequest)
+		tried = append(tried, req.Model)
+		if req.Model == "glm-5.3-uncensored" {
+			return json.Marshal(hostModelResponse{StatusCode: 200, Body: []byte(`{"content":[{"type":"text","text":"I cannot help with that."}],"stop_reason":"end_turn"}`)})
+		}
+		return json.Marshal(hostModelResponse{StatusCode: 200, Body: []byte(`{"served":"abliterated"}`)})
+	}, "only-cred")
+	setQuota(t, "only-cred", quotaWindow{Name: "daily", Remaining: 1, ResetAt: time.Now().Add(time.Hour)})
+
+	raw, errExec := executeGroup([]byte(`{"Model":"uncensored-models","SourceFormat":"openai","Format":"openai","Payload":"`+b64(`{"model":"uncensored-models","messages":[{"role":"user","content":"solve"}]}`)+`","host_callback_id":"cb"}`), groupConfig())
+	if errExec != nil {
+		t.Fatalf("executeGroup() error = %v", errExec)
+	}
+	var resp executorResponse
+	decodeOK(t, raw, &resp)
+	if strings.Join(tried, ",") != "glm-5.3-uncensored,glm-5.3-uncensored,abliterated" {
+		t.Fatalf("tried = %v, want exactly one retry then the next model", tried)
+	}
+}
+
+func TestRefusalSkipClearsWhenPayloadChanges(t *testing.T) {
+	resetHostState(t)
+	cfg := defaultPluginConfig()
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: ratedGroupModels("m1", "m2")}
+	now := time.Now()
+	payload := []byte(`{"messages":[{"role":"user","content":"first"}]}`)
+	recordConversationFailure("session", group.ID, "m1", "refusal (cyber)", payload, now)
+	if got := planConversation(cfg, "session", group, payload, now).Scores[0].Excluded; got == "" {
+		t.Fatal("identical payload must skip the refused model")
+	}
+	next := []byte(`{"messages":[{"role":"user","content":"first"},{"role":"user","content":"second"}]}`)
+	plan := planConversation(cfg, "session", group, next, now)
+	if plan.Scores[0].Excluded != "" || len(plan.Skipped) != 0 {
+		t.Fatalf("a new turn still skipped the refused model: %+v", plan.Scores)
+	}
+}
+
+func TestTotalTokensAndAdvisorNoticesStripped(t *testing.T) {
+	cfg := defaultPluginConfig()
+	in := reminderOpen + "\n" + "<total_tokens>120000 tokens left</total_tokens>" + "\n" + reminderClose + "\ncontinue"
+	out := stripHarnessNoise(in, cfg.Features)
+	if strings.Contains(out, "<total_tokens>") || !strings.Contains(out, "continue") {
+		t.Fatalf("total-tokens reminder survived: %q", out)
+	}
+	in2 := reminderOpen + "\nThe advisor tool is no longer available; disregard the earlier advisor instructions." + "\n" + reminderClose
+	if out2 := stripHarnessNoise(in2, cfg.Features); strings.Contains(out2, "advisor tool") {
+		t.Fatalf("advisor notice survived: %q", out2)
+	}
+}
+
+func TestReliabilityDecayRecoversRefusingModel(t *testing.T) {
+	const model = "decay-model"
+	speedMu.Lock()
+	speedStats[model] = &modelSpeedStats{Attempts: 10, Refusals: 6}
+	speedMu.Unlock()
+	t.Cleanup(func() {
+		speedMu.Lock()
+		delete(speedStats, model)
+		speedMu.Unlock()
+	})
+	before := reliabilityRating(speedStats[model])
+	for i := 0; i < 10; i++ {
+		recordModelAttempt(model)
+	}
+	speedMu.RLock()
+	stats := speedStats[model]
+	speedMu.RUnlock()
+	if stats.Refusals >= 6 || reliabilityRating(stats) <= before {
+		t.Fatalf("decay stats = %+v rating %v (before %v)", stats, reliabilityRating(stats), before)
 	}
 }

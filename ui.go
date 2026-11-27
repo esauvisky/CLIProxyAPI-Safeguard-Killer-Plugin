@@ -806,13 +806,6 @@ const uiHTML = `<!doctype html>
           </span>
         </label>
         <label class="feature-item">
-          <input type="checkbox" data-feature="hint_oversized_reads">
-          <span>
-            <span class="feature-title">Hint oversized Read results</span>
-            <span class="feature-desc">When Claude Code's Read rejects a file for its client-side token cap, append a ready-to-run sed | cut command for the same file and line range (and the grep -n form), so models read files with very long lines instead of retrying smaller limits.</span>
-          </span>
-        </label>
-        <label class="feature-item">
           <input type="checkbox" data-feature="flag_repeated_tool_calls">
           <span>
             <span class="feature-title">Flag repeated tool calls</span>
@@ -1142,7 +1135,6 @@ const FEATURE_KEYS = [
   'strip_rea_directives',
   'strip_model_identity',
   'sanitize_agy_text',
-  'hint_oversized_reads',
   'flag_repeated_tool_calls',
 ];
 

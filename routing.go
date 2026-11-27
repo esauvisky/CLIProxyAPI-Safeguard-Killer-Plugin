@@ -70,9 +70,13 @@ func (s *conversationState) skipReasonLocked(model string, payload []byte) strin
 			delete(s.Failures, model)
 			return ""
 		}
-		// The refused content stays in the history until compaction resets this
-		// conversation. Growing the conversation does not call the refused
-		// model again.
+		// Skip the model only while the payload is byte-identical to the one it refused.
+		// A new turn adds messages, so the model is eligible again instead of staying
+		// banned until compaction.
+		if f.FirstRefusalHash != "" && refusalPayloadHash(payload) != f.FirstRefusalHash {
+			delete(s.Failures, model)
+			return ""
+		}
 		return f.Reason
 	}
 	return ""

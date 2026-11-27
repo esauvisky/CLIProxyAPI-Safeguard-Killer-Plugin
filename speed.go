@@ -33,9 +33,14 @@ const (
 	qualityLatencyFullSec    = 70.0
 	qualityLatencyMaxPenalty = 10.0
 	// Reliability penalties subtract up to reliabilityMaxPenalty quality points from a model whose
-	// refusal, empty-response, or loop rate reaches reliabilityFullPenaltyRate.
-	reliabilityMaxPenalty      = 15.0
-	reliabilityFullPenaltyRate = 0.5
+	// refusal, empty-response, or loop rate reaches reliabilityFullPenaltyRate. A refusal counts
+	// fully; a filter or cyber refusal counts half, because it names the prompt rather than the model.
+	reliabilityMaxPenalty      = 20.0
+	reliabilityFullPenaltyRate = 0.3
+	// Every served attempt shrinks the failure counts, so a model that stopped refusing recovers
+	// its score instead of carrying one refusal for the life of the stats.
+	reliabilityDecayPerAttempt = 0.05
+	reliabilityFilterWeight    = 0.5
 	// A served turn emitting this many tool calls is counted as a loop turn: the real sessions that
 	// stalled ran 25+ calls per turn on flash models repeating searches.
 	loopLoopToolThreshold = 25
@@ -50,9 +55,17 @@ type modelSpeedStats struct {
 	FirstTokenSec   float64   `json:"first_token_sec,omitempty"`
 	Attempts        int       `json:"attempts,omitempty"`
 	Refusals        int       `json:"refusals,omitempty"`
+	FilterRefusals  int       `json:"filter_refusals,omitempty"`
 	EmptyResponses  int       `json:"empty_responses,omitempty"`
 	LoopTurns       int       `json:"loop_turns,omitempty"`
 	LastMeasured    time.Time `json:"last_measured,omitempty"`
+}
+
+// failureCount sums the reliability failures as weighted fractions: a filter or cyber refusal is
+// the prompt's fault as much as the model's, so it counts half.
+func (stats *modelSpeedStats) failureCount() float64 {
+	return float64(stats.Refusals) + reliabilityFilterWeight*float64(stats.FilterRefusals) +
+		float64(stats.EmptyResponses) + float64(stats.LoopTurns)
 }
 
 type modelSpeedSnapshot struct {
@@ -61,6 +74,7 @@ type modelSpeedSnapshot struct {
 	FirstTokenSec   float64   `json:"first_token_sec,omitempty"`
 	Attempts        int       `json:"attempts,omitempty"`
 	Refusals        int       `json:"refusals,omitempty"`
+	FilterRefusals  int       `json:"filter_refusals,omitempty"`
 	EmptyResponses  int       `json:"empty_responses,omitempty"`
 	LoopTurns       int       `json:"loop_turns,omitempty"`
 	Rating          float64   `json:"rating"`
@@ -125,8 +139,7 @@ func reliabilityRating(stats *modelSpeedStats) float64 {
 	if stats == nil || stats.Attempts == 0 {
 		return 100
 	}
-	failures := stats.Refusals + stats.EmptyResponses + stats.LoopTurns
-	successRate := 1 - float64(failures)/float64(stats.Attempts)
+	successRate := 1 - stats.failureCount()/float64(stats.Attempts)
 	return math.Round(100 * math.Max(0, math.Min(1, successRate)))
 }
 
@@ -137,8 +150,7 @@ func reliabilityPenalty(stats *modelSpeedStats) float64 {
 	if stats == nil || stats.Attempts == 0 {
 		return 0
 	}
-	failures := stats.Refusals + stats.EmptyResponses + stats.LoopTurns
-	rate := float64(failures) / float64(stats.Attempts)
+	rate := stats.failureCount() / float64(stats.Attempts)
 	return math.Round(reliabilityMaxPenalty * math.Min(1, math.Max(0, rate/reliabilityFullPenaltyRate)))
 }
 
@@ -166,6 +178,8 @@ func recordModelReliabilityEvent(model, kind string) {
 	switch kind {
 	case "refusal":
 		stats.Refusals++
+	case "filter":
+		stats.FilterRefusals++
 	case "empty":
 		stats.EmptyResponses++
 	case "loop":
@@ -182,6 +196,8 @@ func recordModelReliabilityFailure(model string, errDetail string) {
 	switch {
 	case summary == "empty response":
 		recordModelReliabilityEvent(model, "empty")
+	case summary == "refusal: filter" || summary == "refusal: cyber":
+		recordModelReliabilityEvent(model, "filter")
 	case summary == "refusal" || strings.HasPrefix(summary, "refusal:"):
 		recordModelReliabilityEvent(model, "refusal")
 	}
@@ -200,8 +216,25 @@ func recordModelAttempt(model string) {
 		speedStats[model] = stats
 	}
 	stats.Attempts++
+	decayReliability(stats)
 	speedMu.Unlock()
 	savePersistedSessions()
+}
+
+// decayReliability shrinks failure counts toward zero on every served attempt. Counts floor, so a
+// refusal decays within a few served turns instead of rounding back to its old value.
+func decayReliability(stats *modelSpeedStats) {
+	stats.Refusals = decayCount(stats.Refusals)
+	stats.FilterRefusals = decayCount(stats.FilterRefusals)
+	stats.EmptyResponses = decayCount(stats.EmptyResponses)
+	stats.LoopTurns = decayCount(stats.LoopTurns)
+}
+
+func decayCount(n int) int {
+	if n == 0 {
+		return 0
+	}
+	return int(math.Floor(float64(n) * (1 - reliabilityDecayPerAttempt)))
 }
 
 // recordModelServedTurn counts a served turn: an attempt plus a loop class when the turn emitted
@@ -280,6 +313,7 @@ func speedStatsSnapshot() map[string]modelSpeedSnapshot {
 			FirstTokenSec:   stats.FirstTokenSec,
 			Attempts:        stats.Attempts,
 			Refusals:        stats.Refusals,
+			FilterRefusals:  stats.FilterRefusals,
 			EmptyResponses:  stats.EmptyResponses,
 			LoopTurns:       stats.LoopTurns,
 			Rating:          speedRatingWithTTFT(stats.TokensPerSecond, stats.FirstTokenSec),

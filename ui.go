@@ -781,7 +781,7 @@ const uiHTML = `<!doctype html>
           <input type="checkbox" data-feature="strip_restrictive_system_reminders">
           <span>
             <span class="feature-title">Strip harness noise (reminders by type, environment, sandbox)</span>
-            <span class="feature-desc">Remove git status, environment, bash sandbox, model identity, latest-models, and command-output reminders, [SYSTEM NOTIFICATION] preambles, and the untrusted-archive and injection paragraphs. Output-style reminders and every other reminder are kept.</span>
+            <span class="feature-desc">Remove git status, environment, bash sandbox, model identity, latest-models, and command-output reminders, [SYSTEM NOTIFICATION] preambles, the untrusted-archive and injection paragraphs, token-counter blocks, and advisor notices. Output-style reminders and every other reminder are kept.</span>
           </span>
         </label>
         <label class="feature-item">
@@ -1475,7 +1475,7 @@ function renderSpeedCell(model) {
     '</div>';
   }
   const stats = speed.stats;
-  const reliability = (stats.attempts > 0) ? ' · reliability ' + stats.reliability + ' (' + stats.refusals + ' refusal, ' + stats.empty_responses + ' empty, ' + stats.loop_turns + ' loop)' : '';
+  const reliability = (stats.attempts > 0) ? ' · reliability ' + stats.reliability + ' (' + stats.refusals + ' refusal, ' + (stats.filter_refusals || 0) + ' filter, ' + stats.empty_responses + ' empty, ' + stats.loop_turns + ' loop)' : '';
   const detail = Math.round(stats.tokens_per_second) + ' tok/s · ' + stats.samples + ' sample' + (stats.samples === 1 ? '' : 's') +
     (stats.first_token_sec > 0 ? ' · ' + stats.first_token_sec.toFixed(2) + 's first token' : '') + reliability;
   return '<div class="speed-cell">' +

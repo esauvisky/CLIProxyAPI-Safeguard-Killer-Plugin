@@ -195,12 +195,13 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 	attempts := plan.Skipped
 	prevLookupModel := plan.PrevModel
 	var lastErr error
+	retried := make(map[string]bool)
 
 	if plan.Err != nil {
 		return nil, plan.Err
 	}
 	for model, available := plan.nextModel(rand.Float64()); available; model, available = plan.nextModel(rand.Float64()) {
-		body, errBody := attemptBody(sanitizedPayload, model, cfg)
+		body, errBody := attemptBody(sanitizedPayload, model, cfg, "")
 		if errBody != nil {
 			return nil, errBody
 		}
@@ -225,12 +226,47 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if cfg.Features.FallbackOnRefusal {
 			if errRefusal, salvaged := checkNonStreamResponse(resp.Body); errRefusal != nil {
 				attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errRefusal.Error(), Duration: time.Since(attemptStart), Salvaged: salvaged})
-				recordConversationFailure(session, group.ID, model, errRefusal.Error(), req.Payload, time.Now())
-				if !aux {
-					recordModelReliabilityFailure(model, errRefusal.Error())
+				if !retried[model] && salvaged != "" {
+					// One retry on the same model with its salvaged draft appended: the model often
+					// refused only the latest turn, and a continuation costs less than a full resend.
+					retried[model] = true
+					body, errBody = attemptBody(sanitizedPayload, model, cfg, salvaged)
+					if errBody != nil {
+						return nil, errBody
+					}
+					rawResp, errCall = hostCall(methodHostModelExecute, hostModelRequest{
+						EntryProtocol: req.SourceFormat, ExitProtocol: req.Format, Model: model, Body: body,
+						Headers: sanitizedHeaders, Query: req.Query, Alt: req.Alt, HostCallbackID: req.HostCallbackID,
+					})
+					if errCall != nil {
+						attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error(), Duration: time.Since(attemptStart)})
+						recordConversationFailure(session, group.ID, model, errCall.Error(), req.Payload, time.Now())
+						if !aux {
+							recordModelReliabilityFailure(model, errCall.Error())
+						}
+						lastErr = errCall
+						continue
+					}
+					if errDecode := json.Unmarshal(rawResp, &resp); errDecode != nil {
+						return nil, fmt.Errorf("decode host.model.execute response: %w", errDecode)
+					}
+					if errRetry, salvagedRetry := checkNonStreamResponse(resp.Body); errRetry != nil {
+						attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errRetry.Error(), Duration: time.Since(attemptStart), Salvaged: salvagedRetry})
+						recordConversationFailure(session, group.ID, model, errRetry.Error(), req.Payload, time.Now())
+						if !aux {
+							recordModelReliabilityFailure(model, errRetry.Error())
+						}
+						lastErr = errRetry
+						continue
+					}
+				} else {
+					recordConversationFailure(session, group.ID, model, errRefusal.Error(), req.Payload, time.Now())
+					if !aux {
+						recordModelReliabilityFailure(model, errRefusal.Error())
+					}
+					lastErr = errRefusal
+					continue
 				}
-				lastErr = errRefusal
-				continue
 			}
 		}
 		attempts = append(attempts, groupAttempt{Model: model, Result: "served", Duration: time.Since(attemptStart)})
@@ -245,7 +281,7 @@ func executeGroup(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if !aux {
 			// Without a session identity every turn looks new, so only identified conversations announce a start.
 			started := session != "" && prevModel == ""
-			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)), plan.SelectedScores)
+			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)), plan.SelectedScores) + salvageNotice(attempts)
 			bodyOut = injectNonStreamNotice(resp.Body, effectiveFormat(req.Format, req.SourceFormat), notice)
 		}
 		return okEnvelope(executorResponse{Payload: bodyOut, Headers: cleanResponseHeaders(resp.Headers)})
@@ -285,12 +321,13 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 	attempts := plan.Skipped
 	prevLookupModel := plan.PrevModel
 	var lastErr error
+	retried := make(map[string]bool)
 
 	if plan.Err != nil {
 		return nil, plan.Err
 	}
 	for model, available := plan.nextModel(rand.Float64()); available; model, available = plan.nextModel(rand.Float64()) {
-		body, errBody := attemptBody(sanitizedPayload, model, cfg)
+		body, errBody := attemptBody(sanitizedPayload, model, cfg, "")
 		if errBody != nil {
 			return nil, errBody
 		}
@@ -315,12 +352,48 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		prefetched, done, salvaged, errPrefetch := prefetchStream(resp.StreamID, req.HostCallbackID, cfg.Features.FallbackOnRefusal, cfg.StreamPrefetchBytes)
 		if errPrefetch != nil {
 			attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errPrefetch.Error(), Duration: time.Since(attemptStart), Salvaged: salvaged})
-			recordConversationFailure(session, group.ID, model, errPrefetch.Error(), req.Payload, time.Now())
-			if !aux {
-				recordModelReliabilityFailure(model, errPrefetch.Error())
+			if !retried[model] && salvaged != "" {
+				retried[model] = true
+				body, errBody = attemptBody(sanitizedPayload, model, cfg, salvaged)
+				if errBody != nil {
+					return nil, errBody
+				}
+				rawResp, errCall = hostCall(methodHostModelStream, hostModelRequest{
+					EntryProtocol: req.SourceFormat, ExitProtocol: req.Format, Model: model, Stream: true, Body: body,
+					Headers: sanitizedHeaders, Query: req.Query, Alt: req.Alt, HostCallbackID: req.HostCallbackID,
+				})
+				if errCall != nil {
+					attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errCall.Error(), Duration: time.Since(attemptStart)})
+					recordConversationFailure(session, group.ID, model, errCall.Error(), req.Payload, time.Now())
+					if !aux {
+						recordModelReliabilityFailure(model, errCall.Error())
+					}
+					lastErr = errCall
+					continue
+				}
+				var respRetry hostModelStreamResponse
+				if errDecode := json.Unmarshal(rawResp, &respRetry); errDecode != nil {
+					return nil, fmt.Errorf("decode host.model.execute_stream response: %w", errDecode)
+				}
+				prefetched, done, _, errPrefetch = prefetchStream(respRetry.StreamID, req.HostCallbackID, cfg.Features.FallbackOnRefusal, cfg.StreamPrefetchBytes)
+				if errPrefetch != nil {
+					attempts = append(attempts, groupAttempt{Model: model, Result: "failed: " + errPrefetch.Error(), Duration: time.Since(attemptStart)})
+					recordConversationFailure(session, group.ID, model, errPrefetch.Error(), req.Payload, time.Now())
+					if !aux {
+						recordModelReliabilityFailure(model, errPrefetch.Error())
+					}
+					lastErr = errPrefetch
+					continue
+				}
+				resp = respRetry
+			} else {
+				recordConversationFailure(session, group.ID, model, errPrefetch.Error(), req.Payload, time.Now())
+				if !aux {
+					recordModelReliabilityFailure(model, errPrefetch.Error())
+				}
+				lastErr = errPrefetch
+				continue
 			}
-			lastErr = errPrefetch
-			continue
 		}
 		attempts = append(attempts, groupAttempt{Model: model, Result: "served", Duration: time.Since(attemptStart)})
 		recordGroupDecision(group, session, attempts, model, plan.SelectedScores)
@@ -332,7 +405,7 @@ func executeGroupStream(raw []byte, cfg pluginConfig) ([]byte, error) {
 		if !aux {
 			// Without a session identity every turn looks new, so only identified conversations announce a start.
 			started := session != "" && prevModel == ""
-			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)), plan.SelectedScores)
+			notice := buildGroupNotice(cfg, group, attempts, model, prevModel, started, suppressedRefusals(session, group.ID, failedModels(attempts)), plan.SelectedScores) + salvageNotice(attempts)
 			prefetched, shiftIndices = injectStreamNotice(prefetched, effectiveFormat(req.Format, req.SourceFormat), notice)
 		}
 		go forwardStream(resp.StreamID, req.StreamID, req.HostCallbackID, prefetched, done, shiftIndices, stampSafeguards, cfg.Features.FallbackOnRefusal, session, group, model, attemptStart, !aux)
@@ -534,7 +607,9 @@ func skipReason(cfg pluginConfig, model string, now time.Time) (string, error) {
 
 // attemptBody builds one attempt's request in a single decode/encode pass: the top-level model,
 // redacted_thinking hidden from non-Claude targets, and the model-keyed prompt adaptations.
-func attemptBody(payload []byte, model string, cfg pluginConfig) ([]byte, error) {
+// attemptBody builds one attempt's request. continuation carries the salvaged partial output of a
+// refused attempt on the same model, so the retry continues from that draft instead of re-answering.
+func attemptBody(payload []byte, model string, cfg pluginConfig, continuation string) ([]byte, error) {
 	var body map[string]json.RawMessage
 	if errUnmarshal := json.Unmarshal(payload, &body); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode group request body: %w", errUnmarshal)
@@ -552,10 +627,60 @@ func attemptBody(payload []byte, model string, cfg pluginConfig) ([]byte, error)
 	if errAdapt != nil {
 		return nil, errAdapt
 	}
+	if continuation != "" {
+		continued, errContinue := appendContinuation(body, continuation)
+		if errContinue != nil {
+			return nil, errContinue
+		}
+		adapted = adapted || continued
+	}
 	if !changed && !stripped && !adapted {
 		return payload, nil
 	}
 	return marshalNoEscape(body)
+}
+
+// appendContinuation adds a user message carrying the salvaged partial output and a continue
+// instruction, so the retried model resumes from its own draft instead of the full transcript.
+func appendContinuation(body map[string]json.RawMessage, continuation string) (bool, error) {
+	rawMessages, ok := body["messages"]
+	if !ok {
+		return false, nil
+	}
+	var messages []json.RawMessage
+	if json.Unmarshal(rawMessages, &messages) != nil {
+		return false, nil
+	}
+	content, errContent := marshalNoEscape(continuationInstruction + "\n\n" + continuation)
+	if errContent != nil {
+		return false, errContent
+	}
+	message, errMessage := marshalNoEscape(map[string]json.RawMessage{
+		"role":    json.RawMessage(`"user"`),
+		"content": content,
+	})
+	if errMessage != nil {
+		return false, errMessage
+	}
+	messages = append(messages, message)
+	encoded, errEncode := marshalNoEscape(messages)
+	if errEncode != nil {
+		return false, errEncode
+	}
+	body["messages"] = encoded
+	return true, nil
+}
+
+// salvageNotice shows the partial draft a refused model produced before it was cut off, so the
+// client sees that work instead of losing it.
+func salvageNotice(attempts []groupAttempt) string {
+	var parts []string
+	for _, attempt := range attempts {
+		if strings.HasPrefix(attempt.Result, "failed: ") && attempt.Salvaged != "" {
+			parts = append(parts, fmt.Sprintf("\n\n`%s` was cut off; partial draft:\n\n%s", attempt.Model, attempt.Salvaged))
+		}
+	}
+	return strings.Join(parts, "")
 }
 
 func groupFailure(group modelGroup, attempts []groupAttempt, lastErr error) error {

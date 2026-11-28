@@ -812,6 +812,13 @@ const uiHTML = `<!doctype html>
             <span class="feature-desc">When a tool call repeats an earlier call of the same user turn with identical input and identical output, append a note to that tool result saying nothing changed, so models stop polling or re-reading in circles.</span>
           </span>
         </label>
+        <label class="feature-item">
+          <input type="checkbox" data-feature="skip_agy_staged_prompts">
+          <span>
+            <span class="feature-title">Skip agy for oversized conversations</span>
+            <span class="feature-desc">Exclude agy/* models from a group request larger than 150 KB, the size above which cliproxy-antigravity stages the prompt as a file. Staged agy turns never see the newest messages and re-read the same files every step.</span>
+          </span>
+        </label>
       </div>
       <div class="form-grid" style="margin-top: 14px;" id="noticePrefixForm">
         <label class="field"><span class="cfg-key">Client notice prefix</span>
@@ -1136,6 +1143,7 @@ const FEATURE_KEYS = [
   'strip_model_identity',
   'sanitize_agy_text',
   'flag_repeated_tool_calls',
+  'skip_agy_staged_prompts',
 ];
 
 function featuresOf(cfg) {

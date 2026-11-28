@@ -102,6 +102,7 @@ type featureConfig struct {
 	StripModelIdentity            bool   `yaml:"strip_model_identity" json:"strip_model_identity"`
 	SanitizeAgyText               bool   `yaml:"sanitize_agy_text" json:"sanitize_agy_text"`
 	FlagRepeatedToolCalls         bool   `yaml:"flag_repeated_tool_calls" json:"flag_repeated_tool_calls"`
+	SkipAgyStagedPrompts          bool   `yaml:"skip_agy_staged_prompts" json:"skip_agy_staged_prompts"`
 }
 
 func (f featureConfig) effectiveNoticePrefix() string {
@@ -227,6 +228,7 @@ func defaultPluginConfig() pluginConfig {
 			StripModelIdentity:            true,
 			SanitizeAgyText:               true,
 			FlagRepeatedToolCalls:         true,
+			SkipAgyStagedPrompts:          true,
 		},
 	}
 }

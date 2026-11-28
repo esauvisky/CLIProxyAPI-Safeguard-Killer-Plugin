@@ -1671,3 +1671,29 @@ func TestReliabilityDecayRecoversRefusingModel(t *testing.T) {
 		t.Fatalf("decay stats = %+v rating %v (before %v)", stats, reliabilityRating(stats), before)
 	}
 }
+
+func TestSkipsAgyForOversizedConversations(t *testing.T) {
+	resetHostState(t)
+	cfg := defaultPluginConfig()
+	group := modelGroup{ID: "g", Mode: groupModeQuality, Models: []groupModel{{ID: "agy/gemini-4-neon", Quality: 60}, {ID: "claude-opus-5-5", Quality: 58}}}
+	small := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	large := []byte(`{"messages":[{"role":"user","content":"` + strings.Repeat("x", agyInlinePromptBytes) + `"}]}`)
+
+	plan := planConversation(cfg, "", group, small, time.Now())
+	if plan.Scores[0].Excluded != "" {
+		t.Fatalf("small request excluded agy: %+v", plan.Scores)
+	}
+	plan = planConversation(cfg, "", group, large, time.Now())
+	if !strings.Contains(plan.Scores[0].Excluded, "agy inline prompt limit") || plan.Scores[1].Excluded != "" {
+		t.Fatalf("large request scores = %+v, want agy excluded and claude eligible", plan.Scores)
+	}
+	if model, ok := plan.nextModel(0); !ok || model != "claude-opus-5-5" {
+		t.Fatalf("large request picked %q, %v", model, ok)
+	}
+
+	cfg.Features.SkipAgyStagedPrompts = false
+	plan = planConversation(cfg, "", group, large, time.Now())
+	if plan.Scores[0].Excluded != "" {
+		t.Fatalf("skip_agy_staged_prompts off still excluded agy: %+v", plan.Scores)
+	}
+}

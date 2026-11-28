@@ -168,6 +168,10 @@ const (
 	// CacheWarmBonus lifts the pinned model's score while its provider prefix cache is live, so a
 	// competitor must beat it by more than the bonus before selection invalidates the cache.
 	cacheWarmBonus = 2.0
+	// agyInlinePromptBytes is cliproxy-antigravity's default max_prompt_bytes. Above it the bridge
+	// stages the request as prompt.txt and the model reads it in chunks; in real sessions it then
+	// never sees the newest messages and re-reads the same files every step.
+	agyInlinePromptBytes = 150000
 )
 
 type modelScore struct {
@@ -248,6 +252,9 @@ func planConversation(cfg pluginConfig, session string, group modelGroup, payloa
 
 	for i := range plan.Scores {
 		candidate := &plan.Scores[i]
+		if candidate.Excluded == "" && cfg.Features.SkipAgyStagedPrompts && modelIsAgy(candidate.Model) && len(payload) > agyInlinePromptBytes {
+			candidate.Excluded = fmt.Sprintf("request %d bytes exceeds agy inline prompt limit %d", len(payload), agyInlinePromptBytes)
+		}
 		if candidate.Excluded == "" {
 			reason, err := skipReason(cfg, candidate.Model, now)
 			if err != nil {
